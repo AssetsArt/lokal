@@ -336,6 +336,43 @@ The general rule on Apple Silicon: parallelism pays at coarse granularity —
 per request, per phase (prefill/decode) — and loses at fine granularity,
 where every ANE↔GPU boundary costs a graph invocation.
 
+### Why not MLState decode on the ANE?
+
+Probed 2026-08-29 (coremltools 9.0, torch 2.13.0, macOS 15 target, M1 Pro).
+The idea — keep the KV cache inside a stateful Core ML graph (`ct.StateType`)
+so ANE decode stops paying the host↔ANE KV round-trip — dies on three
+independently measured ceilings, any one of which is sufficient:
+
+- **NE placement caps at ~6 MB of total state per graph.** A 1-layer decode
+  step with KV state places on the NE up to S=7168 (5.5 MB of state) and
+  falls 100% to GPU at S=8192 (6.3 MB), in every variant tried. Splitting
+  the state into more, smaller buffers does not evade it — 2×4096 and 4×2048
+  (same 6.3 MB total) also go 100% GPU while a single 3.1 MB pair stays NE.
+  The bound tracks total state bytes, not per-buffer size.
+- **Multi-layer stateful graphs leave the NE, then stop loading at all.**
+  2/4/8-layer stateful graphs convert and load but place 100% on GPU; at
+  ≥16 layers `ANECCompile()` fails outright (execution-plan error -14), even
+  with state shrunk to 2048 ctx. The real SmolLM2-135M (30 layers, 60 state
+  buffers) fails to load.
+- **The per-layer-model escape hatch loses on the invocation floor.** A chain
+  of 30 single-layer stateful models is NE-placeable, but the measured
+  ~0.74 ms predict floor × 30 layers ≈ 22 ms/token ≈ 45 tok/s — below the
+  Metal decode it would have to beat (122 tok/s at 7k ctx on SmolLM2).
+
+Even ignoring all three, NE-placeable context in the stateful variants caps
+at ~7k — below the ≥10k regime this engine targets.
+
+Worth keeping for a toolchain revisit: state ops per se DO survive NE
+placement (the answer to the old open question) — in fact the state *update*
+op is what pulls a graph onto the NE; a read-only stateful graph places on
+CPU. `state.copy_(expr)` does not convert; mask read-modify-write
+(`state.mul_(1-m); state.add_(k*m)`) with a host-fed one-hot mask does, and
+sidesteps the fp16-2048 integer cliff entirely — verified position-flat
+error across 2047/2048/2049/4095/4096 over 6101 sequential predicts against
+torch f32. Segmented ≤2048-wide softmax over the state (the windowed-prefill
+pattern) stays NE-placed. If Apple's toolchain moves: re-probe the
+layer-count load wall first, then the 8k+ placement matrix, then end-to-end.
+
 ## Future work
 
 Roughly ordered by leverage:
@@ -362,11 +399,6 @@ Roughly ordered by leverage:
    For prompts past whatever the ANE covers, a flash-attention-style Metal
    prefill kernel (f32 accumulation, no fp16 cliffs) is the complementary
    lever.
-4. **ANE decode via Core ML stateful models (MLState)** — keep the KV cache
-   inside the Core ML graph across invocations. The measured ~0.65 ms
-   invocation cost says the overhead is tolerable once per-step compute is
-   large enough (i.e. bigger models); the open questions are whether ANE
-   placement survives the state ops.
 5. The rest: an OpenAI-compatible API (`/v1/chat/completions`) and SSE
    streaming in serve mode; flash-style attention for the *prefill* path
    (its weighted-V loop is still serial per thread, and it is now the
