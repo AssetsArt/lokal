@@ -1,14 +1,21 @@
 # bench_engines.py — compare lokal against other local inference servers.
 #
 # Measures three things against an already-running server, greedy (temperature 0):
-#   prefill   — wall time of a ~450-token prompt with max_tokens=1 (TTFT proxy)
+#   prefill   — wall time of the prompt with max_tokens=1 (TTFT proxy)
 #   decode    — (tokens_long - 1) / (wall_long - wall_prefill), i.e. the marginal
 #               cost per generated token, which cancels out prompt processing
-#   4x concurrent — aggregate generated tokens/sec with 4 simultaneous requests
+#   Nx concurrent — aggregate generated tokens/sec with N simultaneous requests
 #
-# Every engine applies its own chat template, so prompt token counts differ by a
-# few tokens across engines; the workload is identical in substance. Completion
-# lengths are reported so an early EOS is visible instead of skewing the numbers.
+# Two prompt workloads:
+#   default             the original ~460-token synthetic prompt, kept so the
+#                       short-prompt table in README.md stays reproducible
+#   --prompt-tokens N   natural prose sliced out of a pinned public-domain book
+#                       to roughly N tokens — the long-context workload
+#
+# Every engine gets the SAME text; engines tokenize it slightly differently, so
+# each one is asked for its OWN token count and prefill tok/s is normalized by
+# that count. Completion lengths are reported too, so an early EOS is visible
+# instead of silently skewing the numbers.
 #
 # Each request starts with a unique nonce so server-side prompt caches (llama.cpp
 # reuses the KV of a repeated prefix, for example) cannot answer from cache — the
@@ -18,14 +25,23 @@
 #   python3 benchmarks/bench_engines.py --api lokal  --url http://127.0.0.1:8080 --name "lokal (metal)"
 #   python3 benchmarks/bench_engines.py --api openai --url http://127.0.0.1:8081/v1 \
 #       --model SmolLM2-135M-Instruct --name "llama.cpp" --out benchmarks/results.jsonl
+#   python3 benchmarks/bench_engines.py --api cli --bin ./target/release/lokal \
+#       --model Qwen/Qwen2.5-0.5B-Instruct --backend ane --prompt-tokens 16000
 #
 # --api lokal  → POST {url}/generate            (lokal's native endpoint)
 # --api openai → POST {url}/chat/completions    (llama.cpp, oMLX, vLLM, ...)
+# --api cli    → run the lokal binary once per request. serve mode caps a pooled
+#                slot at 8192 tokens (src/batch.rs POOL_SEQ_CAP), so prompts past
+#                that can only be measured through the CLI path.
 # --out        → append the JSON result line to this file
 
 import argparse
+import hashlib
 import json
+import os
+import re
 import statistics
+import subprocess
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -34,14 +50,87 @@ SENTENCE = (
     "The quick brown fox jumps over the lazy dog while the river runs "
     "quietly under the old stone bridge near the edge of town. "
 )
+# The instruction that follows the prompt body. It has to keep a 0.5B model
+# talking for the full max_tokens: "retell everything above" makes Qwen2.5-0.5B
+# stop after ~12 tokens, which would leave the decode rate measured over almost
+# no work. This phrasing generated the full 128 every time.
+TASK = ("Continue the passage above in the same style, writing a long new chapter "
+        "of at least four hundred words. Do not stop early.")
+# The original ~460-token workload, kept verbatim so the short-prompt table in
+# README.md stays reproducible.
 PROMPT = SENTENCE * 18 + "Retell everything above as one long detailed story. Do not stop."
 MAX_TOKENS = 128
 RUNS = 5       # per single-request metric; the median is reported
 CONC_RUNS = 3  # per concurrency metric
 
+# Long-prompt corpus: Moby Dick from Project Gutenberg — public domain, plain
+# UTF-8, ~1.2 MB (≈290k tokens), far more than the largest prompt we build. It
+# is downloaded on first use into benchmarks/.cache/ (gitignored — the repo does
+# not carry a megabyte of novel) and pinned by sha256 so a silent upstream edit
+# turns into a loud failure instead of a moved baseline.
+CORPUS_URL = "https://www.gutenberg.org/cache/epub/2701/pg2701.txt"
+CORPUS_FILE = "pg2701.txt"
+CORPUS_SHA256 = "9a6844ac0703853720010787c7b6c70b0020f1ab1862dcd74452fa46474d1215"
+CORPUS_LABEL = "gutenberg-2701 (Moby Dick)"
+# Skip the Gutenberg header and the table of contents; chapter 1 opens here.
+CORPUS_START = "Call me Ishmael"
+# Measured on this corpus with Qwen2.5's BPE: 43685 characters of the
+# hard-wrapped prose tokenize to 10743 tokens, i.e. 4.07 characters each. Used
+# only to turn --prompt-tokens into a character slice; the token counts that get
+# reported always come from the engines themselves, so a drifting ratio makes a
+# size label slightly off, never a measurement wrong.
+CHARS_PER_TOKEN = 4.07
+
+# "prefill 12345 tokens in 3.21s (…) | generated 128 tokens in 0.53s (…)"
+CLI_STATS = re.compile(
+    r"prefill (\d+) tokens in ([\d.]+)s.*?generated (\d+) tokens in ([\d.]+)s", re.S
+)
+# "  ANE prefill: 6144 tokens (6 chunks, windowed S=1024 P=5120) in 1.98s"
+CLI_ANE = re.compile(r"ANE prefill: (\d+) tokens \((\d+) chunks.*?\) in ([\d.]+)s")
+
+
+def corpus_text():
+    """The prose body of the pinned book, downloaded once and sha256-verified."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", CORPUS_FILE)
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        print(f"downloading corpus {CORPUS_URL} -> {path}")
+        with urllib.request.urlopen(CORPUS_URL, timeout=120) as r:
+            blob = r.read()
+        with open(path, "wb") as f:
+            f.write(blob)
+    else:
+        with open(path, "rb") as f:
+            blob = f.read()
+    digest = hashlib.sha256(blob).hexdigest()
+    if digest != CORPUS_SHA256:
+        raise SystemExit(
+            f"corpus sha256 mismatch: expected {CORPUS_SHA256}, got {digest}.\n"
+            f"Upstream changed the file — delete {path}, re-check the text, and "
+            f"update CORPUS_SHA256 before trusting any number measured with it."
+        )
+    text = blob.decode("utf-8")
+    return text[text.index(CORPUS_START):]
+
+
+def build_prompt(args):
+    """The fixed prompt body — identical for every engine in a run."""
+    if args.prompt_tokens <= 0:
+        return PROMPT
+    chars = args.prompt_chars or round(args.prompt_tokens * CHARS_PER_TOKEN)
+    text = corpus_text()
+    if chars > len(text):
+        raise SystemExit(f"corpus holds {len(text)} chars, need {chars}")
+    # End on a whole word so the last token is not a truncated fragment.
+    body = text[:chars].rsplit(" ", 1)[0]
+    return f"{body}\n\n{TASK}"
+
 
 def call(args, max_tokens):
-    prompt = f"(session {time.time_ns()}) {PROMPT}"
+    """One request. Returns a dict; keys the transport cannot fill stay None."""
+    prompt = f"(session {time.time_ns()}) {args.prompt_body}"
+    if args.api == "cli":
+        return call_cli(args, prompt, max_tokens)
     if args.api == "lokal":
         body = {"prompt": prompt, "max_tokens": max_tokens, "temperature": 0, "chat": True}
         url = f"{args.url}/generate"
@@ -58,65 +147,164 @@ def call(args, max_tokens):
         headers["authorization"] = f"Bearer {args.bearer}"
     req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
     t0 = time.time()
-    with urllib.request.urlopen(req, timeout=600) as r:
+    with urllib.request.urlopen(req, timeout=args.timeout) as r:
         out = json.load(r)
     wall = time.time() - t0
     if args.api == "lokal":
-        gen = out["generated_tokens"]
+        gen, ptok = out["generated_tokens"], out.get("prompt_tokens")
     else:
-        gen = out["usage"]["completion_tokens"]
-    return wall, gen
+        usage = out.get("usage") or {}
+        gen, ptok = usage["completion_tokens"], usage.get("prompt_tokens")
+    return {"wall": wall, "gen": gen, "prompt_tokens": ptok, "prefill_s": None, "decode_s": None}
 
 
-def median_run(args, max_tokens):
-    walls, gens = [], []
-    for _ in range(RUNS):
-        wall, gen = call(args, max_tokens)
-        walls.append(wall)
-        gens.append(gen)
-    return statistics.median(walls), statistics.median(gens)
+def call_cli(args, prompt, max_tokens):
+    """One run of the lokal binary. Its stderr carries the engine's own timings,
+    which is the only honest prefill number here — process wall would include
+    model load and Core ML graph compilation."""
+    cmd = [args.bin, "-b", args.backend, "-m", args.model, "--chat",
+           "-t", "0", "-n", str(max_tokens), "-p", prompt]
+    t0 = time.time()
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
+    wall = time.time() - t0
+    if p.returncode != 0:
+        raise SystemExit(f"lokal exited {p.returncode}:\n{p.stderr[-2000:]}")
+    m = CLI_STATS.search(p.stderr)
+    if not m:
+        raise SystemExit(f"could not parse lokal's stats line from:\n{p.stderr[-2000:]}")
+    ptok, prefill_s, gen, decode_s = int(m[1]), float(m[2]), int(m[3]), float(m[4])
+    rec = {"wall": wall, "gen": gen, "prompt_tokens": ptok,
+           "prefill_s": prefill_s, "decode_s": decode_s}
+    a = CLI_ANE.search(p.stderr)
+    if a:
+        rec["ane"] = {"tokens": int(a[1]), "chunks": int(a[2]), "secs": float(a[3])}
+    return rec
+
+
+def median_run(args, max_tokens, runs):
+    """`runs` requests; returns the per-field medians plus the last ANE line."""
+    recs = [call(args, max_tokens) for _ in range(runs)]
+    ane = next((r["ane"] for r in reversed(recs) if r.get("ane")), None)
+
+    def med(key):
+        vals = [r[key] for r in recs if r.get(key) is not None]
+        return statistics.median(vals) if vals else None
+
+    return {k: med(k) for k in ("wall", "gen", "prompt_tokens", "prefill_s", "decode_s")} | {"ane": ane}
+
+
+def measure(args):
+    """Prefill seconds and decode tok/s, by whichever route the transport allows.
+
+    Over HTTP the server reports no split, so prefill is the wall of a
+    max_tokens=1 request and decode is the marginal rate against a second,
+    longer request. The CLI prints its own prefill/decode split, so one run per
+    sample suffices — which matters: a 32k Metal prefill costs minutes, and
+    halving the passes halves the whole long-context sweep."""
+    if args.api == "cli":
+        long = median_run(args, args.max_tokens, args.runs)
+        return (long, long["prefill_s"], "engine-internal",
+                long["gen"] / max(long["decode_s"], 1e-9), "engine-internal")
+    short = median_run(args, 1, args.runs)
+    long = median_run(args, args.max_tokens, args.runs)
+    # Both requests pay the same prompt processing, so subtracting the walls
+    # leaves only generation.
+    decode_tps = (long["gen"] - 1) / max(long["wall"] - short["wall"], 1e-9)
+    return long, short["wall"], "http-wall(max_tokens=1)", decode_tps, "marginal-wall"
+
+
+def count_tokens(args, observed):
+    """How many tokens the engine saw. Prefer what it reported; then llama.cpp's
+    /tokenize; then a labelled character estimate."""
+    if observed is not None:
+        return int(observed), "engine-reported"
+    body = json.dumps({"content": args.prompt_body}).encode()
+    req = urllib.request.Request(
+        args.url.removesuffix("/v1") + "/tokenize", data=body,
+        headers={"content-type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return len(json.load(r)["tokens"]), "/tokenize"
+    except Exception:
+        return round(len(args.prompt_body) / 4), "chars/4 estimate"
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--api", choices=["lokal", "openai"], required=True)
-    ap.add_argument("--url", required=True)
-    ap.add_argument("--model", default="", help="model name for the openai api")
+    ap.add_argument("--api", choices=["lokal", "openai", "cli"], required=True)
+    ap.add_argument("--url", default="", help="server base url (lokal/openai apis)")
+    ap.add_argument("--model", default="", help="model name for the openai api, repo/dir for the cli")
     ap.add_argument("--name", default="", help="label to print")
     ap.add_argument("--out", default="", help="append the JSON result line to this file")
     ap.add_argument("--bearer", default="", help="Authorization: Bearer token, if the server wants one")
+    ap.add_argument("--bin", default="./target/release/lokal", help="lokal binary for --api cli")
+    ap.add_argument("--backend", default="ane", help="lokal backend for --api cli")
+    ap.add_argument("--prompt-tokens", type=int, default=0,
+                    help="build the prompt from the corpus at roughly this many tokens (0 = the short synthetic prompt)")
+    ap.add_argument("--prompt-chars", type=int, default=0, help="override the character slice directly")
+    ap.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
+    ap.add_argument("--runs", type=int, default=RUNS)
+    ap.add_argument("--conc-runs", type=int, default=CONC_RUNS)
+    ap.add_argument("--warmup", type=int, default=1,
+                    help="untimed requests before measuring (0 to skip — a 32k cli pass is minutes)")
+    ap.add_argument("--concurrency", type=int, default=4)
+    ap.add_argument("--no-concurrent", action="store_true", help="skip the concurrency metric")
+    ap.add_argument("--timeout", type=int, default=1800, help="per-request timeout, seconds")
+    ap.add_argument("--tag", default="", help="free-form label recorded in the JSON line")
     args = ap.parse_args()
     name = args.name or args.api
+    args.prompt_body = build_prompt(args)
+    conc = 0 if (args.no_concurrent or args.api == "cli") else args.concurrency
 
-    call(args, MAX_TOKENS)  # warmup: first request pays caches, JIT, model load
+    for _ in range(args.warmup):
+        call(args, args.max_tokens)  # first request pays caches, JIT, model load
 
-    prefill_wall, _ = median_run(args, 1)
-    long_wall, long_gen = median_run(args, MAX_TOKENS)
-    decode_tps = (long_gen - 1) / max(long_wall - prefill_wall, 1e-9)
+    long, prefill_s, prefill_method, decode_tps, decode_method = measure(args)
+    long_gen = int(long["gen"])
+    ptok, ptok_src = count_tokens(args, long["prompt_tokens"])
+    prefill_tps = ptok / max(prefill_s, 1e-9)
 
-    agg_runs, conc_gen = [], 0
-    for _ in range(CONC_RUNS):
-        t0 = time.time()
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            results = list(ex.map(lambda _: call(args, MAX_TOKENS), range(4)))
-        conc_gen = sum(g for _, g in results)
-        agg_runs.append(conc_gen / (time.time() - t0))
-    agg_tps = statistics.median(agg_runs)
+    agg_tps, conc_gen = None, 0
+    if conc:
+        agg_runs = []
+        for _ in range(args.conc_runs):
+            t0 = time.time()
+            with ThreadPoolExecutor(max_workers=conc) as ex:
+                results = list(ex.map(lambda _: call(args, args.max_tokens), range(conc)))
+            conc_gen = sum(r["gen"] for r in results)
+            agg_runs.append(conc_gen / (time.time() - t0))
+        agg_tps = statistics.median(agg_runs)
 
+    conc_txt = f" | {conc}x concurrent {agg_tps:6.1f} tok/s ({conc_gen} gen/run)" if conc else ""
     print(
-        f"{name:24s} prefill {prefill_wall:6.2f}s | decode {decode_tps:6.1f} tok/s"
-        f" ({long_gen} gen) | 4x concurrent {agg_tps:6.1f} tok/s ({conc_gen} gen/run)"
+        f"{name:26s} {ptok:6d} tok prompt | prefill {prefill_s:7.2f}s ({prefill_tps:7.1f} tok/s)"
+        f" | decode {decode_tps:6.1f} tok/s ({long_gen} gen){conc_txt}"
     )
     line = json.dumps({
         "name": name,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "prefill_s": round(prefill_wall, 3),
+        "tag": args.tag,
+        "api": args.api,
+        "prompt_target_tokens": args.prompt_tokens,
+        "prompt_chars": len(args.prompt_body),
+        "prompt_tokens": ptok,
+        "prompt_tokens_source": ptok_src,
+        "corpus": CORPUS_LABEL if args.prompt_tokens > 0 else "synthetic-460",
+        "prefill_s": round(prefill_s, 3),
+        "prefill_tps": round(prefill_tps, 1),
+        "prefill_method": prefill_method,
         "decode_tps": round(decode_tps, 1),
+        "decode_method": decode_method,
         "single_gen_tokens": long_gen,
-        "concurrent4_agg_tps": round(agg_tps, 1),
+        "ane_prefill": long["ane"],
+        "concurrency": conc,
+        "concurrent4_agg_tps": round(agg_tps, 1) if agg_tps else None,
         "concurrent4_gen_tokens": conc_gen,
-        "runs": RUNS,
-        "conc_runs": CONC_RUNS,
+        "max_tokens": args.max_tokens,
+        "runs": args.runs,
+        "warmup": args.warmup,
+        "conc_runs": args.conc_runs if conc else 0,
     })
     print(line)
     if args.out:
