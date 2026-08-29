@@ -19,11 +19,19 @@ case "$cmd" in
   ane) # ./run.sh ane "prompt text"  — prefill on the Neural Engine + decode on Metal
     exec "$BIN" -b ane -p "${1:-Once upon a time}"
     ;;
-  export-ane) # ./run.sh export-ane [repo or dir]  — build the prefill graphs (once per model)
+  export-ane) # ./run.sh export-ane [repo or dir]  — build the plain prefill graphs (fast, once per model)
     MODEL="${1:-HuggingFaceTB/SmolLM2-135M}"
     if [ -d "$MODEL" ]; then DIR="$MODEL"; else DIR="$("$BIN" path -m "$MODEL")"; fi
     exec uv run --python 3.12 --with torch --with coremltools --with safetensors --with numpy --with tokenizers \
-      tools/export_prefill.py "$DIR" --shapes 512,2048 --window 1024x7168
+      tools/export_prefill.py "$DIR" --shapes 512,2048 --window none
+    ;;
+  export-ane-long) # ./run.sh export-ane-long [repo or dir]  — add the long-context windowed graph (slow)
+    MODEL="${1:-HuggingFaceTB/SmolLM2-135M}"
+    if [ -d "$MODEL" ]; then DIR="$MODEL"; else DIR="$("$BIN" path -m "$MODEL")"; fi
+    echo "note: the windowed graph takes minutes to convert, and its first load on each" >&2
+    echo "      machine spends ~4 min more in the ANE compiler (one-time, then cached)." >&2
+    exec uv run --python 3.12 --with torch --with coremltools --with safetensors --with numpy --with tokenizers \
+      tools/export_prefill.py "$DIR" --shapes none --window 1024x7168
     ;;
   chat) # ./run.sh chat "question"  — Q&A against an Instruct model with the chat template
     exec "$BIN" -m HuggingFaceTB/SmolLM2-135M-Instruct --chat \

@@ -87,25 +87,29 @@ Architectures: `LlamaForCausalLM`, `Qwen2ForCausalLM`, `MistralForCausalLM`.
 
 ## Backends
 
-Pick with `-b cpu | metal | ane`. cpu and metal are verified to produce
-identical greedy output. The ane backend is an fp16 path held to a measured
-numeric envelope; on long prompts it may resolve a greedy near-tie into a
-different (equally sensible) token than the f32 backends — see DESIGN.md for
-the exact gate.
+Pick with `-b cpu | metal | ane`. All three are verified to produce identical
+greedy output, so switching backends never changes what the model says — only
+how fast it says it.
 
 ### ANE setup (optional, once per model)
 
 ```bash
-./run.sh export-ane        # builds prefill graphs (512 and 2048 tokens) next to the cached model
+./run.sh export-ane        # builds the plain prefill graphs (512 and 2048 tokens) — a few minutes
+./run.sh export-ane-long   # optional: adds the long-context windowed graph (slow; see note below)
 ./run.sh ane "Once upon a time"
 ```
 
 lokal picks the graph that fits the prompt: tiny prompts (< 64 tokens) skip
-the ANE — the GPU is faster there — and long prompts run in chunks through a
-windowed graph that carries the accumulated context, keeping everything up
-to ~6k tokens on the ANE (beyond that, Metal takes the tail seamlessly).
-That is what makes long prompts fast: a 6,086-token prompt prefills in
-3.3 s vs 14.1 s on Metal alone.
+the ANE — the GPU is faster there — and, when the windowed graph is present,
+long prompts run in chunks through it, carrying the accumulated context and
+keeping everything up to 8k tokens on the ANE (beyond that, Metal takes the
+tail seamlessly). That is what makes long prompts fast: a 6,086-token prompt
+prefills in 3.3 s vs 14.1 s on Metal alone. Without the windowed graph the
+ANE still serves the first 2,048 tokens and Metal the rest.
+
+The windowed graph is the expensive one — minutes to export, and the first
+load on each machine spends a few more minutes in Apple's ANE compiler
+(one-time; cached after that, with a notice printed while it runs).
 
 The export step needs [uv](https://docs.astral.sh/uv/) and runs offline.
 Placement is verified, not assumed: inspecting the compiled graph with the
@@ -154,10 +158,8 @@ cargo test
 
 The main correctness gate is deterministic cross-backend comparison: with
 `--temperature 0`, the same prompt must produce token-identical output on
-cpu and metal; the fp16 ane backend is held to a numeric envelope vs the f32
-reference (position-flat, no NaN) and may differ at greedy near-ties on long
-prompts. Architecture notes, backend internals, and the guide for adding new
-backends live in [DESIGN.md](DESIGN.md).
+cpu, metal, and ane. Architecture notes, backend internals, and the guide for
+adding new backends live in [DESIGN.md](DESIGN.md).
 
 ## Roadmap
 

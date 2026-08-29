@@ -240,17 +240,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model_dir", type=Path)
     ap.add_argument("--shapes", default="512,2048",
-                    help="sequence lengths to export, comma-separated (one graph each)")
+                    help="sequence lengths to export, comma-separated (one graph each), 'none' to skip")
     ap.add_argument("--window", default="1024x7168",
                     help="windowed graph as SxP (chunk x past), 'none' to skip")
     args = ap.parse_args()
-    shapes = sorted(int(s) for s in args.shapes.split(","))
+    shapes = [] if args.shapes == "none" else sorted(int(s) for s in args.shapes.split(","))
 
     import coremltools as ct
 
     cfg = json.loads((args.model_dir / "config.json").read_text())
     weights = load_file(args.model_dir / "model.safetensors")
-    net = PrefillNet(cfg, weights, shapes[-1]).eval()
+    net = PrefillNet(cfg, weights, shapes[-1]).eval() if shapes else None
 
     done = []
     for seq in shapes:
