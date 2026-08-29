@@ -230,6 +230,70 @@ def count_tokens(args, observed):
         return round(len(args.prompt_body) / 4), "chars/4 estimate"
 
 
+def _cpu_seconds():
+    """pid -> (ppid, accumulated cpu seconds, command)."""
+    out = subprocess.run(["ps", "-Ao", "pid=,ppid=,time=,comm="],
+                         capture_output=True, text=True).stdout
+    snap = {}
+    for line in out.splitlines():
+        f = line.split(None, 3)
+        if len(f) != 4:
+            continue
+        parts = [float(x) for x in f[2].split(":")]
+        secs = 0.0
+        for x in parts:
+            secs = secs * 60 + x
+        snap[int(f[0])] = (int(f[1]), secs, f[3])
+    return snap
+
+
+def machine_state(own, ambient=(), window=2.0):
+    """Load averages plus the heaviest processes that are not ours.
+
+    Every number in this file is bandwidth- or core-bound, so a second agent
+    compiling a Core ML graph on the same laptop moves it as far as a second
+    agent on the GPU would. Sampling this into each row is what lets a reader
+    tell a measurement from a coincidence.
+
+    CPU share is computed from the DELTA in accumulated cpu-time across a short
+    window, not from `ps -o pcpu`: that column is an average over the process's
+    whole lifetime, so a service that burned a core for ten minutes and then
+    went idle still reports ~100%, and a guard built on it cries wolf forever.
+
+    `ambient` names pids that are accepted background load: they are reported
+    separately and stamped into the row, but they do not gate it. That is for a
+    steady consumer nobody can remove — an orphaned root-owned compile, say —
+    where blocking forever costs more than disclosing the perturbation.
+    """
+    a = _cpu_seconds()
+    time.sleep(window)
+    b = _cpu_seconds()
+
+    def ours(pid):  # walk up to init; our own children must not count as noise
+        for _ in range(64):
+            if pid in own:
+                return True
+            pid = b.get(pid, (0,))[0]
+            if pid <= 1:
+                return False
+        return False
+
+    busy, amb = [], []
+    for pid, (_, secs, comm) in b.items():
+        was = a.get(pid)
+        pct = (secs - was[1]) / window * 100 if was else 0.0
+        if pct < 20 or ours(pid):
+            continue
+        (amb if pid in ambient else busy).append((pct, f"{comm.rsplit('/', 1)[-1][:40]}[{pid}]"))
+    busy.sort(reverse=True)
+    load = os.getloadavg()
+    return {"load1": round(load[0], 2), "load5": round(load[1], 2),
+            "foreign_cpu": round(sum(p for p, _ in busy), 1),
+            "top": [[round(p, 1), c] for p, c in busy[:4]],
+            "ambient_cpu": round(sum(p for p, _ in amb), 1),
+            "ambient": [[round(p, 1), c] for p, c in amb]}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--api", choices=["lokal", "openai", "cli"], required=True)
@@ -252,10 +316,35 @@ def main():
     ap.add_argument("--no-concurrent", action="store_true", help="skip the concurrency metric")
     ap.add_argument("--timeout", type=int, default=1800, help="per-request timeout, seconds")
     ap.add_argument("--tag", default="", help="free-form label recorded in the JSON line")
+    ap.add_argument("--max-load", type=float, default=4.0,
+                    help="refuse to measure when the 1-minute load average is above this")
+    ap.add_argument("--ambient-pid", default="",
+                    help="comma-separated pids of accepted background load: reported "
+                         "and stamped into the row, but not gated on")
+    ap.add_argument("--max-foreign-cpu", type=float, default=150.0,
+                    help="refuse to measure when other processes are burning more "
+                         "than this much cpu (percent of one core, summed)")
     args = ap.parse_args()
     name = args.name or args.api
     args.prompt_body = build_prompt(args)
     conc = 0 if (args.no_concurrent or args.api == "cli") else args.concurrency
+
+    own = {os.getpid()}
+    ambient = {int(x) for x in args.ambient_pid.split(",") if x.strip()}
+    before = machine_state(own, ambient)
+    # Two gates, because neither alone is enough: load average is the honest
+    # sustained-quiet signal but lags a minute behind reality, and instantaneous
+    # foreign cpu catches a compute job that just started. A desktop at rest
+    # still burns ~60-80% on WindowServer and a browser, so the cpu gate sits
+    # well above that and only fires on something doing real work.
+    if before["load1"] - before["ambient_cpu"] / 100 > args.max_load \
+            or before["foreign_cpu"] > args.max_foreign_cpu:
+        raise SystemExit(
+            f"machine is busy: load1 {before['load1']} (max {args.max_load}), "
+            f"foreign cpu {before['foreign_cpu']}% (max {args.max_foreign_cpu}); "
+            f"busiest {before['top']}. Refusing to measure — a contended row is "
+            f"worse than a missing one."
+        )
 
     for _ in range(args.warmup):
         call(args, args.max_tokens)  # first request pays caches, JIT, model load
@@ -304,6 +393,8 @@ def main():
         "max_tokens": args.max_tokens,
         "runs": args.runs,
         "warmup": args.warmup,
+        "machine_before": before,
+        "machine_after": machine_state(own, ambient),
         "conc_runs": args.conc_runs if conc else 0,
     })
     print(line)

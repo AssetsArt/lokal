@@ -145,6 +145,8 @@ def main():
     ap.add_argument("--concurrency", type=int, default=0, help="0 = single-stream only")
     ap.add_argument("--conc-runs", type=int, default=3)
     ap.add_argument("--logdir", default="/tmp")
+    ap.add_argument("--ambient-pid", default="",
+                    help="passed through to bench_engines.py: accepted background load")
     args = ap.parse_args()
 
     sizes = [int(s) for s in args.sizes.split(",")]
@@ -160,6 +162,8 @@ def main():
                        "--prompt-tokens", str(size), "--name", f"{key} @{size}",
                        "--out", args.out, "--tag", args.tag,
                        "--runs", str(args.runs), "--warmup", str(args.warmup)]
+                if args.ambient_pid:
+                    cmd += ["--ambient-pid", args.ambient_pid]
                 if args.concurrency:
                     cmd += ["--concurrency", str(args.concurrency),
                             "--conc-runs", str(args.conc_runs)]

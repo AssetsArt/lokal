@@ -58,6 +58,19 @@ def cell(r, metric):
         return f"{r['decode_tps']:.0f} tok/s{note}"
     if metric == "tokens":
         return str(r["prompt_tokens"])
+    if metric == "split":
+        # Where the prompt was actually processed. The ANE only ever covers the
+        # first s+p positions of its windowed graph; everything past that is a
+        # Metal prefill, and that tail is what grows with context.
+        a = r.get("ane_prefill")
+        if not a:
+            return "all Metal"
+        tail_tok = r["prompt_tokens"] - a["tokens"]
+        tail_s = r["prefill_s"] - a["secs"]
+        if tail_tok <= 0:
+            return f"ANE {a['tokens']} tok / {a['secs']:.2f} s (no tail)"
+        return (f"ANE {a['tokens']} tok / {a['secs']:.2f} s + "
+                f"Metal {tail_tok} tok / {tail_s:.2f} s")
     return f"{r['concurrent4_agg_tps']:.0f} tok/s" if r.get("concurrent4_agg_tps") else "—"
 
 
@@ -90,6 +103,7 @@ def main():
     titles = {"prefill": "Prefill (wall / tokens per second)",
               "decode": "Decode (marginal tokens per second)",
               "tokens": "Prompt length as each engine tokenized it",
+              "split": "Where lokal prefilled it (ANE window vs Metal tail)",
               "concurrent": "Concurrent aggregate throughput"}
     for metric in ([args.metric] if args.metric else ["prefill", "decode", "tokens"]):
         print(f"\n**{titles[metric]}**\n")
