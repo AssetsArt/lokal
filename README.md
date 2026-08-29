@@ -39,7 +39,7 @@ Measured on an M1 Pro with `-t 0` (SmolLM2-135M unless noted):
 |---|---|---|---|
 | decode | ~49 tok/s | ~230–270 tok/s | = metal |
 | decode (Qwen2.5-0.5B) | ~27 tok/s | ~130 tok/s | — |
-| prefill (676-token prompt) | ~33 tok/s | ~740 tok/s | **~1,700 tok/s** |
+| prefill (676-token prompt) | ~33 tok/s | ~890 tok/s | **~1,900 tok/s** |
 
 Decode speed comes from keeping f16 weights resident on the GPU. Prefill speed
 comes from batching the prompt into tiled matrix-matrix work — and the `ane`
@@ -52,8 +52,8 @@ What that means end to end (676-token prompt, 200 tokens generated):
 | backend | first token after | decode | total |
 |---|---|---|---|
 | cpu | 18.4 s | ~27 tok/s | ~26 s |
-| metal | 0.91 s | ~228 tok/s | ~1.8 s |
-| ane | **0.40 s** | ~231 tok/s | **~1.3 s** |
+| metal | 0.76 s | ~213 tok/s | ~1.7 s |
+| ane | **0.35 s** | ~232 tok/s | **~1.2 s** |
 
 The `ane` backend doesn't change decode speed — it cuts time-to-first-token,
 which is the number you actually feel in a chat.
@@ -64,8 +64,8 @@ one request while the GPU decodes the others:
 
 | 4 concurrent requests (451-token prompts) | metal | ane (hybrid) |
 |---|---|---|
-| single-request prefill | 0.56 s | **0.06 s** |
-| aggregate throughput | 126 tok/s | **264 tok/s** |
+| single-request prefill | 0.45 s | **0.06 s** |
+| aggregate throughput | 166 tok/s | **331 tok/s** |
 
 How lokal compares against other engines on the same machine and model, with
 reproduction steps, lives in [benchmarks/](benchmarks/).
@@ -165,7 +165,7 @@ adding new backends live in [DESIGN.md](DESIGN.md).
 - [ ] Streaming responses (SSE)
 - [ ] Quantized weights (int8/int4) for larger models on modest RAM
 - [ ] Continuous batching — one weight read serves every active request
-- [ ] `simdgroup_matrix` (MMA) matmul on Metal
+- [x] `simdgroup_matrix` (MMA) matmul on Metal
 - [ ] CUDA (NVIDIA) and Vulkan (AMD/portable) backends
 - [x] Multi-size ANE prefill graphs (512/2048) with automatic routing per prompt length
 - [ ] ANE decode via Core ML stateful models (MLState)

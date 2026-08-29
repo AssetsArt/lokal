@@ -114,13 +114,15 @@ performance:
    command buffer, submitted once, waited on once. Token ids go in, logits come
    out; the KV cache never leaves the GPU. On M-series unified memory, even
    those crossings are plain memcpys.
-3. **matvec for decode, tiled matmul for prefill.** Every kernel takes an
-   `n_rows` parameter; decode is simply `n_rows = 1`. For prefill,
+3. **matvec for decode, simdgroup-matrix matmul for prefill.** Every kernel
+   takes an `n_rows` parameter; decode is simply `n_rows = 1`. For prefill,
    `enc_linear` switches to a threadgroup-tiled matmul (8 tokens × 32 outputs
    × 32-wide k-slices staged in on-chip memory), so one read of W serves a
-   whole chunk of tokens instead of a single one. Prompts are processed in
-   chunks of 128; later chunks attend to earlier ones through the cache, and
-   causality is just the per-row loop bound `0..=pos0+row`.
+   whole chunk of tokens instead of a single one — and the multiply itself
+   runs on the GPU's matrix hardware (`simdgroup_multiply_accumulate` on 8×8
+   blocks, staged as f32 so accumulation precision is unchanged). Prompts are
+   processed in chunks of 128; later chunks attend to earlier ones through
+   the cache, and causality is just the per-row loop bound `0..=pos0+row`.
 
 4. **Decode has its own fused path.** A single decode step is hundreds of tiny
    launches, so launch count and bandwidth efficiency dominate. When
@@ -333,8 +335,8 @@ Roughly ordered by leverage:
    large enough (i.e. bigger models); the open questions are whether ANE
    placement survives the state ops.
 5. The rest: an OpenAI-compatible API (`/v1/chat/completions`) and SSE
-   streaming in serve mode; `simdgroup_matrix` MMA on Metal; flash-style
-   attention for the *prefill* path (its weighted-V loop is still serial per
-   thread, which is what caps very-long-prompt Metal prefill); a hybrid
-   scheduler that picks the backend automatically; CUDA/Vulkan backends on
-   the same Engine/Session seam.
+   streaming in serve mode; flash-style attention for the *prefill* path
+   (its weighted-V loop is still serial per thread, and it is now the
+   dominant prefill cost — the matmuls run on simdgroup matrix hardware);
+   a hybrid scheduler that picks the backend automatically; CUDA/Vulkan
+   backends on the same Engine/Session seam.

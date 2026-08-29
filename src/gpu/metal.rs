@@ -340,12 +340,13 @@ impl MetalEngine {
             enc.set_buffer(2, Some(x), x_off);
             enc.set_buffer(3, Some(y), y_off);
             enc.set_bytes(4, size_of::<MatmulParams>() as u64, &p as *const _ as *const _);
-            // 2D grid: (tiles of 32 outputs) × (tiles of 8 tokens) — see MM_* in kernels.metal.
+            // 2D grid: (tiles of 32 outputs) × (tiles of 8 tokens), 128 threads =
+            // 4 simdgroups per tile — see MM_* in kernels.metal.
             let tiles_out = (l.out_dim as u64).div_ceil(32);
             let tiles_row = (n_rows as u64).div_ceil(8);
             enc.dispatch_thread_groups(
                 MTLSize::new(tiles_out, tiles_row, 1),
-                MTLSize::new(256, 1, 1),
+                MTLSize::new(128, 1, 1),
             );
         }
     }

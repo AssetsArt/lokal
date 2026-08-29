@@ -24,8 +24,8 @@ ones lokal loses — they exist to steer the roadmap, not to advertise.
 
 | engine | version | prefill (~460 tok) | decode | 4x concurrent aggregate |
 |---|---|---|---|---|
-| lokal `-b metal` | main | 0.56 s | 241 tok/s | 126 tok/s |
-| lokal `-b ane` | main | **0.06 s** | 240 tok/s | 264 tok/s |
+| lokal `-b metal` | main | 0.45 s | 240 tok/s | 166 tok/s |
+| lokal `-b ane` | main | **0.06 s** | 237 tok/s | 331 tok/s |
 | llama.cpp | b9960 | **0.06 s** | 215 tok/s | **355 tok/s** |
 | oMLX | 0.6.3rc3 | 0.12 s | **262 tok/s** | 332 tok/s |
 | vLLM Metal | 0.1.0 | 0.08 s | 253 tok/s ¹ | 217 tok/s ¹ |
