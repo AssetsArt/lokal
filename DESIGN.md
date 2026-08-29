@@ -100,7 +100,7 @@ invariants worth keeping are in `src/gpu/mod.rs`.
 
 ## Metal backend
 
-`gpu/metal.rs` + `gpu/kernels.metal`. Three decisions carry all of its
+`gpu/metal.rs` + `gpu/kernels.metal`. Four decisions carry all of its
 performance:
 
 1. **Weights are f16 and resident.** Decode is memory-bandwidth-bound: every
@@ -120,6 +120,20 @@ performance:
    whole chunk of tokens instead of a single one. Prompts are processed in
    chunks of 128; later chunks attend to earlier ones through the cache, and
    causality is just the per-row loop bound `0..=pos0+row`.
+
+4. **Decode has its own fused path.** A single decode step is hundreds of tiny
+   launches, so launch count and bandwidth efficiency dominate. When
+   `n_rows == 1` the layer loop switches to fused kernels — q/k/v in one
+   dispatch (k,v written straight into their cache slot), the whole SwiGLU
+   inner step in one, residual adds folded into o/down matvecs, RoPE for q+k
+   in one — 9 dispatches per layer instead of 15. Attention becomes
+   flash-decoding: cached positions split into 128-wide windows, one
+   threadgroup per (head, window) computes a partial softmax-weighted sum
+   (scores never touch device memory), and a tiny second kernel merges the
+   windows with the online-softmax rule — the position loop that used to be
+   serial per head now spreads across the whole GPU. All dot products load
+   `half4`/`float4` vectors, which is what pushes a bandwidth-bound kernel
+   toward peak. Prefill keeps the plain tiled-matmul path.
 
 The kernels are deliberately annotated against their CPU twins — `matvec` ↔
 `math::matvec`, `attention` ↔ `model::attention`, and so on.
@@ -171,23 +185,25 @@ values and run offline.
 
 | workload | cpu | metal | ane hybrid |
 |---|---|---|---|
-| decode (short context) | ~49 tok/s | ~160–190 tok/s | = metal |
-| prefill, 669-token prompt | ~33 tok/s | ~740 tok/s | ~1,780 tok/s |
+| decode (short context) | ~49 tok/s | ~267 tok/s | = metal |
+| decode (~500 positions) | — | ~237 tok/s | = metal |
+| prefill, 676-token prompt | ~33 tok/s | ~740 tok/s | ~1,700 tok/s |
 | ANE-only portion (512 tokens) | — | — | ~0.07 s |
 
-End to end — 669-token prompt, 200 tokens generated:
+End to end — 676-token prompt, 200 tokens generated:
 
 | backend | TTFT | decode | total |
 |---|---|---|---|
 | cpu | 18.4 s | ~27 tok/s | ~26 s |
-| metal | 0.90 s | ~62 tok/s | ~4.2 s |
-| ane+metal | 0.37 s | ~62 tok/s | ~3.6 s |
+| metal | 0.91 s | ~228 tok/s | ~1.8 s |
+| ane+metal | 0.40 s | ~231 tok/s | ~1.3 s |
 
 Two readings worth taking away. First, the hybrid's decode speed is exactly
 Metal's — the ANE changes time-to-first-token only, and at chat latencies
-0.90 s → 0.37 s is very perceptible. Second, decode slows as context grows
-(~190 tok/s near-empty vs ~62 tok/s at ~870 positions) because attention's
-cost is linear in cached positions.
+0.91 s → 0.40 s is very perceptible. Second, decode still slows as context
+grows (attention's cost is linear in cached positions), but flash-decoding
+flattened the slide dramatically: before it, the same run decoded at
+~76 tok/s; the remaining per-position cost is mostly the f32 KV cache reads.
 
 ## Where the time goes
 
@@ -196,12 +212,13 @@ Each device has its own cost structure:
 
 - **cpu** — matvec is 90%+ of everything; one token is one full pass over the
   weights through the memory hierarchy.
-- **metal** — the same arithmetic becomes ~450 dispatches encoded into one
-  command buffer per step. The decode floor is streaming the f16 weights; the
-  fixed costs are command encoding and the single sync per step; attention
-  grows linearly with context (the 190 → 62 tok/s slide above); and prefill
-  moves the cost into the tiled matmul, where *reuse* — not raw FLOPs — is the
-  lever that matters.
+- **metal** — the same arithmetic becomes ~270 fused dispatches (decode) or
+  ~450 plain ones (prefill) encoded into one command buffer per step. The
+  decode floor is streaming the f16 weights (~1.4 ms/token for 135M at full
+  bandwidth); the fixed costs are launch overhead and the single sync per
+  step; attention grows linearly with context but is spread across the GPU
+  by flash-decoding; and prefill moves the cost into the tiled matmul, where
+  *reuse* — not raw FLOPs — is the lever that matters.
 - **ane** — execution is a black box scheduled by Core ML. What stays visible
   from outside is the fixed-shape graph execution (~70 ms for 512 positions)
   and the Core ML ↔ Metal handoff (one K/V memcpy per prefill).
@@ -221,16 +238,16 @@ submission are documented thread-safe. Measured (M1 Pro, SmolLM2-135M,
 
 | | metal | ane hybrid |
 |---|---|---|
-| prefill + wait, per request | ~1.9 s | ~0.1–0.2 s |
+| single-request prefill | ~0.56 s | ~0.06 s |
 | ANE prefill time under load | — | 0.05–0.18 s (≈ idle) |
-| aggregate throughput | 77 gen-tok/s | 124 gen-tok/s |
+| aggregate throughput | 126 gen-tok/s | 264 gen-tok/s |
 
-Aggregate decode saturates at ~4 concurrent generations (~124 gen-tok/s);
-past that, extra concurrency only splits the same tokens/sec across more
-requests and holds more KV caches in RAM. So serve admits `--max-concurrent`
-requests (default 4) into generation and queues the rest FIFO (a tokio
-semaphore): at 16 concurrent requests, admitted ones still decode at
-~32 tok/s each instead of ~8. Raising the ceiling itself needs continuous
+Aggregate decode saturates at a few concurrent generations; past that, extra
+concurrency only splits the same tokens/sec across more requests and holds
+more KV caches in RAM. So serve admits `--max-concurrent` requests (default
+4) into generation and queues the rest FIFO (a tokio semaphore) — under a
+16-request burst, admitted requests keep their full share instead of
+everyone slowing to a crawl. Raising the ceiling itself needs continuous
 batching (Future work).
 
 ### Why not split tensors across ANE + GPU?
@@ -256,11 +273,11 @@ where every ANE↔GPU boundary costs a graph invocation.
 
 Roughly ordered by leverage:
 
-1. **Faster long-context decode** — Metal decode slides ~190 → ~62 tok/s as
-   context grows. During decode the attention kernel parallelizes only
-   across heads (9 threadgroups on SmolLM2-135M — most of the GPU idles).
-   Split cached positions across threadgroups and reduce (flash-decoding
-   style), and store the KV cache as f16 to halve its bandwidth.
+1. **f16 KV cache** — the last piece of the decode-speed work (the
+   flash-decoding attention, fused decode kernels, and vectorized loads
+   landed already — ~76 → ~237 tok/s at ~500 positions). Halving the KV
+   bytes flattens the remaining per-position cost; it touches both attention
+   paths, the RoPE cache writes, and the ANE handoff.
 2. **Quantization (int8/int4)** — shrinks the bandwidth bill that sets the
    decode floor on every device, and admits 1B–8B models on modest RAM.
    Needs its own quality methodology: quantized greedy output no longer

@@ -37,9 +37,9 @@ Measured on an M1 Pro with `-t 0` (SmolLM2-135M unless noted):
 
 | workload | cpu | metal | ane (hybrid) |
 |---|---|---|---|
-| decode | ~49 tok/s | ~160–190 tok/s | = metal |
-| decode (Qwen2.5-0.5B) | ~27 tok/s | ~106 tok/s | — |
-| prefill (669-token prompt) | ~33 tok/s | ~740 tok/s | **~1,780 tok/s** |
+| decode | ~49 tok/s | ~230–270 tok/s | = metal |
+| decode (Qwen2.5-0.5B) | ~27 tok/s | ~130 tok/s | — |
+| prefill (676-token prompt) | ~33 tok/s | ~740 tok/s | **~1,700 tok/s** |
 
 Decode speed comes from keeping f16 weights resident on the GPU. Prefill speed
 comes from batching the prompt into tiled matrix-matrix work — and the `ane`
@@ -47,13 +47,13 @@ backend pushes prompt processing onto the Neural Engine, which is faster
 still, draws far less power, and leaves the GPU free to decode for other
 requests in serve mode.
 
-What that means end to end (669-token prompt, 200 tokens generated):
+What that means end to end (676-token prompt, 200 tokens generated):
 
 | backend | first token after | decode | total |
 |---|---|---|---|
 | cpu | 18.4 s | ~27 tok/s | ~26 s |
-| metal | 0.90 s | ~62 tok/s | ~4.2 s |
-| ane | **0.37 s** | ~62 tok/s | ~3.6 s |
+| metal | 0.91 s | ~228 tok/s | ~1.8 s |
+| ane | **0.40 s** | ~231 tok/s | **~1.3 s** |
 
 The `ane` backend doesn't change decode speed — it cuts time-to-first-token,
 which is the number you actually feel in a chat.
@@ -64,8 +64,11 @@ one request while the GPU decodes the others:
 
 | 4 concurrent requests (451-token prompts) | metal | ane (hybrid) |
 |---|---|---|
-| prefill + wait, per request | ~1.9 s | **~0.1 s** |
-| aggregate throughput | 77 tok/s | **124 tok/s** |
+| single-request prefill | 0.56 s | **0.06 s** |
+| aggregate throughput | 126 tok/s | **264 tok/s** |
+
+How lokal compares against other engines on the same machine and model, with
+reproduction steps, lives in [benchmarks/](benchmarks/).
 
 ## Supported models
 
@@ -146,7 +149,8 @@ adding new backends live in [DESIGN.md](DESIGN.md).
 
 ## Roadmap
 
-- [ ] Faster long-context decode — split-position attention + f16 KV cache on Metal
+- [x] Fast decode on Metal — flash-decoding attention, fused kernels, vectorized loads
+- [ ] f16 KV cache — halve the attention bandwidth bill at long context
 - [ ] OpenAI-compatible API in serve mode (`/v1/chat/completions`, works with existing clients)
 - [ ] Streaming responses (SSE)
 - [ ] Quantized weights (int8/int4) for larger models on modest RAM

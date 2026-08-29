@@ -24,12 +24,16 @@ ones lokal loses — they exist to steer the roadmap, not to advertise.
 
 | engine | version | prefill (~460 tok) | decode | 4x concurrent aggregate |
 |---|---|---|---|---|
-| lokal `-b metal` | 05dbba1 | 0.57 s | 76 tok/s | 78 tok/s |
-| lokal `-b ane` | 05dbba1 | **0.08 s** | 75 tok/s | 115 tok/s |
+| lokal `-b metal` | main | 0.56 s | 241 tok/s | 126 tok/s |
+| lokal `-b ane` | main | **0.06 s** | 240 tok/s | 264 tok/s |
 | llama.cpp | b9960 | **0.06 s** | 215 tok/s | **355 tok/s** |
 | oMLX | 0.6.3rc3 | 0.12 s | **262 tok/s** | 332 tok/s |
 | vLLM Metal | 0.1.0 | 0.08 s | 253 tok/s ¹ | 217 tok/s ¹ |
 | SGLang | — | n/a: no macOS support | | |
+
+Before the decode-optimization pass (commit 05dbba1: pre flash-decoding
+attention, unfused kernels, scalar loads) lokal decoded at 76 tok/s and
+aggregated 78 (metal) / 115 (ane) — those runs are kept in results.jsonl.
 
 ¹ vLLM Metal stopped some completions early (123 of 128 single, 369 of 512
 concurrent tokens generated); its tok/s are computed from the tokens it
@@ -39,17 +43,17 @@ Raw per-run output: [results.jsonl](results.jsonl).
 
 ## Reading
 
-- **Prefill**: lokal's ANE path is in the leaders' club (0.08 s), and it is
-  the only engine here doing prompt processing off-GPU — under concurrent
+- **Prefill**: lokal's ANE path ties llama.cpp for the lead (0.06 s), and it
+  is the only engine here doing prompt processing off-GPU — under concurrent
   load the GPU keeps decoding while prefill runs elsewhere.
-- **Decode**: the mature engines are ~3x faster (215–262 vs 76 tok/s) on a
-  short context. That gap is fused/hand-tuned kernels and per-step overhead,
-  not memory bandwidth — see DESIGN.md Future work items 1 (attention
-  split-position, f16 KV) and the fixed-cost notes in "Where the time goes".
+- **Decode**: after the flash-decoding + kernel-fusion pass, lokal sits with
+  the leaders (241 vs llama.cpp's 215 and oMLX's 262) — the pass is
+  described in DESIGN.md, Metal backend decision 4.
 - **Concurrency**: llama.cpp and oMLX batch concurrent decodes into shared
   forward passes (continuous batching); lokal interleaves whole single-token
-  steps, so its aggregate is capped by single-stream decode. Same roadmap
-  item 3.
+  steps, so its aggregate is capped by single-stream decode. The ane
+  backend's 264 aggregate is that cap in action — continuous batching is the
+  roadmap item that lifts it.
 
 ## Reproduce
 

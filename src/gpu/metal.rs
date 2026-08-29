@@ -40,6 +40,13 @@ struct MatvecParams {
     out_dim: u32,
 }
 #[repr(C)]
+struct QkvParams {
+    in_dim: u32,
+    q_dim: u32,
+    kv_dim: u32,
+    kv_off: u32,
+}
+#[repr(C)]
 struct MatmulParams {
     in_dim: u32,
     out_dim: u32,
@@ -59,12 +66,28 @@ struct RopeParams {
     n_rows: u32,
 }
 #[repr(C)]
+struct RopeQkParams {
+    head_dim: u32,
+    n_q_heads: u32,
+    n_kv_heads: u32,
+    pos: u32,
+    theta: f32,
+}
+#[repr(C)]
 struct AttnParams {
     head_dim: u32,
     n_heads: u32,
     n_kv_heads: u32,
     pos0: u32,
     max_seq: u32,
+}
+#[repr(C)]
+struct AttnDecParams {
+    head_dim: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    pos: u32,
+    n_splits: u32,
 }
 #[repr(C)]
 struct ElemParams {
@@ -75,13 +98,24 @@ struct ElemParams {
 struct Pipelines {
     embed: ComputePipelineState,
     matvec: ComputePipelineState,
+    matvec_acc: ComputePipelineState,
+    matvec_swiglu: ComputePipelineState,
+    matvec_qkv: ComputePipelineState,
     matmul: ComputePipelineState,
     rmsnorm: ComputePipelineState,
     rope: ComputePipelineState,
+    rope_qk_decode: ComputePipelineState,
     attention: ComputePipelineState,
+    attention_decode_partial: ComputePipelineState,
+    attention_decode_reduce: ComputePipelineState,
     silu_mul: ComputePipelineState,
     add_inplace: ComputePipelineState,
 }
+
+/// Cached positions per flash-decoding window — must match ATTN_SPLIT in kernels.metal.
+const ATTN_SPLIT: usize = 128;
+/// Threads per decode-attention threadgroup — must match DEC_TG in kernels.metal.
+const DEC_TG: usize = 128;
 
 /// A linear layer on the GPU: f16 weights + f16 bias (all-zero when the model has none —
 /// adding zero is free and avoids a branch in the kernel).
@@ -157,10 +191,16 @@ impl MetalEngine {
         let pipes = Pipelines {
             embed: pipe("embed")?,
             matvec: pipe("matvec")?,
+            matvec_acc: pipe("matvec_acc")?,
+            matvec_swiglu: pipe("matvec_swiglu")?,
+            matvec_qkv: pipe("matvec_qkv")?,
             matmul: pipe("matmul")?,
             rmsnorm: pipe("rmsnorm")?,
             rope: pipe("rope")?,
+            rope_qk_decode: pipe("rope_qk_decode")?,
             attention: pipe("attention")?,
+            attention_decode_partial: pipe("attention_decode_partial")?,
+            attention_decode_reduce: pipe("attention_decode_reduce")?,
             silu_mul: pipe("silu_mul")?,
             add_inplace: pipe("add_inplace")?,
         };
@@ -248,10 +288,7 @@ impl MetalEngine {
             enc.set_buffer(2, Some(x), x_off);
             enc.set_buffer(3, Some(y), y_off);
             enc.set_bytes(4, size_of::<MatvecParams>() as u64, &p as *const _ as *const _);
-            // 4 simdgroups (W rows) per threadgroup — the grid covers every row.
-            let rows_per_tg = 4u64;
-            let tgs = (l.out_dim as u64).div_ceil(rows_per_tg);
-            enc.dispatch_thread_groups(MTLSize::new(tgs, 1, 1), MTLSize::new(32 * rows_per_tg, 1, 1));
+            dispatch_simdgroup_rows(enc, l.out_dim);
         } else {
             let p = MatmulParams { in_dim: l.in_dim, out_dim: l.out_dim, n_rows: n_rows as u32 };
             enc.set_compute_pipeline_state(&self.pipes.matmul);
@@ -346,6 +383,138 @@ impl MetalEngine {
         );
     }
 
+    /// Decode-only: x[row] += W·in + bias — o_proj/down_proj with the residual fused.
+    fn enc_matvec_acc(&self, enc: &ComputeCommandEncoderRef, l: &GpuLinear, x: &Buffer, y: &Buffer) {
+        let p = MatvecParams { in_dim: l.in_dim, out_dim: l.out_dim };
+        enc.set_compute_pipeline_state(&self.pipes.matvec_acc);
+        enc.set_buffer(0, Some(&l.w), 0);
+        enc.set_buffer(1, Some(&l.bias), 0);
+        enc.set_buffer(2, Some(x), 0);
+        enc.set_buffer(3, Some(y), 0);
+        enc.set_bytes(4, size_of::<MatvecParams>() as u64, &p as *const _ as *const _);
+        dispatch_simdgroup_rows(enc, l.out_dim);
+    }
+
+    /// Decode-only: y = silu(Wg·x) * (Wu·x) — the SwiGLU inner step in one dispatch.
+    fn enc_swiglu(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        gate: &GpuLinear,
+        up: &GpuLinear,
+        x: &Buffer,
+        y: &Buffer,
+    ) {
+        let p = MatvecParams { in_dim: gate.in_dim, out_dim: gate.out_dim };
+        enc.set_compute_pipeline_state(&self.pipes.matvec_swiglu);
+        enc.set_buffer(0, Some(&gate.w), 0);
+        enc.set_buffer(1, Some(&up.w), 0);
+        enc.set_buffer(2, Some(x), 0);
+        enc.set_buffer(3, Some(y), 0);
+        enc.set_bytes(4, size_of::<MatvecParams>() as u64, &p as *const _ as *const _);
+        dispatch_simdgroup_rows(enc, gate.out_dim);
+    }
+
+    /// Decode-only: q,k,v projections in one dispatch, k and v written straight into
+    /// this position's cache slot.
+    #[allow(clippy::too_many_arguments)]
+    fn enc_qkv(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        blk: &GpuBlock,
+        x: &Buffer,
+        q: &Buffer,
+        k_cache: &Buffer,
+        v_cache: &Buffer,
+        pos: usize,
+    ) {
+        let p = QkvParams {
+            in_dim: blk.q_proj.in_dim,
+            q_dim: blk.q_proj.out_dim,
+            kv_dim: blk.k_proj.out_dim,
+            kv_off: (pos * blk.k_proj.out_dim as usize) as u32,
+        };
+        enc.set_compute_pipeline_state(&self.pipes.matvec_qkv);
+        enc.set_buffer(0, Some(&blk.q_proj.w), 0);
+        enc.set_buffer(1, Some(&blk.q_proj.bias), 0);
+        enc.set_buffer(2, Some(&blk.k_proj.w), 0);
+        enc.set_buffer(3, Some(&blk.k_proj.bias), 0);
+        enc.set_buffer(4, Some(&blk.v_proj.w), 0);
+        enc.set_buffer(5, Some(&blk.v_proj.bias), 0);
+        enc.set_buffer(6, Some(x), 0);
+        enc.set_buffer(7, Some(q), 0);
+        enc.set_buffer(8, Some(k_cache), 0);
+        enc.set_buffer(9, Some(v_cache), 0);
+        enc.set_bytes(10, size_of::<QkvParams>() as u64, &p as *const _ as *const _);
+        dispatch_simdgroup_rows(enc, blk.q_proj.out_dim + 2 * blk.k_proj.out_dim);
+    }
+
+    /// Decode-only: RoPE on q and this position's new k cache row, one dispatch.
+    fn enc_rope_qk(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        q: &Buffer,
+        k_cache: &Buffer,
+        kv_byte_off: u64,
+        pos: usize,
+    ) {
+        let hd = self.cfg.head_dim();
+        let p = RopeQkParams {
+            head_dim: hd as u32,
+            n_q_heads: self.cfg.num_attention_heads as u32,
+            n_kv_heads: self.cfg.num_key_value_heads as u32,
+            pos: pos as u32,
+            theta: self.cfg.rope_theta,
+        };
+        enc.set_compute_pipeline_state(&self.pipes.rope_qk_decode);
+        enc.set_buffer(0, Some(q), 0);
+        enc.set_buffer(1, Some(k_cache), kv_byte_off);
+        enc.set_bytes(2, size_of::<RopeQkParams>() as u64, &p as *const _ as *const _);
+        dispatch_grid(enc, (self.cfg.num_attention_heads + self.cfg.num_key_value_heads) * hd / 2);
+    }
+
+    /// Decode-only attention (n_rows = 1): flash-decoding split. Falls back to the
+    /// generic kernel via the caller when head_dim > DEC_TG.
+    #[allow(clippy::too_many_arguments)]
+    fn enc_attention_decode(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        q: &Buffer,
+        k_cache: &Buffer,
+        v_cache: &Buffer,
+        partials: &Buffer,
+        out: &Buffer,
+        pos: usize,
+    ) {
+        let n_splits = (pos + 1).div_ceil(ATTN_SPLIT);
+        let p = AttnDecParams {
+            head_dim: self.cfg.head_dim() as u32,
+            n_heads: self.cfg.num_attention_heads as u32,
+            n_kv_heads: self.cfg.num_key_value_heads as u32,
+            pos: pos as u32,
+            n_splits: n_splits as u32,
+        };
+        let heads = self.cfg.num_attention_heads as u64;
+        enc.set_compute_pipeline_state(&self.pipes.attention_decode_partial);
+        enc.set_buffer(0, Some(q), 0);
+        enc.set_buffer(1, Some(k_cache), 0);
+        enc.set_buffer(2, Some(v_cache), 0);
+        enc.set_buffer(3, Some(partials), 0);
+        enc.set_bytes(4, size_of::<AttnDecParams>() as u64, &p as *const _ as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new(heads, n_splits as u64, 1),
+            MTLSize::new(DEC_TG as u64, 1, 1),
+        );
+
+        enc.set_compute_pipeline_state(&self.pipes.attention_decode_reduce);
+        enc.set_buffer(0, Some(partials), 0);
+        enc.set_buffer(1, Some(out), 0);
+        enc.set_bytes(2, size_of::<AttnDecParams>() as u64, &p as *const _ as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new(heads, 1, 1),
+            MTLSize::new(self.cfg.head_dim() as u64, 1, 1),
+        );
+    }
+
     fn enc_elementwise(
         &self,
         enc: &ComputeCommandEncoderRef,
@@ -367,6 +536,14 @@ impl MetalEngine {
 fn dispatch_grid(enc: &ComputeCommandEncoderRef, n: usize) {
     let tg = 256u64;
     enc.dispatch_thread_groups(MTLSize::new((n as u64).div_ceil(tg), 1, 1), MTLSize::new(tg, 1, 1));
+}
+
+/// One-simdgroup-per-output-row dispatch, 4 rows per threadgroup — shared by every
+/// matvec-family kernel (they guard the tail with `if (row >= out_dim)`).
+fn dispatch_simdgroup_rows(enc: &ComputeCommandEncoderRef, rows: u32) {
+    let rows_per_tg = 4u64;
+    let tgs = (rows as u64).div_ceil(rows_per_tg);
+    enc.dispatch_thread_groups(MTLSize::new(tgs, 1, 1), MTLSize::new(32 * rows_per_tg, 1, 1));
 }
 
 impl Engine for MetalEngine {
@@ -398,6 +575,10 @@ impl MetalEngine {
             up: f32_buffer(d, chunk * cfg.intermediate_size),
             logits: f32_buffer(d, cfg.vocab_size),
             scores: f32_buffer(d, chunk * cfg.num_attention_heads * max_seq),
+            partials: f32_buffer(
+                d,
+                cfg.num_attention_heads * max_seq.div_ceil(ATTN_SPLIT) * (cfg.head_dim() + 2),
+            ),
             k_cache: (0..cfg.num_hidden_layers).map(|_| f32_buffer(d, max_seq * cfg.kv_dim())).collect(),
             v_cache: (0..cfg.num_hidden_layers).map(|_| f32_buffer(d, max_seq * cfg.kv_dim())).collect(),
             max_seq,
@@ -419,6 +600,7 @@ pub(crate) struct MetalSession<'a> {
     up: Buffer,
     logits: Buffer,
     scores: Buffer,
+    partials: Buffer, // decode attention: [heads × windows × (head_dim + 2)]
     k_cache: Vec<Buffer>,
     v_cache: Vec<Buffer>,
     max_seq: usize,
@@ -443,7 +625,24 @@ impl MetalSession<'_> {
         let enc = cb.new_compute_command_encoder();
 
         e.enc_embed(enc, &self.ids, &self.x, n);
+        let fused_decode = n == 1 && cfg.head_dim() <= DEC_TG && cfg.head_dim().is_multiple_of(4);
         for (l, blk) in e.blocks.iter().enumerate() {
+            if fused_decode {
+                // Decode path: fused kernels — 9 dispatches per layer instead of 15.
+                // Same math as the prefill path below, with qkv / swiglu / residual
+                // adds folded into single launches and flash-decoding attention.
+                e.enc_rmsnorm(enc, &self.x, &blk.input_layernorm, &self.xn, 1);
+                e.enc_qkv(enc, blk, &self.xn, &self.q, &self.k_cache[l], &self.v_cache[l], pos0);
+                e.enc_rope_qk(enc, &self.q, &self.k_cache[l], kv_byte_off, pos0);
+                e.enc_attention_decode(enc, &self.q, &self.k_cache[l], &self.v_cache[l], &self.partials, &self.att, pos0);
+                e.enc_matvec_acc(enc, &blk.o_proj, &self.att, &self.x);
+                e.enc_rmsnorm(enc, &self.x, &blk.post_attention_layernorm, &self.xn, 1);
+                e.enc_swiglu(enc, &blk.gate_proj, &blk.up_proj, &self.xn, &self.gate);
+                e.enc_matvec_acc(enc, &blk.down_proj, &self.gate, &self.x);
+                continue;
+            }
+
+            // Prefill path (and the rare head_dim > DEC_TG decode): tiled matmuls.
             // Attention half.
             e.enc_rmsnorm(enc, &self.x, &blk.input_layernorm, &self.xn, n);
             e.enc_linear(enc, &blk.q_proj, &self.xn, 0, &self.q, 0, n);

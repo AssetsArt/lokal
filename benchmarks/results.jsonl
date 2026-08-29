@@ -3,3 +3,5 @@
 {"name": "llama.cpp (metal)", "timestamp": "2026-08-29T14:35:56", "prefill_s": 0.056, "decode_tps": 215.3, "single_gen_tokens": 128, "concurrent4_agg_tps": 355.2, "concurrent4_gen_tokens": 512, "runs": 5, "conc_runs": 3}
 {"name": "oMLX (mlx)", "timestamp": "2026-08-29T14:52:17", "prefill_s": 0.115, "decode_tps": 261.7, "single_gen_tokens": 128, "concurrent4_agg_tps": 332.2, "concurrent4_gen_tokens": 512, "runs": 5, "conc_runs": 3}
 {"name": "vllm-metal (mlx)", "timestamp": "2026-08-29T14:54:00", "prefill_s": 0.082, "decode_tps": 252.8, "single_gen_tokens": 123, "concurrent4_agg_tps": 217.3, "concurrent4_gen_tokens": 369, "runs": 5, "conc_runs": 3}
+{"name": "lokal (metal) v2", "timestamp": "2026-08-29T15:10:30", "prefill_s": 0.561, "decode_tps": 241.3, "single_gen_tokens": 128, "concurrent4_agg_tps": 125.8, "concurrent4_gen_tokens": 512, "runs": 5, "conc_runs": 3}
+{"name": "lokal (ane) v2", "timestamp": "2026-08-29T15:11:00", "prefill_s": 0.063, "decode_tps": 239.5, "single_gen_tokens": 128, "concurrent4_agg_tps": 264.3, "concurrent4_gen_tokens": 512, "runs": 5, "conc_runs": 3}
