@@ -778,6 +778,321 @@ kernel void attention_decode_reduce(
     }
 }
 
+// ---------- batched decode: one step for several requests at once ----------
+// Continuous batching's core. B rows, each with its own (token, position, KV slot);
+// the KV cache is pooled per layer as [slot][max_seq][kv_dim] — plain static slots,
+// no block tables: macOS commits the pages lazily, so an untouched slot tail costs
+// no physical RAM, and the kernels keep fully linear, coalesced access. The
+// weight-heavy kernels gain a batch grid dimension, so ONE read of the weights
+// serves every active request — that is the entire point of batching decode.
+
+struct RowMeta {
+    uint pos;  // this row's position in its own sequence
+    uint slot; // which pooled KV slot the row owns
+};
+
+struct QkvBatchParams {
+    uint in_dim;
+    uint q_dim;
+    uint kv_dim;
+    uint max_seq; // slot stride, in cache rows
+};
+
+kernel void matvec_qkv_batch(
+    device const half *w_q [[buffer(0)]],
+    device const half *b_q [[buffer(1)]],
+    device const half *w_k [[buffer(2)]],
+    device const half *b_k [[buffer(3)]],
+    device const half *w_v [[buffer(4)]],
+    device const half *b_v [[buffer(5)]],
+    device const float *x [[buffer(6)]],
+    device float *q [[buffer(7)]],
+    device half *k_cache [[buffer(8)]],
+    device half *v_cache [[buffer(9)]],
+    constant QkvBatchParams &p [[buffer(10)]],
+    device const RowMeta *meta [[buffer(11)]],
+    uint2 tgid [[threadgroup_position_in_grid]], // x = W-row tile, y = batch row
+    uint2 tpos [[thread_position_in_threadgroup]])
+{
+    uint tid = tpos.x;
+    uint lane = tid % 32;
+    uint row = tgid.x * 4 + tid / 32; // 128 threads = 4 simdgroups per threadgroup
+    if (row >= p.q_dim + 2 * p.kv_dim) {
+        return;
+    }
+    uint b = tgid.y;
+    device const float *xb = x + (ulong)b * p.in_dim;
+
+    device const half *w;
+    device const half *bias;
+    uint r;
+    if (row < p.q_dim) {
+        w = w_q; bias = b_q; r = row;
+    } else if (row < p.q_dim + p.kv_dim) {
+        r = row - p.q_dim;
+        w = w_k; bias = b_k;
+    } else {
+        r = row - p.q_dim - p.kv_dim;
+        w = w_v; bias = b_v;
+    }
+    float sum = simd_sum(dot_wx(w + (ulong)r * p.in_dim, xb, p.in_dim, lane));
+    if (lane == 0) {
+        float val = sum + (float)bias[r];
+        ulong kv_off = ((ulong)meta[b].slot * p.max_seq + meta[b].pos) * p.kv_dim;
+        if (row < p.q_dim) {
+            q[(ulong)b * p.q_dim + r] = val;
+        } else if (row < p.q_dim + p.kv_dim) {
+            k_cache[kv_off + r] = (half)val;
+        } else {
+            v_cache[kv_off + r] = (half)val;
+        }
+    }
+}
+
+// y[b] += W·x[b] + bias — batched o_proj/down_proj with the residual fused.
+kernel void matvec_acc_batch(
+    device const half *w [[buffer(0)]],
+    device const half *bias [[buffer(1)]],
+    device const float *x [[buffer(2)]],
+    device float *y [[buffer(3)]],
+    constant MatvecParams &p [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint2 tpos [[thread_position_in_threadgroup]])
+{
+    uint tid = tpos.x;
+    uint lane = tid % 32;
+    uint row = tgid.x * 4 + tid / 32;
+    if (row >= p.out_dim) {
+        return;
+    }
+    uint b = tgid.y;
+    float sum = simd_sum(dot_wx(w + (ulong)row * p.in_dim, x + (ulong)b * p.in_dim, p.in_dim, lane));
+    if (lane == 0) {
+        y[(ulong)b * p.out_dim + row] += sum + (float)bias[row];
+    }
+}
+
+// y[b] = silu(Wg·x[b]) * (Wu·x[b]) — batched SwiGLU inner step.
+kernel void matvec_swiglu_batch(
+    device const half *w_gate [[buffer(0)]],
+    device const half *w_up [[buffer(1)]],
+    device const float *x [[buffer(2)]],
+    device float *y [[buffer(3)]],
+    constant MatvecParams &p [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint2 tpos [[thread_position_in_threadgroup]])
+{
+    uint tid = tpos.x;
+    uint lane = tid % 32;
+    uint row = tgid.x * 4 + tid / 32;
+    if (row >= p.out_dim) {
+        return;
+    }
+    uint b = tgid.y;
+    device const float *xb = x + (ulong)b * p.in_dim;
+    float g = simd_sum(dot_wx(w_gate + (ulong)row * p.in_dim, xb, p.in_dim, lane));
+    float u = simd_sum(dot_wx(w_up + (ulong)row * p.in_dim, xb, p.in_dim, lane));
+    if (lane == 0) {
+        y[(ulong)b * p.out_dim + row] = (g / (1.0f + exp(-g))) * u;
+    }
+}
+
+// Batched RoPE on q and each row's freshly written k cache row.
+struct RopeQkBatchParams {
+    uint head_dim;
+    uint n_q_heads;
+    uint n_kv_heads;
+    float theta;
+    uint max_seq;
+    uint kv_dim;
+    uint n_rows;
+};
+
+kernel void rope_qk_batch(
+    device float *q [[buffer(0)]],
+    device half *k_cache [[buffer(1)]],
+    device const RowMeta *meta [[buffer(2)]],
+    constant RopeQkBatchParams &p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint half_dim = p.head_dim / 2;
+    uint q_pairs = p.n_q_heads * half_dim;
+    uint per_b = q_pairs + p.n_kv_heads * half_dim;
+    uint b = gid / per_b;
+    if (b >= p.n_rows) {
+        return;
+    }
+    uint idx = gid % per_b;
+    bool is_q = idx < q_pairs;
+    uint hidx = is_q ? idx : idx - q_pairs;
+    uint h = hidx / half_dim;
+    uint i = hidx % half_dim;
+
+    float freq = pow(p.theta, -2.0f * (float)i / (float)p.head_dim);
+    float angle = (float)meta[b].pos * freq;
+    float c;
+    float s = sincos(angle, c);
+    if (is_q) {
+        device float *head = q + (ulong)b * p.n_q_heads * p.head_dim + h * p.head_dim;
+        float a0 = head[i];
+        float b0 = head[i + half_dim];
+        head[i] = a0 * c - b0 * s;
+        head[i + half_dim] = a0 * s + b0 * c;
+    } else {
+        device half *head = k_cache
+            + ((ulong)meta[b].slot * p.max_seq + meta[b].pos) * p.kv_dim + h * p.head_dim;
+        float a0 = head[i];
+        float b0 = head[i + half_dim];
+        head[i] = (half)(a0 * c - b0 * s);
+        head[i + half_dim] = (half)(a0 * s + b0 * c);
+    }
+}
+
+// Batched flash-decoding attention: same two kernels as above with a batch grid
+// dimension and per-row position/slot from meta.
+struct AttnDecBatchParams {
+    uint head_dim;
+    uint n_heads;
+    uint n_kv_heads;
+    uint max_seq;
+    uint kv_dim;
+    uint splits_max; // partials stride; rows with fewer windows leave the tail unused
+};
+
+kernel void attention_decode_partial_batch(
+    device const float *q [[buffer(0)]],
+    device const half *k_cache [[buffer(1)]],
+    device const half *v_cache [[buffer(2)]],
+    device float *partials [[buffer(3)]],
+    device const RowMeta *meta [[buffer(4)]],
+    constant AttnDecBatchParams &p [[buffer(5)]],
+    uint3 tg [[threadgroup_position_in_grid]], // x = head, y = window, z = batch row
+    uint3 tpos [[thread_position_in_threadgroup]])
+{
+    uint tid = tpos.x;
+    uint b = tg.z;
+    uint pos = meta[b].pos;
+    uint t0 = tg.y * ATTN_SPLIT;
+    if (t0 > pos) {
+        return; // this row has fewer windows than the widest in the batch
+    }
+    uint head = tg.x;
+    uint hd = p.head_dim;
+    uint kvd = p.kv_dim;
+    uint kv_off = (head / (p.n_heads / p.n_kv_heads)) * hd;
+    uint t_end = min(t0 + ATTN_SPLIT, pos + 1);
+    ulong base = (ulong)meta[b].slot * p.max_seq;
+    device const float *q_head = q + (ulong)b * p.n_heads * hd + head * hd;
+    float scale = rsqrt((float)hd);
+
+    threadgroup float es[ATTN_SPLIT];
+    threadgroup float red[DEC_TG];
+
+    uint t = t0 + tid;
+    float score = -INFINITY;
+    if (t < t_end) {
+        device const half4 *k_t = (device const half4 *)(k_cache + (base + t) * kvd + kv_off);
+        device const float4 *q4 = (device const float4 *)q_head;
+        float d = 0.0f;
+        for (uint i = 0; i < hd / 4; i++) {
+            d += dot(q4[i], float4(k_t[i]));
+        }
+        score = d * scale;
+    }
+    float sg_max = simd_max(score);
+    if (tid % 32 == 0) {
+        red[tid / 32] = sg_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float mm = -INFINITY;
+        for (uint j = 0; j < DEC_TG / 32; j++) {
+            mm = max(mm, red[j]);
+        }
+        red[0] = mm;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float m = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float e = (t < t_end) ? exp(score - m) : 0.0f;
+    es[tid] = e;
+    float sg_sum = simd_sum(e);
+    if (tid % 32 == 0) {
+        red[tid / 32] = sg_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint j = 0; j < DEC_TG / 32; j++) {
+            total += red[j];
+        }
+        red[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float l = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint P = DEC_TG / hd;
+    uint pl = tid / hd;
+    uint di = tid % hd;
+    float acc = 0.0f;
+    if (pl < P) {
+        for (uint tt = t0 + pl; tt < t_end; tt += P) {
+            acc += es[tt - t0] * (float)v_cache[(base + tt) * kvd + kv_off + di];
+        }
+    }
+    red[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device float *out = partials
+        + (((ulong)b * p.n_heads + head) * p.splits_max + tg.y) * (hd + 2);
+    if (tid == 0) {
+        out[0] = m;
+        out[1] = l;
+    }
+    if (tid < hd) {
+        float a = 0.0f;
+        for (uint j = 0; j < P; j++) {
+            a += red[j * hd + tid];
+        }
+        out[2 + tid] = a;
+    }
+}
+
+kernel void attention_decode_reduce_batch(
+    device const float *partials [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    device const RowMeta *meta [[buffer(2)]],
+    constant AttnDecBatchParams &p [[buffer(3)]],
+    uint2 tg [[threadgroup_position_in_grid]], // x = head, y = batch row
+    uint2 tpos [[thread_position_in_threadgroup]])
+{
+    uint head = tg.x;
+    uint b = tg.y;
+    uint di = tpos.x;
+    uint hd = p.head_dim;
+    uint n_splits = meta[b].pos / ATTN_SPLIT + 1;
+    device const float *ph = partials
+        + ((ulong)b * p.n_heads + head) * p.splits_max * (hd + 2);
+
+    float m = -INFINITY;
+    for (uint s = 0; s < n_splits; s++) {
+        m = max(m, ph[s * (hd + 2)]);
+    }
+    float l = 0.0f;
+    for (uint s = 0; s < n_splits; s++) {
+        l += exp(ph[s * (hd + 2)] - m) * ph[s * (hd + 2) + 1];
+    }
+    if (di < hd) {
+        float a = 0.0f;
+        for (uint s = 0; s < n_splits; s++) {
+            a += exp(ph[s * (hd + 2)] - m) * ph[s * (hd + 2) + 2 + di];
+        }
+        out[((ulong)b * p.n_heads + head) * hd + di] = a / l;
+    }
+}
+
 // ---------- two tiny elementwise kernels ----------
 // dim = total element count across all rows (rows are contiguous, so rows don't matter here).
 

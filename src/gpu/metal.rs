@@ -47,6 +47,38 @@ struct QkvParams {
     kv_off: u32,
 }
 #[repr(C)]
+struct QkvBatchParams {
+    in_dim: u32,
+    q_dim: u32,
+    kv_dim: u32,
+    max_seq: u32,
+}
+#[repr(C)]
+struct RopeQkBatchParams {
+    head_dim: u32,
+    n_q_heads: u32,
+    n_kv_heads: u32,
+    theta: f32,
+    max_seq: u32,
+    kv_dim: u32,
+    n_rows: u32,
+}
+#[repr(C)]
+struct AttnDecBatchParams {
+    head_dim: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    max_seq: u32,
+    kv_dim: u32,
+    splits_max: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RowMeta {
+    pos: u32,
+    slot: u32,
+}
+#[repr(C)]
 struct MatmulParams {
     in_dim: u32,
     out_dim: u32,
@@ -113,6 +145,13 @@ struct Pipelines {
     attention_decode_reduce: ComputePipelineState,
     silu_mul: ComputePipelineState,
     add_inplace: ComputePipelineState,
+    // Batched-decode variants (continuous batching in serve mode).
+    matvec_qkv_batch: ComputePipelineState,
+    matvec_acc_batch: ComputePipelineState,
+    matvec_swiglu_batch: ComputePipelineState,
+    rope_qk_batch: ComputePipelineState,
+    attention_decode_partial_batch: ComputePipelineState,
+    attention_decode_reduce_batch: ComputePipelineState,
 }
 
 /// Cached positions per flash-decoding window — must match ATTN_SPLIT in kernels.metal.
@@ -216,6 +255,12 @@ impl MetalEngine {
             attention_decode_reduce: pipe("attention_decode_reduce")?,
             silu_mul: pipe("silu_mul")?,
             add_inplace: pipe("add_inplace")?,
+            matvec_qkv_batch: pipe("matvec_qkv_batch")?,
+            matvec_acc_batch: pipe("matvec_acc_batch")?,
+            matvec_swiglu_batch: pipe("matvec_swiglu_batch")?,
+            rope_qk_batch: pipe("rope_qk_batch")?,
+            attention_decode_partial_batch: pipe("attention_decode_partial_batch")?,
+            attention_decode_reduce_batch: pipe("attention_decode_reduce_batch")?,
         };
 
         fn lin(device: &Device, l: &crate::model::Linear) -> GpuLinear {
@@ -401,6 +446,7 @@ impl MetalEngine {
         q: &Buffer,
         k_cache: &Buffer,
         v_cache: &Buffer,
+        cache_off: u64,
         scores: &Buffer,
         out: &Buffer,
         pos0: usize,
@@ -416,8 +462,8 @@ impl MetalEngine {
         };
         enc.set_compute_pipeline_state(&self.pipes.attention);
         enc.set_buffer(0, Some(q), 0);
-        enc.set_buffer(1, Some(k_cache), 0);
-        enc.set_buffer(2, Some(v_cache), 0);
+        enc.set_buffer(1, Some(k_cache), cache_off);
+        enc.set_buffer(2, Some(v_cache), cache_off);
         enc.set_buffer(3, Some(scores), 0);
         enc.set_buffer(4, Some(out), 0);
         enc.set_bytes(5, size_of::<AttnParams>() as u64, &p as *const _ as *const _);
@@ -470,13 +516,13 @@ impl MetalEngine {
         q: &Buffer,
         k_cache: &Buffer,
         v_cache: &Buffer,
-        pos: usize,
+        kv_off_elems: usize,
     ) {
         let p = QkvParams {
             in_dim: blk.q_proj.in_dim,
             q_dim: blk.q_proj.out_dim,
             kv_dim: blk.k_proj.out_dim,
-            kv_off: (pos * blk.k_proj.out_dim as usize) as u32,
+            kv_off: kv_off_elems as u32,
         };
         enc.set_compute_pipeline_state(&self.pipes.matvec_qkv);
         enc.set_buffer(0, Some(&blk.q_proj.w), 0);
@@ -526,6 +572,7 @@ impl MetalEngine {
         q: &Buffer,
         k_cache: &Buffer,
         v_cache: &Buffer,
+        cache_off: u64,
         partials: &Buffer,
         out: &Buffer,
         pos: usize,
@@ -541,8 +588,8 @@ impl MetalEngine {
         let heads = self.cfg.num_attention_heads as u64;
         enc.set_compute_pipeline_state(&self.pipes.attention_decode_partial);
         enc.set_buffer(0, Some(q), 0);
-        enc.set_buffer(1, Some(k_cache), 0);
-        enc.set_buffer(2, Some(v_cache), 0);
+        enc.set_buffer(1, Some(k_cache), cache_off);
+        enc.set_buffer(2, Some(v_cache), cache_off);
         enc.set_buffer(3, Some(partials), 0);
         enc.set_bytes(4, size_of::<AttnDecParams>() as u64, &p as *const _ as *const _);
         enc.dispatch_thread_groups(
@@ -601,11 +648,35 @@ impl Engine for MetalEngine {
     fn session(&self, max_seq: usize) -> crate::Result<Box<dyn Session + '_>> {
         Ok(Box::new(self.raw_session(max_seq)))
     }
+    fn batcher(&self, n_slots: usize, max_seq: usize) -> Option<Box<dyn crate::engine::Batcher + '_>> {
+        self.make_batcher(n_slots, max_seq)
+            .map(|b| Box::new(b) as Box<dyn crate::engine::Batcher>)
+    }
 }
 
 impl MetalEngine {
     /// Build a session as a concrete type — the ane backend needs write_kv/prefill_from.
     pub(crate) fn raw_session(&self, max_seq: usize) -> MetalSession<'_> {
+        let cfg = &self.cfg;
+        let d = &self.device;
+        let caches = (0..cfg.num_hidden_layers)
+            .map(|_| f16_empty_buffer(d, max_seq * cfg.kv_dim()))
+            .collect::<Vec<_>>();
+        let v_caches = (0..cfg.num_hidden_layers)
+            .map(|_| f16_empty_buffer(d, max_seq * cfg.kv_dim()))
+            .collect::<Vec<_>>();
+        self.session_with_cache(max_seq, caches, v_caches, 0)
+    }
+
+    /// A session whose KV cache lives inside a shared pool (continuous batching):
+    /// the buffers are shared, kv_base points at this session's slot.
+    pub(crate) fn session_with_cache(
+        &self,
+        max_seq: usize,
+        k_cache: Vec<Buffer>,
+        v_cache: Vec<Buffer>,
+        kv_base: u64,
+    ) -> MetalSession<'_> {
         let cfg = &self.cfg;
         let d = &self.device;
         let chunk = PREFILL_CHUNK.min(max_seq); // scratch sized per chunk (decode uses row 0 only)
@@ -624,8 +695,9 @@ impl MetalEngine {
                 d,
                 cfg.num_attention_heads * max_seq.div_ceil(ATTN_SPLIT) * (cfg.head_dim() + 2),
             ),
-            k_cache: (0..cfg.num_hidden_layers).map(|_| f16_empty_buffer(d, max_seq * cfg.kv_dim())).collect(),
-            v_cache: (0..cfg.num_hidden_layers).map(|_| f16_empty_buffer(d, max_seq * cfg.kv_dim())).collect(),
+            k_cache,
+            v_cache,
+            kv_base,
             max_seq,
             engine: self,
         }
@@ -648,6 +720,7 @@ pub(crate) struct MetalSession<'a> {
     partials: Buffer, // decode attention: [heads × windows × (head_dim + 2)]
     k_cache: Vec<Buffer>,
     v_cache: Vec<Buffer>,
+    kv_base: u64, // byte offset of this session's slot when the cache is pooled
     max_seq: usize,
 }
 
@@ -660,7 +733,7 @@ impl MetalSession<'_> {
         let e = self.engine;
         let cfg = &e.cfg;
         let (h, n) = (cfg.hidden_size, ids.len());
-        let kv_byte_off = (pos0 * cfg.kv_dim() * 2) as u64; // this chunk's first (f16) cache slot
+        let kv_byte_off = self.kv_base + (pos0 * cfg.kv_dim() * 2) as u64; // this chunk's first (f16) cache row
 
         // Push the token ids to the GPU (unified memory: write into the buffer pre-commit).
         unsafe { std::ptr::copy_nonoverlapping(ids.as_ptr(), self.ids.contents() as *mut u32, n) };
@@ -678,9 +751,10 @@ impl MetalSession<'_> {
                 // Same math as the prefill path below, with qkv / swiglu / residual
                 // adds folded into single launches and flash-decoding attention.
                 e.enc_rmsnorm(enc, &self.x, &blk.input_layernorm, &self.xn, 1);
-                e.enc_qkv(enc, blk, &self.xn, &self.q, &self.k_cache[l], &self.v_cache[l], pos0);
+                let kv_off_elems = (self.kv_base / 2) as usize + pos0 * cfg.kv_dim();
+                e.enc_qkv(enc, blk, &self.xn, &self.q, &self.k_cache[l], &self.v_cache[l], kv_off_elems);
                 e.enc_rope_qk(enc, &self.q, &self.k_cache[l], kv_byte_off, pos0);
-                e.enc_attention_decode(enc, &self.q, &self.k_cache[l], &self.v_cache[l], &self.partials, &self.att, pos0);
+                e.enc_attention_decode(enc, &self.q, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.partials, &self.att, pos0);
                 e.enc_matvec_acc(enc, &blk.o_proj, &self.att, &self.x);
                 e.enc_rmsnorm(enc, &self.x, &blk.post_attention_layernorm, &self.xn, 1);
                 e.enc_swiglu(enc, &blk.gate_proj, &blk.up_proj, &self.xn, &self.gate);
@@ -696,7 +770,7 @@ impl MetalSession<'_> {
             e.enc_linear_kv(enc, &blk.v_proj, &self.xn, &self.v_cache[l], kv_byte_off, n);
             e.enc_rope(enc, &self.q, 0, cfg.num_attention_heads, pos0, n, false);
             e.enc_rope(enc, &self.k_cache[l], kv_byte_off, cfg.num_key_value_heads, pos0, n, true);
-            e.enc_attention(enc, &self.q, &self.k_cache[l], &self.v_cache[l], &self.scores, &self.att, pos0, n, self.max_seq);
+            e.enc_attention(enc, &self.q, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.scores, &self.att, pos0, n, self.max_seq);
             e.enc_linear(enc, &blk.o_proj, &self.att, 0, &self.xb, 0, n);
             e.enc_elementwise(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
 
@@ -735,12 +809,13 @@ impl MetalSession<'_> {
     /// whole "device transfer".
     pub(crate) fn write_kv(&mut self, layer: usize, pos0: usize, k: &[f32], v: &[f32]) {
         let kvd = self.engine.cfg.kv_dim();
+        let base = (self.kv_base / 2) as usize;
         unsafe {
-            let kp = (self.k_cache[layer].contents() as *mut u16).add(pos0 * kvd);
+            let kp = (self.k_cache[layer].contents() as *mut u16).add(base + pos0 * kvd);
             for (i, &x) in k.iter().enumerate() {
                 *kp.add(i) = f16::from_f32(x).to_bits();
             }
-            let vp = (self.v_cache[layer].contents() as *mut u16).add(pos0 * kvd);
+            let vp = (self.v_cache[layer].contents() as *mut u16).add(base + pos0 * kvd);
             for (i, &x) in v.iter().enumerate() {
                 *vp.add(i) = f16::from_f32(x).to_bits();
             }
@@ -758,6 +833,246 @@ impl MetalSession<'_> {
             pos0 += chunk.len();
         }
         Ok(logits)
+    }
+}
+
+// ---------- continuous batching ----------
+
+/// The serve-mode batcher: a pooled KV cache ([slot][max_seq][kv_dim] per layer,
+/// physical pages committed lazily by the OS) plus scratch for one batched decode
+/// step. Prefill runs per request through a slot-backed MetalSession; decode
+/// advances every active request in one submission, so one read of the weights
+/// serves all of them.
+pub(crate) struct MetalBatcher<'a> {
+    engine: &'a MetalEngine,
+    max_seq: usize,
+    splits_max: usize,
+    k_cache: Vec<Buffer>, // per layer: [n_slots × max_seq × kv_dim] f16
+    v_cache: Vec<Buffer>,
+    ids: Buffer,
+    meta: Buffer,
+    x: Buffer,
+    xn: Buffer,
+    q: Buffer,
+    att: Buffer,
+    gate: Buffer,
+    logits: Buffer,
+    partials: Buffer,
+}
+
+// Same justification as MetalEngine: every Metal object here is documented
+// thread-safe, and the batcher itself lives on one scheduler thread.
+unsafe impl Send for MetalBatcher<'_> {}
+
+impl MetalEngine {
+    pub(crate) fn make_batcher(&self, n_slots: usize, max_seq: usize) -> Option<MetalBatcher<'_>> {
+        let cfg = &self.cfg;
+        // The batched kernels are the fused-decode family — same requirements.
+        if cfg.head_dim() > DEC_TG || !cfg.head_dim().is_multiple_of(4) || n_slots > SPEC_MAX {
+            return None;
+        }
+        let d = &self.device;
+        let (h, kvd) = (cfg.hidden_size, cfg.kv_dim());
+        let splits_max = max_seq.div_ceil(ATTN_SPLIT);
+        Some(MetalBatcher {
+            k_cache: (0..cfg.num_hidden_layers)
+                .map(|_| f16_empty_buffer(d, n_slots * max_seq * kvd))
+                .collect(),
+            v_cache: (0..cfg.num_hidden_layers)
+                .map(|_| f16_empty_buffer(d, n_slots * max_seq * kvd))
+                .collect(),
+            ids: d.new_buffer((n_slots * 4) as u64, MTLResourceOptions::StorageModeShared),
+            meta: d.new_buffer(
+                (n_slots * size_of::<RowMeta>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            ),
+            x: f32_buffer(d, n_slots * h),
+            xn: f32_buffer(d, n_slots * h),
+            q: f32_buffer(d, n_slots * h),
+            att: f32_buffer(d, n_slots * h),
+            gate: f32_buffer(d, n_slots * cfg.intermediate_size),
+            logits: f32_buffer(d, n_slots * cfg.vocab_size),
+            partials: f32_buffer(
+                d,
+                n_slots * cfg.num_attention_heads * splits_max * (cfg.head_dim() + 2),
+            ),
+            splits_max,
+            max_seq,
+            engine: self,
+        })
+    }
+}
+
+impl MetalBatcher<'_> {
+    /// A regular MetalSession whose cache is this pool's `slot` — prefill reuses the
+    /// whole existing path (chunked matmul prefill, ANE handoff via write_kv).
+    pub(crate) fn slot_session(&self, slot: usize) -> MetalSession<'_> {
+        let kvd = self.engine.cfg.kv_dim();
+        let base = (slot * self.max_seq * kvd * 2) as u64;
+        self.engine.session_with_cache(
+            self.max_seq,
+            self.k_cache.clone(),
+            self.v_cache.clone(),
+            base,
+        )
+    }
+}
+
+impl crate::engine::Batcher for MetalBatcher<'_> {
+    fn prefill(&mut self, slot: usize, ids: &[u32]) -> crate::Result<Vec<f32>> {
+        self.slot_session(slot).prefill(ids)
+    }
+
+    /// One decode step for every active request — the fused decode dispatch
+    /// sequence with a batch grid dimension, encoded into a single command buffer.
+    fn decode_step(&mut self, rows: &[crate::engine::BatchRow]) -> crate::Result<Vec<Vec<f32>>> {
+        let e = self.engine;
+        let cfg = &e.cfg;
+        let n = rows.len();
+        let h = cfg.hidden_size;
+        let (hd, kvd) = (cfg.head_dim(), cfg.kv_dim());
+        unsafe {
+            let idp = self.ids.contents() as *mut u32;
+            let mp = self.meta.contents() as *mut RowMeta;
+            for (i, r) in rows.iter().enumerate() {
+                *idp.add(i) = r.token;
+                *mp.add(i) = RowMeta { pos: r.pos as u32, slot: r.slot as u32 };
+            }
+        }
+        let splits_now = rows.iter().map(|r| r.pos / ATTN_SPLIT + 1).max().unwrap_or(1);
+
+        let cb = e.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        e.enc_embed(enc, &self.ids, &self.x, n);
+        for (l, blk) in e.blocks.iter().enumerate() {
+            e.enc_rmsnorm(enc, &self.x, &blk.input_layernorm, &self.xn, n);
+
+            let p = QkvBatchParams {
+                in_dim: h as u32,
+                q_dim: blk.q_proj.out_dim,
+                kv_dim: blk.k_proj.out_dim,
+                max_seq: self.max_seq as u32,
+            };
+            enc.set_compute_pipeline_state(&e.pipes.matvec_qkv_batch);
+            enc.set_buffer(0, Some(&blk.q_proj.w), 0);
+            enc.set_buffer(1, Some(&blk.q_proj.bias), 0);
+            enc.set_buffer(2, Some(&blk.k_proj.w), 0);
+            enc.set_buffer(3, Some(&blk.k_proj.bias), 0);
+            enc.set_buffer(4, Some(&blk.v_proj.w), 0);
+            enc.set_buffer(5, Some(&blk.v_proj.bias), 0);
+            enc.set_buffer(6, Some(&self.xn), 0);
+            enc.set_buffer(7, Some(&self.q), 0);
+            enc.set_buffer(8, Some(&self.k_cache[l]), 0);
+            enc.set_buffer(9, Some(&self.v_cache[l]), 0);
+            enc.set_bytes(10, size_of::<QkvBatchParams>() as u64, &p as *const _ as *const _);
+            enc.set_buffer(11, Some(&self.meta), 0);
+            let qkv_rows = (blk.q_proj.out_dim + 2 * blk.k_proj.out_dim) as u64;
+            enc.dispatch_thread_groups(
+                MTLSize::new(qkv_rows.div_ceil(4), n as u64, 1),
+                MTLSize::new(128, 1, 1),
+            );
+
+            let p = RopeQkBatchParams {
+                head_dim: hd as u32,
+                n_q_heads: cfg.num_attention_heads as u32,
+                n_kv_heads: cfg.num_key_value_heads as u32,
+                theta: cfg.rope_theta,
+                max_seq: self.max_seq as u32,
+                kv_dim: kvd as u32,
+                n_rows: n as u32,
+            };
+            enc.set_compute_pipeline_state(&e.pipes.rope_qk_batch);
+            enc.set_buffer(0, Some(&self.q), 0);
+            enc.set_buffer(1, Some(&self.k_cache[l]), 0);
+            enc.set_buffer(2, Some(&self.meta), 0);
+            enc.set_bytes(3, size_of::<RopeQkBatchParams>() as u64, &p as *const _ as *const _);
+            dispatch_grid(enc, n * (cfg.num_attention_heads + cfg.num_key_value_heads) * hd / 2);
+
+            let p = AttnDecBatchParams {
+                head_dim: hd as u32,
+                n_heads: cfg.num_attention_heads as u32,
+                n_kv_heads: cfg.num_key_value_heads as u32,
+                max_seq: self.max_seq as u32,
+                kv_dim: kvd as u32,
+                splits_max: self.splits_max as u32,
+            };
+            enc.set_compute_pipeline_state(&e.pipes.attention_decode_partial_batch);
+            enc.set_buffer(0, Some(&self.q), 0);
+            enc.set_buffer(1, Some(&self.k_cache[l]), 0);
+            enc.set_buffer(2, Some(&self.v_cache[l]), 0);
+            enc.set_buffer(3, Some(&self.partials), 0);
+            enc.set_buffer(4, Some(&self.meta), 0);
+            enc.set_bytes(5, size_of::<AttnDecBatchParams>() as u64, &p as *const _ as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(cfg.num_attention_heads as u64, splits_now as u64, n as u64),
+                MTLSize::new(DEC_TG as u64, 1, 1),
+            );
+            enc.set_compute_pipeline_state(&e.pipes.attention_decode_reduce_batch);
+            enc.set_buffer(0, Some(&self.partials), 0);
+            enc.set_buffer(1, Some(&self.att), 0);
+            enc.set_buffer(2, Some(&self.meta), 0);
+            enc.set_bytes(3, size_of::<AttnDecBatchParams>() as u64, &p as *const _ as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(cfg.num_attention_heads as u64, n as u64, 1),
+                MTLSize::new(hd as u64, 1, 1),
+            );
+
+            self.enc_matvec_batch(enc, &e.pipes.matvec_acc_batch, &blk.o_proj, &self.att, &self.x, n);
+            e.enc_rmsnorm(enc, &self.x, &blk.post_attention_layernorm, &self.xn, n);
+            self.enc_swiglu_batch(enc, blk, n);
+            self.enc_matvec_batch(enc, &e.pipes.matvec_acc_batch, &blk.down_proj, &self.gate, &self.x, n);
+        }
+        e.enc_rmsnorm(enc, &self.x, &e.norm, &self.xn, n);
+        e.enc_linear(enc, &e.lm_head, &self.xn, 0, &self.logits, 0, n);
+
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let vocab = cfg.vocab_size;
+        let flat = unsafe {
+            std::slice::from_raw_parts(self.logits.contents() as *const f32, n * vocab)
+        };
+        Ok(flat.chunks(vocab).map(|c| c.to_vec()).collect())
+    }
+}
+
+impl MetalBatcher<'_> {
+    fn enc_matvec_batch(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        pipe: &ComputePipelineState,
+        l: &GpuLinear,
+        x: &Buffer,
+        y: &Buffer,
+        n: usize,
+    ) {
+        let p = MatvecParams { in_dim: l.in_dim, out_dim: l.out_dim };
+        enc.set_compute_pipeline_state(pipe);
+        enc.set_buffer(0, Some(&l.w), 0);
+        enc.set_buffer(1, Some(&l.bias), 0);
+        enc.set_buffer(2, Some(x), 0);
+        enc.set_buffer(3, Some(y), 0);
+        enc.set_bytes(4, size_of::<MatvecParams>() as u64, &p as *const _ as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new((l.out_dim as u64).div_ceil(4), n as u64, 1),
+            MTLSize::new(128, 1, 1),
+        );
+    }
+
+    fn enc_swiglu_batch(&self, enc: &ComputeCommandEncoderRef, blk: &GpuBlock, n: usize) {
+        let gate = &blk.gate_proj;
+        let p = MatvecParams { in_dim: gate.in_dim, out_dim: gate.out_dim };
+        enc.set_compute_pipeline_state(&self.engine.pipes.matvec_swiglu_batch);
+        enc.set_buffer(0, Some(&gate.w), 0);
+        enc.set_buffer(1, Some(&blk.up_proj.w), 0);
+        enc.set_buffer(2, Some(&self.xn), 0);
+        enc.set_buffer(3, Some(&self.gate), 0);
+        enc.set_bytes(4, size_of::<MatvecParams>() as u64, &p as *const _ as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new((gate.out_dim as u64).div_ceil(4), n as u64, 1),
+            MTLSize::new(128, 1, 1),
+        );
     }
 }
 

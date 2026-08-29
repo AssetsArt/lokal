@@ -15,6 +15,35 @@ pub trait Engine: Send + Sync {
     fn config(&self) -> &ModelConfig;
     /// Start a new generation run with a KV cache sized for `max_seq` tokens.
     fn session(&self, max_seq: usize) -> crate::Result<Box<dyn Session + '_>>;
+
+    /// Continuous batching (serve mode): a pool of `n_slots` KV slots of `max_seq`
+    /// positions each, with a decode step that advances every active request in one
+    /// pass. None means the backend doesn't support it — the server then falls back
+    /// to per-request sessions.
+    fn batcher(&self, n_slots: usize, max_seq: usize) -> Option<Box<dyn Batcher + '_>> {
+        let _ = (n_slots, max_seq);
+        None
+    }
+}
+
+/// One active request's contribution to a batched decode step.
+pub struct BatchRow {
+    pub token: u32,
+    pub pos: usize,
+    pub slot: usize,
+}
+
+/// Serve-mode continuous batching. The KV pool is plain static slots
+/// ([slot][max_seq][kv_dim] per layer): macOS commits pages lazily, so an untouched
+/// slot tail costs no physical RAM, and the kernels keep fully linear access —
+/// no block tables. Prefill still runs per request through a slot-backed Session
+/// (which is how the ANE prefill path keeps working); decode is where batching
+/// pays, because one read of the weights serves every active request.
+pub trait Batcher: Send {
+    /// Fill `slot`'s KV cache with the prompt → logits for its last position.
+    fn prefill(&mut self, slot: usize, ids: &[u32]) -> crate::Result<Vec<f32>>;
+    /// One decode step for every row → logits per row, in the same order.
+    fn decode_step(&mut self, rows: &[BatchRow]) -> crate::Result<Vec<Vec<f32>>>;
 }
 
 pub trait Session {

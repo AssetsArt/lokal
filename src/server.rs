@@ -27,6 +27,17 @@ pub fn serve(
     port: u16,
     max_concurrent: usize,
 ) -> crate::Result<()> {
+    // Continuous batching when the backend supports it: one scheduler thread owns
+    // the KV slot pool and advances every active request per GPU submission. The
+    // channel is the FIFO queue; the cpu backend falls back to the semaphore path.
+    let batch = crate::batch::spawn(engine.clone(), tokenizer.clone(), max_concurrent.max(1));
+    if batch.is_some() {
+        eprintln!("continuous batching: {} slots", max_concurrent.max(1));
+        if draft.is_some() {
+            eprintln!("note: --draft is ignored in batched serving (single-stream only)");
+        }
+    }
+
     // main() is plain sync code — build the tokio runtime here at the async boundary.
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -41,12 +52,12 @@ pub fn serve(
         eprintln!("  curl http://127.0.0.1:{port}/generate -d '{{\"prompt\": \"Once upon a time\"}}'");
         loop {
             let (stream, _) = listener.accept().await?;
-            let (engine, draft, tokenizer, sem) =
-                (engine.clone(), draft.clone(), tokenizer.clone(), sem.clone());
+            let (engine, draft, tokenizer, sem, batch) =
+                (engine.clone(), draft.clone(), tokenizer.clone(), sem.clone(), batch.clone());
             // One connection = one task, so a slow connection never blocks the others.
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
-                    handle(req, engine.clone(), draft.clone(), tokenizer.clone(), sem.clone())
+                    handle(req, engine.clone(), draft.clone(), tokenizer.clone(), sem.clone(), batch.clone())
                 });
                 let conn = http1::Builder::new().serve_connection(TokioIo::new(stream), service);
                 if let Err(e) = conn.await {
@@ -63,6 +74,7 @@ async fn handle(
     draft: Option<Arc<dyn Engine>>,
     tokenizer: Arc<Tokenizer>,
     sem: Arc<Semaphore>,
+    batch: Option<std::sync::mpsc::Sender<crate::batch::Job>>,
 ) -> std::result::Result<Response<Full<Bytes>>, hyper::Error> {
     if (req.method(), req.uri().path()) != (&Method::POST, "/generate") {
         return Ok(reply(
@@ -78,6 +90,29 @@ async fn handle(
             return Ok(reply(StatusCode::BAD_REQUEST, json!({"error": format!("invalid JSON: {e}")})))
         }
     };
+
+    // Batched serving: hand the request to the scheduler and await its reply.
+    if let Some(tx) = &batch {
+        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        let sent = tx.send(crate::batch::Job { opt, resp: rtx }).is_ok();
+        let out = if sent { rrx.await.ok() } else { None };
+        return Ok(match out {
+            Some(Ok(out)) => reply(
+                StatusCode::OK,
+                json!({
+                    "text": out.text,
+                    "prompt_tokens": out.prompt_tokens,
+                    "generated_tokens": out.generated_tokens,
+                    "tok_per_sec": out.generated_tokens as f64 / out.decode_secs.max(1e-9),
+                }),
+            ),
+            Some(Err(e)) => reply(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+            None => reply(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "the batch scheduler is gone"}),
+            ),
+        });
+    }
 
     // Wait for a generation slot (FIFO). The permit moves into the blocking task so
     // the slot frees exactly when generation finishes.

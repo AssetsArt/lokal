@@ -269,29 +269,40 @@ Design notes:
   is on the roadmap. The machinery itself is correct, exact, and free when
   `--draft` is not passed.
 
-## Serve-mode concurrency
+## Serve-mode concurrency: continuous batching
 
-Because an Engine is immutable and every Session owns its own state,
-concurrent requests need no locks — and on the hybrid backend they overlap
-across *devices*: while the GPU decodes one request, the Neural Engine
-prefills the next. Nothing schedules this explicitly; requests live on
-separate blocking threads, and both MLModel prediction and Metal command
-submission are documented thread-safe. Measured (M1 Pro, SmolLM2-135M,
-451-token prompts, 100 tokens generated, 4 concurrent requests):
+serve (on the GPU backends) runs one scheduler thread (`batch.rs`) that owns a
+`Batcher`: a pooled KV cache plus a batched decode step. Requests queue on a
+channel; a free slot admits the next request (its prompt prefills into the
+slot — on the hybrid backend that runs on the ANE), and every loop iteration
+advances ALL active requests by one token in a single GPU submission. Decode
+is bandwidth-bound on the weights, so one read of the weights serving four
+requests is nearly four times the aggregate. Outputs are bit-for-bit the
+same as running each request alone — verified with concurrent identical
+prompts, distinct prompts, and requests joining mid-flight.
+
+**KV layout: static slots, deliberately not PagedAttention.** The pool is
+`[slot][max_seq][kv_dim]` per layer. PagedAttention exists because discrete
+VRAM fragments; on unified memory, macOS commits 16 KB pages lazily, so an
+untouched slot tail costs virtual address space, not RAM — reserving full
+slots is effectively free, and the kernels keep fully linear, coalesced
+`half4` access with no block-table indirection. Block tables would buy prompt
+caching and 16+ concurrency, which this project doesn't need yet.
+
+Measured (M1 Pro, SmolLM2-135M-Instruct, 451-token prompts, 128 generated,
+4 concurrent):
 
 | | metal | ane hybrid |
 |---|---|---|
-| single-request prefill | ~0.56 s | ~0.06 s |
-| ANE prefill time under load | — | 0.05–0.18 s (≈ idle) |
-| aggregate throughput | 126 gen-tok/s | 264 gen-tok/s |
+| single-request prefill | ~0.49 s | ~0.06 s |
+| aggregate throughput | 168 gen-tok/s | **365 gen-tok/s** |
 
-Aggregate decode saturates at a few concurrent generations; past that, extra
-concurrency only splits the same tokens/sec across more requests and holds
-more KV caches in RAM. So serve admits `--max-concurrent` requests (default
-4) into generation and queues the rest FIFO (a tokio semaphore) — under a
-16-request burst, admitted requests keep their full share instead of
-everyone slowing to a crawl. Raising the ceiling itself needs continuous
-batching (Future work).
+The gap between the two columns is prefill: admission runs a whole prompt's
+prefill before decode steps resume, and on metal that stalls the batch for
+~0.5 s per join, while the ANE does it in ~0.06 s on another device — the
+hybrid design's whole thesis in one number. (Interleaving prefill chunks with
+decode steps would close the metal gap — Future work.) The cpu backend keeps
+the earlier per-request path behind a FIFO semaphore.
 
 ### Why not split tensors across ANE + GPU?
 
@@ -325,10 +336,11 @@ Roughly ordered by leverage:
    decode floor on every device, and admits 1B–8B models on modest RAM.
    Needs its own quality methodology: quantized greedy output no longer
    matches the f32 reference token-for-token.
-3. **Continuous batching in serve mode** — the only way past the ~124
-   gen-tok/s aggregate ceiling: batch concurrent decode steps into one
-   matmul so a single read of the weights serves every active request. The
-   kernels already take `n_rows`, and the admission queue already exists.
+3. **Chunked-prefill scheduling** — admission currently prefills a whole
+   prompt before decode steps resume, stalling the batch ~0.5 s per join on
+   the metal backend (the ANE hybrid hides this on another device).
+   Interleaving PREFILL_CHUNK-sized pieces with decode steps caps the stall
+   at one chunk.
 4. **ANE decode via Core ML stateful models (MLState)** — keep the KV cache
    inside the Core ML graph across invocations. The measured ~0.65 ms
    invocation cost says the overhead is tolerable once per-step compute is

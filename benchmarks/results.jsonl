@@ -7,3 +7,5 @@
 {"name": "lokal (ane) v2", "timestamp": "2026-08-29T15:11:00", "prefill_s": 0.063, "decode_tps": 239.5, "single_gen_tokens": 128, "concurrent4_agg_tps": 264.3, "concurrent4_gen_tokens": 512, "runs": 5, "conc_runs": 3}
 {"name": "lokal (metal) v3", "timestamp": "2026-08-29T16:29:46", "prefill_s": 0.454, "decode_tps": 240.0, "single_gen_tokens": 128, "concurrent4_agg_tps": 166.0, "concurrent4_gen_tokens": 512, "runs": 5, "conc_runs": 3}
 {"name": "lokal (ane) v3", "timestamp": "2026-08-29T16:29:57", "prefill_s": 0.064, "decode_tps": 237.4, "single_gen_tokens": 128, "concurrent4_agg_tps": 330.9, "concurrent4_gen_tokens": 512, "runs": 5, "conc_runs": 3}
+{"name": "lokal (metal) batch", "timestamp": "2026-08-29T16:43:18", "prefill_s": 0.487, "decode_tps": 239.9, "single_gen_tokens": 128, "concurrent4_agg_tps": 168.3, "concurrent4_gen_tokens": 512, "runs": 5, "conc_runs": 3}
+{"name": "lokal (ane) batch", "timestamp": "2026-08-29T16:43:28", "prefill_s": 0.058, "decode_tps": 232.4, "single_gen_tokens": 128, "concurrent4_agg_tps": 365.1, "concurrent4_gen_tokens": 512, "runs": 5, "conc_runs": 3}

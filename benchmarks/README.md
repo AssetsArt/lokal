@@ -24,9 +24,9 @@ ones lokal loses — they exist to steer the roadmap, not to advertise.
 
 | engine | version | prefill (~460 tok) | decode | 4x concurrent aggregate |
 |---|---|---|---|---|
-| lokal `-b metal` | main | 0.45 s | 240 tok/s | 166 tok/s |
-| lokal `-b ane` | main | **0.06 s** | 237 tok/s | 331 tok/s |
-| llama.cpp | b9960 | **0.06 s** | 215 tok/s | **355 tok/s** |
+| lokal `-b metal` | main | 0.49 s | 240 tok/s | 168 tok/s |
+| lokal `-b ane` | main | **0.06 s** | 232 tok/s | **365 tok/s** |
+| llama.cpp | b9960 | **0.06 s** | 215 tok/s | 355 tok/s |
 | oMLX | 0.6.3rc3 | 0.12 s | **262 tok/s** | 332 tok/s |
 | vLLM Metal | 0.1.0 | 0.08 s | 253 tok/s ¹ | 217 tok/s ¹ |
 | SGLang | — | n/a: no macOS support | | |
@@ -49,11 +49,11 @@ Raw per-run output: [results.jsonl](results.jsonl).
 - **Decode**: after the flash-decoding + kernel-fusion pass, lokal sits with
   the leaders (241 vs llama.cpp's 215 and oMLX's 262) — the pass is
   described in DESIGN.md, Metal backend decision 4.
-- **Concurrency**: llama.cpp and oMLX batch concurrent decodes into shared
-  forward passes (continuous batching); lokal interleaves whole single-token
-  steps, so its aggregate is capped by single-stream decode. The ane
-  backend's 264 aggregate is that cap in action — continuous batching is the
-  roadmap item that lifts it.
+- **Concurrency**: with continuous batching (one weight read serves every
+  active request) plus ANE prefill off-GPU, lokal's hybrid leads the field
+  (365 vs llama.cpp's 355 and oMLX's 332). The metal-only number is
+  admission-bound: each join prefills ~0.5 s on the same GPU — chunked
+  prefill scheduling is the known fix.
 
 ## Reproduce
 

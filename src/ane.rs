@@ -20,8 +20,8 @@
 //!   sudo powermetrics --samplers ane_power        (while generating)
 
 use crate::config::ModelConfig;
-use crate::engine::{Engine, Session};
-use crate::gpu::metal::{MetalEngine, MetalSession};
+use crate::engine::{BatchRow, Batcher, Engine, Session};
+use crate::gpu::metal::{MetalBatcher, MetalEngine, MetalSession};
 use crate::model::Model;
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -175,6 +175,33 @@ impl Engine for AneEngine {
             metal: self.metal.raw_session(max_seq),
             graphs: &self.graphs,
         }))
+    }
+    fn batcher(&self, n_slots: usize, max_seq: usize) -> Option<Box<dyn Batcher + '_>> {
+        let inner = self.metal.make_batcher(n_slots, max_seq)?;
+        Some(Box::new(AneBatcher { engine: self, inner }))
+    }
+}
+
+/// Continuous batching with the hybrid backend: decode is Metal's batched step;
+/// each admitted request's prompt goes through the Core ML graphs straight into
+/// its pooled KV slot (the slot-backed session makes write_kv land in the pool).
+struct AneBatcher<'a> {
+    engine: &'a AneEngine,
+    inner: MetalBatcher<'a>,
+}
+
+impl Batcher for AneBatcher<'_> {
+    fn prefill(&mut self, slot: usize, ids: &[u32]) -> crate::Result<Vec<f32>> {
+        let mut s = AneSession {
+            n_layers: self.engine.config().num_hidden_layers,
+            kvd: self.engine.config().kv_dim(),
+            metal: self.inner.slot_session(slot),
+            graphs: &self.engine.graphs,
+        };
+        s.prefill(ids)
+    }
+    fn decode_step(&mut self, rows: &[BatchRow]) -> crate::Result<Vec<Vec<f32>>> {
+        self.inner.decode_step(rows)
     }
 }
 

@@ -58,14 +58,14 @@ What that means end to end (676-token prompt, 200 tokens generated):
 The `ane` backend doesn't change decode speed — it cuts time-to-first-token,
 which is the number you actually feel in a chat.
 
-Serving is where the hybrid pays off most: requests share no mutable state,
-so they overlap across devices with no locks — the Neural Engine prefills
-one request while the GPU decodes the others:
+Serving is where the hybrid pays off most. Concurrent requests decode as one
+batch — a single read of the weights serves every active request — while the
+Neural Engine prefills newly arrived requests off-GPU:
 
 | 4 concurrent requests (451-token prompts) | metal | ane (hybrid) |
 |---|---|---|
-| single-request prefill | 0.45 s | **0.06 s** |
-| aggregate throughput | 166 tok/s | **331 tok/s** |
+| single-request prefill | 0.49 s | **0.06 s** |
+| aggregate throughput | 168 tok/s | **365 tok/s** |
 
 How lokal compares against other engines on the same machine and model, with
 reproduction steps, lives in [benchmarks/](benchmarks/).
@@ -118,9 +118,9 @@ curl http://127.0.0.1:8080/generate -d '{"prompt": "Once upon a time", "max_toke
 
 Single endpoint, JSON in and out: `prompt` (required), `max_tokens`,
 `temperature`, `top_p`, `seed`, `chat`. The reply includes token counts and
-tokens/sec. Up to `--max-concurrent` requests (default 4 — where an M1 Pro's
-aggregate throughput saturates) generate at once; the rest queue FIFO, so
-per-request speed stays flat under burst load.
+tokens/sec. On the GPU backends, up to `--max-concurrent` requests (default 4)
+decode as one continuous batch and the rest queue FIFO; outputs are identical
+to running each request alone.
 
 ## CLI reference
 
@@ -164,7 +164,7 @@ adding new backends live in [DESIGN.md](DESIGN.md).
 - [ ] OpenAI-compatible API in serve mode (`/v1/chat/completions`, works with existing clients)
 - [ ] Streaming responses (SSE)
 - [ ] Quantized weights (int8/int4) for larger models on modest RAM
-- [ ] Continuous batching — one weight read serves every active request
+- [x] Continuous batching — one weight read serves every active request
 - [x] `simdgroup_matrix` (MMA) matmul on Metal
 - [ ] CUDA (NVIDIA) and Vulkan (AMD/portable) backends
 - [x] Multi-size ANE prefill graphs (512/2048) with automatic routing per prompt length

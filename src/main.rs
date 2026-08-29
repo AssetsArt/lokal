@@ -12,6 +12,7 @@
 
 #[cfg(target_os = "macos")]
 mod ane;
+mod batch;
 mod config;
 mod engine;
 mod generate;

@@ -46,7 +46,7 @@ pub struct GenOutput {
 
 /// ChatML template — Instruct models (SmolLM2-Instruct, Qwen2.5-Instruct) are fine-tuned
 /// to answer text in exactly this shape; a bare prompt won't get a conversational reply.
-fn chatml(user_msg: &str) -> String {
+pub(crate) fn chatml(user_msg: &str) -> String {
     format!("<|im_start|>user\n{user_msg}<|im_end|>\n<|im_start|>assistant\n")
 }
 
