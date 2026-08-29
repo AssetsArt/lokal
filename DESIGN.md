@@ -341,6 +341,19 @@ Roughly ordered by leverage:
    the metal backend (the ANE hybrid hides this on another device).
    Interleaving PREFILL_CHUNK-sized pieces with decode steps caps the stall
    at one chunk.
+4. **Windowed ANE prefill (spiked, not yet wired).** Prompts past the
+   largest graph overflow to Metal today because the graphs cannot see
+   history. A windowed graph — current chunk of S tokens plus `k_past` /
+   `v_past` inputs (fixed P, validity-masked) — was spiked and works:
+   ANE-compiles cleanly, ~0.6 s per (S=1024, P=3072) chunk, and matches the
+   f32 reference as well as the shipping graphs do (max abs diff ~0.4) up to
+   a total attention width of 6,144. At width 8,192 the Core ML fp16 path
+   breaks hard (max abs diff ~66 with the *same* valid content, only wider
+   masked padding) — some internal tiling limit, not our math. So the wiring
+   plan is: chunk long prompts through windowed graphs up to ~6k total
+   context on the ANE, and keep the Metal overflow beyond that. For truly
+   long prompts the better lever is a flash-attention-style Metal prefill
+   kernel (f32 accumulation has no such cliff).
 4. **ANE decode via Core ML stateful models (MLState)** — keep the KV cache
    inside the Core ML graph across invocations. The measured ~0.65 ms
    invocation cost says the overhead is tolerable once per-step compute is
