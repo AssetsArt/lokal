@@ -247,6 +247,14 @@ impl Session for AneSession<'_> {
     fn prefill(&mut self, ids: &[u32]) -> crate::Result<Vec<f32>> {
         let want = ids.len().saturating_sub(1);
         let mut ane_n = 0;
+        if want < ANE_MIN {
+            // Say so — the user picked -b ane and would otherwise wonder why the
+            // Neural Engine stays idle on a short prompt.
+            eprintln!(
+                "  ANE skipped: {}-token prompt (< {ANE_MIN}) — the GPU prefills it faster than the smallest padded graph",
+                ids.len()
+            );
+        }
         if want >= ANE_MIN {
             let g = pick_graph(self.graphs, want);
             ane_n = want.min(g.seq);
