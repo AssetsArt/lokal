@@ -141,8 +141,13 @@ class WindowedNet(torch.nn.Module):
     through the ANE in chunks: the Rust side accumulates each chunk's K/V and feeds
     it back as the next chunk's past. All shapes are static.
 
-    Measured limit: the Core ML fp16 path matches the f32 reference up to a total
-    attention width (P + S) of 6,144 and breaks hard at 8,192 — keep P + S ≤ 6,144.
+    Measured (2026-08-29, Qwen2.5-0.5B-Instruct, natural text): the fp16 path holds
+    its numeric envelope through P + S = 8,192 — max |Δ| vs torch f32 was 0.54/0.41
+    (K/V) at 8,192 vs 0.50/0.34 for the shipped 6,144 graph. The earlier "breaks
+    hard at 8,192" note predated the host-side cos/sin fix and was the misdiagnosed
+    in-graph fp16 position bug, not a width limit. The practical bound is the
+    first-load ANECompilerService cost, which every machine pays once per graph:
+    99 s at 6,144 → 250 s at 8,192 → 21+ min (unfinished, killed) at 16,384.
     """
 
     def __init__(self, cfg, weights, s, p):
@@ -236,7 +241,7 @@ def main():
     ap.add_argument("model_dir", type=Path)
     ap.add_argument("--shapes", default="512,2048",
                     help="sequence lengths to export, comma-separated (one graph each)")
-    ap.add_argument("--window", default="1024x5120",
+    ap.add_argument("--window", default="1024x7168",
                     help="windowed graph as SxP (chunk x past), 'none' to skip")
     args = ap.parse_args()
     shapes = sorted(int(s) for s in args.shapes.split(","))

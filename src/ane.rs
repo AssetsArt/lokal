@@ -112,8 +112,10 @@ impl CoreMlPrefill {
 /// A windowed prefill graph: one chunk of `s` tokens attending to up to `p` past
 /// positions fed in as K/V inputs. This is how prompts longer than the plain graphs
 /// stay on the ANE — the runtime accumulates each chunk's K/V and feeds it back as
-/// the next chunk's past. p + s stays ≤ 6,144: the measured width where the Core ML
-/// fp16 path still matches the f32 reference (it breaks hard at 8,192).
+/// the next chunk's past. The fp16 path holds its numeric envelope through
+/// p + s = 8,192 (measured against torch f32 on natural text); what limits wider
+/// windows is the one-time first-load ANECompilerService cost, which scales
+/// 99 s at 6,144 → 250 s at 8,192 → 21+ min at 16,384.
 struct CoreMlWindowed {
     model: Retained<MLModel>,
     s: usize,
@@ -282,6 +284,10 @@ impl AneEngine {
             .into());
         }
         found.sort_by_key(|&(_, seq)| seq);
+        // First load on a machine sends each graph through ANECompilerService, which
+        // is silent and can take minutes for the windowed graph (~250 s at 8,192);
+        // without a notice that reads as a hang. Later loads hit the cache in seconds.
+        eprintln!("ANE: loading prefill graphs (first load on this machine compiles them — can take minutes)");
         let graphs = found
             .iter()
             .map(|(path, seq)| CoreMlPrefill::load(path, *seq))
