@@ -396,9 +396,14 @@ def main():
         done.append(dest)
         print(f"saved: {dest}", flush=True)
 
-    # Remove graphs from older exports with sizes not in this run.
+    # Remove stale graphs from older exports — but only of the kinds this run
+    # actually rebuilt: a plain-only run must not delete the windowed graph and
+    # a --shapes none windowed run must not delete the plain graphs (that
+    # cross-delete once wiped a model's whole graph set).
     for old in args.model_dir.glob("prefill-*.mlmodelc"):
-        if old not in done:
+        is_windowed = "w" in old.stem.removeprefix("prefill-")
+        rebuilt_kind = (args.window != "none") if is_windowed else bool(shapes)
+        if rebuilt_kind and old not in done:
             shutil.rmtree(old)
     print(f"done: {len(done)} graph(s)")
 
