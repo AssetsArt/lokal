@@ -1,0 +1,33 @@
+[package]
+name = "lokal"
+version = "0.1.0"
+edition = "2021"
+description = "Fast, simple local LLM inference — CPU, Metal GPU, and Apple Neural Engine backends"
+license = "MIT"
+readme = "README.md"
+keywords = ["llm", "inference", "local", "metal", "transformer"]
+categories = ["command-line-utilities", "science"]
+
+[dependencies]
+# Model loading and execution (the transformer itself is implemented in this repo)
+hf-hub = { version = "1.0", features = ["blocking"] }  # standard HF cache, shared with other tools
+half = "2.7"            # bf16/f16 <-> f32 conversion (most checkpoints ship bf16)
+memmap2 = "0.9"         # mmap weight files instead of reading them into RAM up front
+rayon = "1.12"          # parallel matmul rows on the CPU backend
+safetensors = "0.8"     # .safetensors header parsing
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"      # config.json + HTTP API payloads
+tokenizers = "0.23"     # Hugging Face BPE tokenizer
+
+# HTTP server (serve mode)
+http-body-util = "0.1"  # body helpers for hyper
+hyper = { version = "1.11", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }   # hyper <-> tokio glue
+tokio = { version = "1.53", features = ["rt-multi-thread", "net"] }
+
+# GPU / ANE backends (compiled only where the hardware exists; see src/gpu/, src/ane.rs)
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.33"          # Rust bindings for Apple's Metal API
+objc2 = "0.6"           # Objective-C interop (Core ML is an ObjC framework)
+objc2-core-ml = "0.3"   # Core ML bindings — the only public road to the ANE
+objc2-foundation = "0.3" # NSString/NSArray/NSDictionary used by Core ML
