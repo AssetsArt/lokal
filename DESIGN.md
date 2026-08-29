@@ -163,6 +163,19 @@ one-time Python export step and keeps the runtime pure Rust + Core ML.
   prompt fills at least half of it — ANE time grows superlinearly with S
   (attention is S²: 46 ms at 512, 510 ms at 2048), so below half-full it is
   cheaper to fill the smaller graph and let Metal take the overflow.
+- **Windowed chunking past the largest graph.** Longer prompts run in
+  S=1024 chunks through a windowed graph (`prefill-1024w5120.mlmodelc`): each
+  chunk attends to up to P=5120 rows of accumulated past K/V fed in as
+  validity-masked inputs, so everything up to 6,144 positions stays on the
+  ANE, and Metal takes only the tail beyond that. Two hard-won rules are
+  baked into the export: (1) the graph must never derive positions
+  internally — the fp16 pipeline cannot represent integers above 2,048, which
+  silently corrupts RoPE from that position on (this presented as a "cliff"
+  that was first misread as a softmax-width limit), so RoPE cos/sin arrive
+  as host-computed inputs; (2) every softmax stays ≤ 2,048 positions wide,
+  with segments merged by an exact online-softmax. Measured: a 6,086-token
+  prompt prefills in 3.3 s vs 14.1 s on Metal alone (4.3x), token-identical
+  to the CPU reference.
 - **Padding is safe by construction.** Prompts shorter than the chosen graph
   are zero-padded at the tail; the causal mask guarantees pad positions
   cannot influence the K,V of real positions before them, and the padded
@@ -341,19 +354,14 @@ Roughly ordered by leverage:
    the metal backend (the ANE hybrid hides this on another device).
    Interleaving PREFILL_CHUNK-sized pieces with decode steps caps the stall
    at one chunk.
-4. **Windowed ANE prefill (spiked, not yet wired).** Prompts past the
-   largest graph overflow to Metal today because the graphs cannot see
-   history. A windowed graph — current chunk of S tokens plus `k_past` /
-   `v_past` inputs (fixed P, validity-masked) — was spiked and works:
-   ANE-compiles cleanly, ~0.6 s per (S=1024, P=3072) chunk, and matches the
-   f32 reference as well as the shipping graphs do (max abs diff ~0.4) up to
-   a total attention width of 6,144. At width 8,192 the Core ML fp16 path
-   breaks hard (max abs diff ~66 with the *same* valid content, only wider
-   masked padding) — some internal tiling limit, not our math. So the wiring
-   plan is: chunk long prompts through windowed graphs up to ~6k total
-   context on the ANE, and keep the Metal overflow beyond that. For truly
-   long prompts the better lever is a flash-attention-style Metal prefill
-   kernel (f32 accumulation has no such cliff).
+4. **Wider ANE windows.** The windowed graph caps at 6,144 positions — a
+   limit chosen while the failures were still misattributed (the real bug
+   was in-graph fp16 positions, fixed by feeding cos/sin as inputs). The
+   true ceiling with the fixed graph is unmeasured: probe P=7168 and beyond,
+   and raise the cap toward the model's context length if it stays clean.
+   For prompts past whatever the ANE covers, a flash-attention-style Metal
+   prefill kernel (f32 accumulation, no fp16 cliffs) is the complementary
+   lever.
 4. **ANE decode via Core ML stateful models (MLState)** — keep the KV cache
    inside the Core ML graph across invocations. The measured ~0.65 ms
    invocation cost says the overhead is tolerable once per-step compute is

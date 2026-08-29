@@ -22,6 +22,7 @@
 use crate::config::ModelConfig;
 use crate::engine::{BatchRow, Batcher, Engine, Session};
 use crate::gpu::metal::{MetalBatcher, MetalEngine, MetalSession};
+use half::f16;
 use crate::model::Model;
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -108,6 +109,129 @@ impl CoreMlPrefill {
     }
 }
 
+/// A windowed prefill graph: one chunk of `s` tokens attending to up to `p` past
+/// positions fed in as K/V inputs. This is how prompts longer than the plain graphs
+/// stay on the ANE — the runtime accumulates each chunk's K/V and feeds it back as
+/// the next chunk's past. p + s stays ≤ 6,144: the measured width where the Core ML
+/// fp16 path still matches the f32 reference (it breaks hard at 8,192).
+struct CoreMlWindowed {
+    model: Retained<MLModel>,
+    s: usize,
+    p: usize,
+}
+
+unsafe impl Send for CoreMlWindowed {}
+unsafe impl Sync for CoreMlWindowed {}
+
+fn ml_array(shape: &[usize], dtype: MLMultiArrayDataType) -> crate::Result<Retained<MLMultiArray>> {
+    let dims: Vec<_> = shape.iter().map(|&d| NSNumber::new_usize(d)).collect();
+    let shape_ns = NSArray::from_retained_slice(&dims);
+    unsafe { MLMultiArray::initWithShape_dataType_error(MLMultiArray::alloc(), &shape_ns, dtype) }
+        .map_err(|e| format!("failed to create MLMultiArray: {e:?}").into())
+}
+
+impl CoreMlWindowed {
+    fn load(path: &Path, s: usize, p: usize) -> crate::Result<Self> {
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        let config = unsafe { MLModelConfiguration::new() };
+        unsafe { config.setComputeUnits(MLComputeUnits::CPUAndNeuralEngine) };
+        let model = unsafe { MLModel::modelWithContentsOfURL_configuration_error(&url, &config) }
+            .map_err(|e| format!("failed to load {}: {e:?}", path.display()))?;
+        Ok(Self { model, s, p })
+    }
+
+    /// One chunk: `ids` (≤ s tokens) at absolute position `pos0`, with `pos0` (≤ p)
+    /// valid rows of accumulated K/V ([layers × p × kvd], f16 bits). RoPE cos/sin
+    /// are computed here in f32 and fed as inputs — the graph must not derive
+    /// positions itself, because the fp16 pipeline cannot represent integers above
+    /// 2,048 exactly and RoPE breaks from that position on.
+    #[allow(clippy::too_many_arguments)]
+    fn predict(
+        &self,
+        ids: &[u32],
+        pos0: usize,
+        k_past: &[u16],
+        v_past: &[u16],
+        n_layers: usize,
+        kvd: usize,
+        head_dim: usize,
+        theta: f32,
+    ) -> crate::Result<(Vec<f32>, Vec<f32>)> {
+        autoreleasepool(|_| {
+            let ids_arr = ml_array(&[1, self.s], MLMultiArrayDataType::Int32)?;
+            let cos_arr = ml_array(&[self.s, head_dim], MLMultiArrayDataType::Float16)?;
+            let sin_arr = ml_array(&[self.s, head_dim], MLMultiArrayDataType::Float16)?;
+            let k_arr = ml_array(&[n_layers, self.p, kvd], MLMultiArrayDataType::Float16)?;
+            let v_arr = ml_array(&[n_layers, self.p, kvd], MLMultiArrayDataType::Float16)?;
+            let valid_arr = ml_array(&[1, self.p], MLMultiArrayDataType::Float16)?;
+            #[allow(deprecated)] // dataPointer: plain pointers, same reasoning as above
+            unsafe {
+                let idp = ids_arr.dataPointer().as_ptr() as *mut i32;
+                for i in 0..self.s {
+                    *idp.add(i) = if i < ids.len() { ids[i] as i32 } else { 0 };
+                }
+                let cp = cos_arr.dataPointer().as_ptr() as *mut u16;
+                let sp = sin_arr.dataPointer().as_ptr() as *mut u16;
+                let half = head_dim / 2;
+                for r in 0..self.s {
+                    let pos = (pos0 + r) as f32;
+                    for i in 0..half {
+                        let freq = theta.powf(-2.0 * i as f32 / head_dim as f32);
+                        let (s_v, c_v) = (pos * freq).sin_cos();
+                        let (c_b, s_b) = (f16::from_f32(c_v).to_bits(), f16::from_f32(s_v).to_bits());
+                        *cp.add(r * head_dim + i) = c_b;
+                        *cp.add(r * head_dim + i + half) = c_b; // HF layout: both halves
+                        *sp.add(r * head_dim + i) = s_b;
+                        *sp.add(r * head_dim + i + half) = s_b;
+                    }
+                }
+                std::ptr::copy_nonoverlapping(
+                    k_past.as_ptr(),
+                    k_arr.dataPointer().as_ptr() as *mut u16,
+                    k_past.len(),
+                );
+                std::ptr::copy_nonoverlapping(
+                    v_past.as_ptr(),
+                    v_arr.dataPointer().as_ptr() as *mut u16,
+                    v_past.len(),
+                );
+                let vp = valid_arr.dataPointer().as_ptr() as *mut u16;
+                let one = f16::from_f32(1.0).to_bits();
+                for i in 0..self.p {
+                    *vp.add(i) = if i < pos0 { one } else { 0 };
+                }
+            }
+
+            let names = ["ids", "cos", "sin", "k_past", "v_past", "past_valid"];
+            let arrays = [ids_arr, cos_arr, sin_arr, k_arr, v_arr, valid_arr];
+            let keys: Vec<_> = names.iter().map(|n| NSString::from_str(n)).collect();
+            let key_refs: Vec<&NSString> = keys.iter().map(|k| &**k).collect();
+            let values: Vec<Retained<AnyObject>> = arrays
+                .into_iter()
+                .map(|a| {
+                    let v = unsafe { MLFeatureValue::featureValueWithMultiArray(&a) };
+                    Retained::into_super(Retained::into_super(v))
+                })
+                .collect();
+            let dict = NSDictionary::from_retained_objects(&key_refs, &values);
+            let provider = unsafe {
+                MLDictionaryFeatureProvider::initWithDictionary_error(
+                    MLDictionaryFeatureProvider::alloc(),
+                    &dict,
+                )
+            }
+            .map_err(|e| format!("feature provider: {e:?}"))?;
+
+            let out = unsafe {
+                self.model
+                    .predictionFromFeatures_error(ProtocolObject::from_ref(&*provider))
+            }
+            .map_err(|e| format!("Core ML prediction failed: {e:?}"))?;
+            Ok((fetch_f32(&out, "k_cache")?, fetch_f32(&out, "v_cache")?))
+        })
+    }
+}
+
 /// Pull an f32 multiarray output into a Vec<f32>.
 fn fetch_f32(out: &ProtocolObject<dyn MLFeatureProvider>, name: &str) -> crate::Result<Vec<f32>> {
     let fv = unsafe { out.featureValueForName(&NSString::from_str(name)) }
@@ -125,26 +249,33 @@ fn fetch_f32(out: &ProtocolObject<dyn MLFeatureProvider>, name: &str) -> crate::
 pub struct AneEngine {
     metal: MetalEngine,
     graphs: Vec<CoreMlPrefill>, // sorted by seq, ascending — one fixed shape each
+    windowed: Option<CoreMlWindowed>,
 }
 
 impl AneEngine {
     pub fn new(model: Model, model_dir: &Path) -> crate::Result<Self> {
-        // Collect every prefill-<seq>.mlmodelc next to the model (seq is in the name).
+        // Collect every prefill graph next to the model: prefill-<seq>.mlmodelc
+        // (plain) and prefill-<s>w<p>.mlmodelc (windowed).
         let mut found = Vec::new();
+        let mut win = None;
         for entry in std::fs::read_dir(model_dir)? {
             let name = entry?.file_name().to_string_lossy().into_owned();
-            if let Some(seq) = name
-                .strip_prefix("prefill-")
-                .and_then(|s| s.strip_suffix(".mlmodelc"))
-                .and_then(|s| s.parse::<usize>().ok())
-            {
+            let Some(spec) = name.strip_prefix("prefill-").and_then(|s| s.strip_suffix(".mlmodelc"))
+            else {
+                continue;
+            };
+            if let Some((s, p)) = spec.split_once('w') {
+                if let (Ok(s), Ok(p)) = (s.parse::<usize>(), p.parse::<usize>()) {
+                    win = Some((model_dir.join(&name), s, p));
+                }
+            } else if let Ok(seq) = spec.parse::<usize>() {
                 found.push((model_dir.join(&name), seq));
             }
         }
         if found.is_empty() {
             return Err(format!(
                 "the ane backend needs prefill-<seq>.mlmodelc graphs in the model directory — build them once with:\n  \
-                 uv run --python 3.12 --with torch --with coremltools --with safetensors --with numpy \\\n    \
+                 uv run --python 3.12 --with torch --with coremltools --with safetensors --with numpy --with tokenizers \\\n    \
                  tools/export_prefill.py {} --shapes 512,2048",
                 model_dir.display()
             )
@@ -155,9 +286,19 @@ impl AneEngine {
             .iter()
             .map(|(path, seq)| CoreMlPrefill::load(path, *seq))
             .collect::<crate::Result<Vec<_>>>()?;
+        let windowed = match win {
+            Some((path, s, p)) => Some(CoreMlWindowed::load(&path, s, p)?),
+            None => None,
+        };
         let shapes: Vec<usize> = graphs.iter().map(|g| g.seq).collect();
-        eprintln!("ANE: loaded prefill graphs {shapes:?} (Core ML, compute = CPU+ANE)");
-        Ok(Self { metal: MetalEngine::new(model)?, graphs })
+        match &windowed {
+            Some(w) => eprintln!(
+                "ANE: loaded prefill graphs {shapes:?} + windowed {}x{} (Core ML, compute = CPU+ANE)",
+                w.s, w.p
+            ),
+            None => eprintln!("ANE: loaded prefill graphs {shapes:?} (Core ML, compute = CPU+ANE)"),
+        }
+        Ok(Self { metal: MetalEngine::new(model)?, graphs, windowed })
     }
 }
 
@@ -174,6 +315,7 @@ impl Engine for AneEngine {
             kvd: self.config().kv_dim(),
             metal: self.metal.raw_session(max_seq),
             graphs: &self.graphs,
+            windowed: self.windowed.as_ref(),
         }))
     }
     fn batcher(&self, n_slots: usize, max_seq: usize) -> Option<Box<dyn Batcher + '_>> {
@@ -197,6 +339,7 @@ impl Batcher for AneBatcher<'_> {
             kvd: self.engine.config().kv_dim(),
             metal: self.inner.slot_session(slot),
             graphs: &self.engine.graphs,
+            windowed: self.engine.windowed.as_ref(),
         };
         s.prefill(ids)
     }
@@ -212,8 +355,81 @@ const ANE_MIN: usize = 64;
 struct AneSession<'a> {
     metal: MetalSession<'a>,
     graphs: &'a [CoreMlPrefill], // sorted by seq, ascending
+    windowed: Option<&'a CoreMlWindowed>,
     n_layers: usize,
     kvd: usize,
+}
+
+impl AneSession<'_> {
+    /// Copy `n` rows of a graph result (per-layer stride `src_stride`) into Metal's
+    /// cache — and, when chunking, into the host-side f16 past that feeds the next
+    /// windowed chunk (rows at index ≥ p can never be attended to again and are
+    /// skipped).
+    #[allow(clippy::too_many_arguments)]
+    fn absorb(
+        &mut self,
+        k: &[f32],
+        v: &[f32],
+        src_stride: usize,
+        pos0: usize,
+        n: usize,
+        past: Option<(&mut [u16], &mut [u16], usize)>,
+    ) {
+        let kvd = self.kvd;
+        for l in 0..self.n_layers {
+            let off = l * src_stride * kvd;
+            let used = n * kvd;
+            self.metal.write_kv(l, pos0, &k[off..off + used], &v[off..off + used]);
+        }
+        if let Some((past_k, past_v, p)) = past {
+            let copy = (n * kvd).min(p.saturating_sub(pos0) * kvd);
+            for l in 0..self.n_layers {
+                let off = l * src_stride * kvd;
+                let dst = l * p * kvd + pos0 * kvd;
+                for i in 0..copy {
+                    past_k[dst + i] = f16::from_f32(k[off + i]).to_bits();
+                    past_v[dst + i] = f16::from_f32(v[off + i]).to_bits();
+                }
+            }
+        }
+    }
+
+    /// Prompts longer than the largest plain graph: head chunk through the plain
+    /// graph, then windowed chunks that attend to the accumulated past — all on the
+    /// ANE up to s+p total positions; Metal takes anything beyond that.
+    fn prefill_chunked(&mut self, ids: &[u32], want: usize) -> crate::Result<Vec<f32>> {
+        let w = self.windowed.expect("caller checked");
+        let ane_total = want.min(w.s + w.p);
+        let (n_layers, kvd) = (self.n_layers, self.kvd);
+        let mut past_k = vec![0u16; n_layers * w.p * kvd];
+        let mut past_v = vec![0u16; n_layers * w.p * kvd];
+
+        let t = Instant::now();
+        let head_graph = self.graphs.last().expect("AneEngine::new guarantees one");
+        let head = ane_total.min(head_graph.seq);
+        let (k, v) = head_graph.predict(&ids[..head])?;
+        self.absorb(&k, &v, head_graph.seq, 0, head, Some((&mut past_k, &mut past_v, w.p)));
+
+        let cfg = self.metal.config_ref();
+        let (head_dim, theta) = (cfg.head_dim(), cfg.rope_theta);
+        let mut pos = head;
+        let mut chunks = 1;
+        while pos < ane_total {
+            let n = (ane_total - pos).min(w.s);
+            let (k, v) =
+                w.predict(&ids[pos..pos + n], pos, &past_k, &past_v, n_layers, kvd, head_dim, theta)?;
+            self.absorb(&k, &v, w.s, pos, n, Some((&mut past_k, &mut past_v, w.p)));
+            pos += n;
+            chunks += 1;
+        }
+        eprintln!(
+            "  ANE prefill: {ane_total} tokens ({chunks} chunks, windowed S={} P={}) in {:.2}s",
+            w.s,
+            w.p,
+            t.elapsed().as_secs_f64()
+        );
+        self.metal.prefill_from(&ids[ane_total..], ane_total)
+    }
 }
 
 /// Pick the graph for a `want`-token prompt. Prefer the smallest graph that fits,
@@ -246,7 +462,6 @@ impl Session for AneSession<'_> {
     /// Metal step is cheaper than shipping a vocab-sized matmul through Core ML).
     fn prefill(&mut self, ids: &[u32]) -> crate::Result<Vec<f32>> {
         let want = ids.len().saturating_sub(1);
-        let mut ane_n = 0;
         if want < ANE_MIN {
             // Say so — the user picked -b ane and would otherwise wonder why the
             // Neural Engine stays idle on a short prompt.
@@ -254,25 +469,23 @@ impl Session for AneSession<'_> {
                 "  ANE skipped: {}-token prompt (< {ANE_MIN}) — the GPU prefills it faster than the smallest padded graph",
                 ids.len()
             );
+            return self.metal.prefill_from(ids, 0);
         }
-        if want >= ANE_MIN {
-            let g = pick_graph(self.graphs, want);
-            ane_n = want.min(g.seq);
-            let t = Instant::now();
-            let (k, v) = g.predict(&ids[..ane_n])?;
-            // Move K,V into Metal's cache — keep only the ane_n real rows, drop the padding.
-            let per_layer = g.seq * self.kvd;
-            let used = ane_n * self.kvd;
-            for layer in 0..self.n_layers {
-                let off = layer * per_layer;
-                self.metal.write_kv(layer, 0, &k[off..off + used], &v[off..off + used]);
-            }
-            eprintln!(
-                "  ANE prefill: {ane_n} tokens (S={} graph) in {:.2}s",
-                g.seq,
-                t.elapsed().as_secs_f64()
-            );
+        let largest = self.graphs.last().map(|g| g.seq).unwrap_or(0);
+        if want > largest && self.windowed.is_some() {
+            return self.prefill_chunked(ids, want);
         }
+        let g = pick_graph(self.graphs, want);
+        let ane_n = want.min(g.seq);
+        let t = Instant::now();
+        let (k, v) = g.predict(&ids[..ane_n])?;
+        // Move K,V into Metal's cache — keep only the ane_n real rows, drop the padding.
+        self.absorb(&k, &v, g.seq, 0, ane_n, None);
+        eprintln!(
+            "  ANE prefill: {ane_n} tokens (S={} graph) in {:.2}s",
+            g.seq,
+            t.elapsed().as_secs_f64()
+        );
         self.metal.prefill_from(&ids[ane_n..], ane_n)
     }
 }

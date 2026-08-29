@@ -99,10 +99,11 @@ how fast it says it.
 ```
 
 lokal picks the graph that fits the prompt: tiny prompts (< 64 tokens) skip
-the ANE — the GPU is faster there — and prompts longer than the largest
-graph overflow to Metal seamlessly. The long graph is what makes long
-prompts fast: a 1,223-token prompt prefills in 0.55 s vs 2.38 s on Metal
-alone.
+the ANE — the GPU is faster there — and long prompts run in chunks through a
+windowed graph that carries the accumulated context, keeping everything up
+to ~6k tokens on the ANE (beyond that, Metal takes the tail seamlessly).
+That is what makes long prompts fast: a 6,086-token prompt prefills in
+3.3 s vs 14.1 s on Metal alone.
 
 The export step needs [uv](https://docs.astral.sh/uv/) and runs offline.
 Placement is verified, not assumed: inspecting the compiled graph with the
@@ -168,6 +169,7 @@ adding new backends live in [DESIGN.md](DESIGN.md).
 - [x] `simdgroup_matrix` (MMA) matmul on Metal
 - [ ] CUDA (NVIDIA) and Vulkan (AMD/portable) backends
 - [x] Multi-size ANE prefill graphs (512/2048) with automatic routing per prompt length
+- [x] Windowed ANE prefill — long prompts chunk through the ANE with fed-back KV (~6k coverage)
 - [ ] ANE decode via Core ML stateful models (MLState)
 - [ ] Hybrid scheduler — route each phase to the best device automatically, no `--backend` flag needed
 - [ ] Repetition penalty and top-k sampling

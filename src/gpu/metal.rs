@@ -804,6 +804,11 @@ impl MetalSession<'_> {
         Ok(logits.to_vec())
     }
 
+    /// The model config, for callers (the ane backend) that only hold a session.
+    pub(crate) fn config_ref(&self) -> &ModelConfig {
+        &self.engine.cfg
+    }
+
     /// Write K,V computed elsewhere (e.g. on the ANE) into the cache at pos0 onward,
     /// converting to the cache's f16 on the way. With unified memory this is the
     /// whole "device transfer".
