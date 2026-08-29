@@ -148,17 +148,28 @@ one-time Python export step and keeps the runtime pure Rust + Core ML.
   ever-growing cache fits it poorly, but prefill is a fixed-shape,
   compute-bound batch job — exactly its diet. The export script rebuilds the
   prefill half of the transformer (through `embedding` → blocks → per-layer
-  K,V; no lm_head) at a fixed S=512, fp16, requesting `CPU_AND_NE`.
-- **Padding is safe by construction.** Prompts shorter than 512 are zero-padded
-  at the tail; the causal mask guarantees pad positions cannot influence the
-  K,V of real positions before them, and the padded rows are simply not copied
-  out.
-- **The hybrid handoff.** `AneSession::prefill` sends `ids[..n-1]` (up to 512)
-  through Core ML, memcpys the resulting K,V into the Metal session's cache
-  (`MetalSession::write_kv`), then lets Metal handle any overflow plus the
-  final prompt token (`MetalSession::prefill_from`) — the last token produces
-  the logits, which is why the ANE graph can omit lm_head entirely. Decoding
-  is pure Metal.
+  K,V; no lm_head) at fixed shapes (S=512 and S=2048 by default), fp16,
+  requesting `CPU_AND_NE`.
+- **A ladder of fixed graphs, not one dynamic one.** Enumerated shapes were
+  tried and measured: on this graph `ct.EnumeratedShapes` makes ANECCompile
+  fail (silent CPU fallback) and the compiled model OOMs a 16 GB machine at
+  load. Separate fixed graphs compile clean; the cost is one weight copy on
+  disk per size. Routing (`ane::pick_graph`): prompts under 64 tokens skip
+  the ANE entirely (the GPU is faster than the smallest padded graph); use
+  the smallest graph that fits, but only step up to a bigger graph when the
+  prompt fills at least half of it — ANE time grows superlinearly with S
+  (attention is S²: 46 ms at 512, 510 ms at 2048), so below half-full it is
+  cheaper to fill the smaller graph and let Metal take the overflow.
+- **Padding is safe by construction.** Prompts shorter than the chosen graph
+  are zero-padded at the tail; the causal mask guarantees pad positions
+  cannot influence the K,V of real positions before them, and the padded
+  rows are simply not copied out.
+- **The hybrid handoff.** `AneSession::prefill` sends `ids[..n-1]` (up to the
+  chosen graph's length) through Core ML, memcpys the resulting K,V into the
+  Metal session's cache (`MetalSession::write_kv`), then lets Metal handle
+  any overflow plus the final prompt token (`MetalSession::prefill_from`) —
+  the last token produces the logits, which is why the ANE graphs can omit
+  lm_head entirely. Decoding is pure Metal.
 - **Placement is verified, not assumed.** Core ML decides where a graph runs;
   we check with the MLComputePlan API (1,733 ops on the NeuralEngine device,
   6 on the CPU for SmolLM2-135M) and `powermetrics --samplers ane_power`.
@@ -188,7 +199,8 @@ values and run offline.
 | decode (short context) | ~49 tok/s | ~267 tok/s | = metal |
 | decode (~500 positions) | — | ~237 tok/s | = metal |
 | prefill, 676-token prompt | ~33 tok/s | ~740 tok/s | ~1,700 tok/s |
-| ANE-only portion (512 tokens) | — | — | ~0.07 s |
+| prefill, 1,223-token prompt | — | ~515 tok/s | ~2,200 tok/s |
+| ANE-only graph run | — | — | 0.05 s (S=512) / 0.51 s (S=2048) |
 
 End to end — 676-token prompt, 200 tokens generated:
 
@@ -292,7 +304,8 @@ Roughly ordered by leverage:
    large enough (i.e. bigger models); the open questions are whether ANE
    placement survives the state ops.
 5. The rest: an OpenAI-compatible API (`/v1/chat/completions`) and SSE
-   streaming in serve mode; `simdgroup_matrix` MMA on Metal; a hybrid
+   streaming in serve mode; `simdgroup_matrix` MMA on Metal; flash-style
+   attention for the *prefill* path (its weighted-V loop is still serial per
+   thread, which is what caps very-long-prompt Metal prefill); a hybrid
    scheduler that picks the backend automatically; CUDA/Vulkan backends on
-   the same Engine/Session seam; enumerated-shape ANE graphs (demoted — the
-   fixed-512 padding costs only ~0.05 s per prompt).
+   the same Engine/Session seam.

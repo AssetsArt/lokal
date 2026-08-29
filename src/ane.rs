@@ -124,13 +124,13 @@ fn fetch_f32(out: &ProtocolObject<dyn MLFeatureProvider>, name: &str) -> crate::
 
 pub struct AneEngine {
     metal: MetalEngine,
-    coreml: CoreMlPrefill,
+    graphs: Vec<CoreMlPrefill>, // sorted by seq, ascending — one fixed shape each
 }
 
 impl AneEngine {
     pub fn new(model: Model, model_dir: &Path) -> crate::Result<Self> {
-        // Look for prefill-<seq>.mlmodelc next to the model (seq is encoded in the name).
-        let mut found = None;
+        // Collect every prefill-<seq>.mlmodelc next to the model (seq is in the name).
+        let mut found = Vec::new();
         for entry in std::fs::read_dir(model_dir)? {
             let name = entry?.file_name().to_string_lossy().into_owned();
             if let Some(seq) = name
@@ -138,23 +138,26 @@ impl AneEngine {
                 .and_then(|s| s.strip_suffix(".mlmodelc"))
                 .and_then(|s| s.parse::<usize>().ok())
             {
-                found = Some((model_dir.join(&name), seq));
+                found.push((model_dir.join(&name), seq));
             }
         }
-        let (path, seq) = found.ok_or_else(|| {
-            format!(
-                "the ane backend needs a prefill-<seq>.mlmodelc in the model directory — build it once with:\n  \
+        if found.is_empty() {
+            return Err(format!(
+                "the ane backend needs prefill-<seq>.mlmodelc graphs in the model directory — build them once with:\n  \
                  uv run --python 3.12 --with torch --with coremltools --with safetensors --with numpy \\\n    \
-                 tools/export_prefill.py {} --seq 512",
+                 tools/export_prefill.py {} --shapes 512,2048",
                 model_dir.display()
             )
-        })?;
-        let coreml = CoreMlPrefill::load(&path, seq)?;
-        eprintln!(
-            "ANE: loaded {} (prefill up to {seq} tokens via Core ML, compute = CPU+ANE)",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        );
-        Ok(Self { metal: MetalEngine::new(model)?, coreml })
+            .into());
+        }
+        found.sort_by_key(|&(_, seq)| seq);
+        let graphs = found
+            .iter()
+            .map(|(path, seq)| CoreMlPrefill::load(path, *seq))
+            .collect::<crate::Result<Vec<_>>>()?;
+        let shapes: Vec<usize> = graphs.iter().map(|g| g.seq).collect();
+        eprintln!("ANE: loaded prefill graphs {shapes:?} (Core ML, compute = CPU+ANE)");
+        Ok(Self { metal: MetalEngine::new(model)?, graphs })
     }
 }
 
@@ -170,16 +173,35 @@ impl Engine for AneEngine {
             n_layers: self.config().num_hidden_layers,
             kvd: self.config().kv_dim(),
             metal: self.metal.raw_session(max_seq),
-            coreml: &self.coreml,
+            graphs: &self.graphs,
         }))
     }
 }
 
+/// Below this many prompt tokens the GPU prefills faster than even the smallest
+/// padded ANE graph (~46 ms for S=512 vs ~1 ms per token on Metal).
+const ANE_MIN: usize = 64;
+
 struct AneSession<'a> {
     metal: MetalSession<'a>,
-    coreml: &'a CoreMlPrefill,
+    graphs: &'a [CoreMlPrefill], // sorted by seq, ascending
     n_layers: usize,
     kvd: usize,
+}
+
+/// Pick the graph for a `want`-token prompt. Prefer the smallest graph that fits,
+/// but only "upgrade" to a bigger graph when the prompt fills at least half of it —
+/// ANE time grows superlinearly with S (attention is S²), so below half-full it is
+/// cheaper to fill a smaller graph completely and let Metal take the overflow.
+fn pick_graph(graphs: &[CoreMlPrefill], want: usize) -> &CoreMlPrefill {
+    let fits = graphs.iter().find(|g| g.seq >= want);
+    let under = graphs.iter().rev().find(|g| g.seq <= want);
+    match (fits, under) {
+        (Some(f), Some(u)) if f.seq != u.seq && want * 2 < f.seq => u,
+        (Some(f), _) => f,
+        (None, Some(u)) => u, // longer than the largest graph — Metal takes the rest
+        (None, None) => unreachable!("AneEngine::new guarantees at least one graph"),
+    }
 }
 
 impl Session for AneSession<'_> {
@@ -187,23 +209,30 @@ impl Session for AneSession<'_> {
         self.metal.forward(token, pos) // decoding stays entirely on Metal
     }
 
-    /// Division of labor: the ANE takes the prompt's head (up to seq tokens), Metal
-    /// takes any overflow — and always the final token, because we need the last
-    /// position's logits and the ANE graph deliberately omits lm_head (one Metal
-    /// step is cheaper than shipping a vocab-sized matmul through Core ML).
+    /// Division of labor: the ANE takes the prompt's head (up to the chosen graph's
+    /// seq), Metal takes any overflow — and always the final token, because we need
+    /// the last position's logits and the ANE graphs deliberately omit lm_head (one
+    /// Metal step is cheaper than shipping a vocab-sized matmul through Core ML).
     fn prefill(&mut self, ids: &[u32]) -> crate::Result<Vec<f32>> {
-        let ane_n = ids.len().saturating_sub(1).min(self.coreml.seq);
-        if ane_n > 0 {
+        let want = ids.len().saturating_sub(1);
+        let mut ane_n = 0;
+        if want >= ANE_MIN {
+            let g = pick_graph(self.graphs, want);
+            ane_n = want.min(g.seq);
             let t = Instant::now();
-            let (k, v) = self.coreml.predict(&ids[..ane_n])?;
+            let (k, v) = g.predict(&ids[..ane_n])?;
             // Move K,V into Metal's cache — keep only the ane_n real rows, drop the padding.
-            let per_layer = self.coreml.seq * self.kvd;
+            let per_layer = g.seq * self.kvd;
             let used = ane_n * self.kvd;
             for layer in 0..self.n_layers {
                 let off = layer * per_layer;
                 self.metal.write_kv(layer, 0, &k[off..off + used], &v[off..off + used]);
             }
-            eprintln!("  ANE prefill: {ane_n} tokens in {:.2}s", t.elapsed().as_secs_f64());
+            eprintln!(
+                "  ANE prefill: {ane_n} tokens (S={} graph) in {:.2}s",
+                g.seq,
+                t.elapsed().as_secs_f64()
+            );
         }
         self.metal.prefill_from(&ids[ane_n..], ane_n)
     }

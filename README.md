@@ -94,9 +94,15 @@ how fast it says it.
 ### ANE setup (optional, once per model)
 
 ```bash
-./run.sh export-ane        # builds prefill-512.mlmodelc next to the cached model
+./run.sh export-ane        # builds prefill graphs (512 and 2048 tokens) next to the cached model
 ./run.sh ane "Once upon a time"
 ```
+
+lokal picks the graph that fits the prompt: tiny prompts (< 64 tokens) skip
+the ANE — the GPU is faster there — and prompts longer than the largest
+graph overflow to Metal seamlessly. The long graph is what makes long
+prompts fast: a 1,223-token prompt prefills in 0.55 s vs 2.38 s on Metal
+alone.
 
 The export step needs [uv](https://docs.astral.sh/uv/) and runs offline.
 Placement is verified, not assumed: inspecting the compiled graph with the
@@ -157,9 +163,9 @@ adding new backends live in [DESIGN.md](DESIGN.md).
 - [ ] Continuous batching — one weight read serves every active request
 - [ ] `simdgroup_matrix` (MMA) matmul on Metal
 - [ ] CUDA (NVIDIA) and Vulkan (AMD/portable) backends
+- [x] Multi-size ANE prefill graphs (512/2048) with automatic routing per prompt length
 - [ ] ANE decode via Core ML stateful models (MLState)
 - [ ] Hybrid scheduler — route each phase to the best device automatically, no `--backend` flag needed
-- [ ] Enumerated-shape ANE graphs so short prompts skip the 512 padding
 - [ ] Repetition penalty and top-k sampling
 
 ## License
