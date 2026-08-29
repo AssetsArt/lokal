@@ -36,6 +36,7 @@ struct Args {
     serve: bool,
     path_only: bool,
     port: u16,
+    max_concurrent: usize,
     opt: GenOptions,
 }
 
@@ -56,6 +57,7 @@ Options:
       --seed <N>           RNG seed for reproducible sampling
       --chat               wrap the prompt in a chat template (use with -Instruct models)
       --port <N>           port for serve mode [8080]
+      --max-concurrent <N> serve mode: requests generating at once, the rest queue [4]
   -h, --help               show this help";
 
 impl Args {
@@ -66,6 +68,7 @@ impl Args {
             serve: false,
             path_only: false,
             port: 8080,
+            max_concurrent: 4,
             opt: GenOptions { prompt: "Once upon a time".into(), ..Default::default() },
         };
         let mut it = std::env::args().skip(1);
@@ -83,6 +86,7 @@ impl Args {
                 "--seed" => a.opt.seed = Some(val()?.parse()?),
                 "--chat" => a.opt.chat = true,
                 "--port" => a.port = val()?.parse()?,
+                "--max-concurrent" => a.max_concurrent = val()?.parse()?,
                 "-h" | "--help" => {
                     println!("{USAGE}");
                     std::process::exit(0);
@@ -133,7 +137,12 @@ fn run() -> Result<()> {
     eprintln!("backend: {}", engine.name());
 
     if args.serve {
-        return server::serve(Arc::from(engine), Arc::new(tokenizer), args.port);
+        return server::serve(
+            Arc::from(engine),
+            Arc::new(tokenizer),
+            args.port,
+            args.max_concurrent,
+        );
     }
 
     // CLI mode: echo the prompt, then stream generated text after it.

@@ -171,17 +171,111 @@ values and run offline.
 
 | workload | cpu | metal | ane hybrid |
 |---|---|---|---|
-| decode | ~49 tok/s | ~160–190 tok/s | = metal |
+| decode (short context) | ~49 tok/s | ~160–190 tok/s | = metal |
 | prefill, 669-token prompt | ~33 tok/s | ~740 tok/s | ~1,780 tok/s |
 | ANE-only portion (512 tokens) | — | — | ~0.07 s |
 
+End to end — 669-token prompt, 200 tokens generated:
+
+| backend | TTFT | decode | total |
+|---|---|---|---|
+| cpu | 18.4 s | ~27 tok/s | ~26 s |
+| metal | 0.90 s | ~62 tok/s | ~4.2 s |
+| ane+metal | 0.37 s | ~62 tok/s | ~3.6 s |
+
+Two readings worth taking away. First, the hybrid's decode speed is exactly
+Metal's — the ANE changes time-to-first-token only, and at chat latencies
+0.90 s → 0.37 s is very perceptible. Second, decode slows as context grows
+(~190 tok/s near-empty vs ~62 tok/s at ~870 positions) because attention's
+cost is linear in cached positions.
+
+## Where the time goes
+
+"matvec dominates" is a statement about the CPU backend, not about the system.
+Each device has its own cost structure:
+
+- **cpu** — matvec is 90%+ of everything; one token is one full pass over the
+  weights through the memory hierarchy.
+- **metal** — the same arithmetic becomes ~450 dispatches encoded into one
+  command buffer per step. The decode floor is streaming the f16 weights; the
+  fixed costs are command encoding and the single sync per step; attention
+  grows linearly with context (the 190 → 62 tok/s slide above); and prefill
+  moves the cost into the tiled matmul, where *reuse* — not raw FLOPs — is the
+  lever that matters.
+- **ane** — execution is a black box scheduled by Core ML. What stays visible
+  from outside is the fixed-shape graph execution (~70 ms for 512 positions)
+  and the Core ML ↔ Metal handoff (one K/V memcpy per prefill).
+
+The consequence: the open optimization frontier is no longer the matmul — it
+is decode state management and scheduling work across devices.
+
+## Serve-mode concurrency
+
+Because an Engine is immutable and every Session owns its own state,
+concurrent requests need no locks — and on the hybrid backend they overlap
+across *devices*: while the GPU decodes one request, the Neural Engine
+prefills the next. Nothing schedules this explicitly; requests live on
+separate blocking threads, and both MLModel prediction and Metal command
+submission are documented thread-safe. Measured (M1 Pro, SmolLM2-135M,
+451-token prompts, 100 tokens generated, 4 concurrent requests):
+
+| | metal | ane hybrid |
+|---|---|---|
+| prefill + wait, per request | ~1.9 s | ~0.1–0.2 s |
+| ANE prefill time under load | — | 0.05–0.18 s (≈ idle) |
+| aggregate throughput | 77 gen-tok/s | 124 gen-tok/s |
+
+Aggregate decode saturates at ~4 concurrent generations (~124 gen-tok/s);
+past that, extra concurrency only splits the same tokens/sec across more
+requests and holds more KV caches in RAM. So serve admits `--max-concurrent`
+requests (default 4) into generation and queues the rest FIFO (a tokio
+semaphore): at 16 concurrent requests, admitted ones still decode at
+~32 tok/s each instead of ~8. Raising the ceiling itself needs continuous
+batching (Future work).
+
+### Why not split tensors across ANE + GPU?
+
+The measured reason finer-grained parallelism (Megatron-style tensor split)
+does not pay on this hardware:
+
+- Core ML cannot exchange tensors mid-graph, so the finest possible split
+  unit is one whole-graph invocation. Measured round-trips: 0.07 ms floor,
+  0.65 ms for one MLP layer at S=512. A tensor split needs two joins per
+  layer — ~60 invocations per step, ~39 ms per 512-token prefill chunk,
+  more than the 15–23 ms a perfect ANE/GPU split could save (the ANE alone
+  already prefills 512 tokens in 50–80 ms, in a single invocation).
+- Decode gains nothing at any overhead: it is bandwidth-bound, and both
+  devices draw from the same unified-memory bandwidth. Splitting the weights
+  adds FLOPs, not bytes/s.
+
+The general rule on Apple Silicon: parallelism pays at coarse granularity —
+per request, per phase (prefill/decode) — and loses at fine granularity,
+where every ANE↔GPU boundary costs a graph invocation.
+
 ## Future work
 
-Quantization (int8/int4) is the highest-leverage next step — it shrinks the
-bandwidth bill that dominates decode. On Metal, `simdgroup_matrix` MMA would
-lift the matmul toward MLX-class throughput. On the ANE, enumerated shapes
-would remove the fixed-512 padding cost, and Core ML stateful models (MLState)
-are the speculative path to ANE decoding. Server mode wants an
-OpenAI-compatible API (`/v1/chat/completions`), SSE streaming, and continuous
-batching. CUDA/Vulkan backends can reuse the Engine/Session seam and the Metal
-backend's invariants as a template.
+Roughly ordered by leverage:
+
+1. **Faster long-context decode** — Metal decode slides ~190 → ~62 tok/s as
+   context grows. During decode the attention kernel parallelizes only
+   across heads (9 threadgroups on SmolLM2-135M — most of the GPU idles).
+   Split cached positions across threadgroups and reduce (flash-decoding
+   style), and store the KV cache as f16 to halve its bandwidth.
+2. **Quantization (int8/int4)** — shrinks the bandwidth bill that sets the
+   decode floor on every device, and admits 1B–8B models on modest RAM.
+   Needs its own quality methodology: quantized greedy output no longer
+   matches the f32 reference token-for-token.
+3. **Continuous batching in serve mode** — the only way past the ~124
+   gen-tok/s aggregate ceiling: batch concurrent decode steps into one
+   matmul so a single read of the weights serves every active request. The
+   kernels already take `n_rows`, and the admission queue already exists.
+4. **ANE decode via Core ML stateful models (MLState)** — keep the KV cache
+   inside the Core ML graph across invocations. The measured ~0.65 ms
+   invocation cost says the overhead is tolerable once per-step compute is
+   large enough (i.e. bigger models); the open questions are whether ANE
+   placement survives the state ops.
+5. The rest: an OpenAI-compatible API (`/v1/chat/completions`) and SSE
+   streaming in serve mode; `simdgroup_matrix` MMA on Metal; a hybrid
+   scheduler that picks the backend automatically; CUDA/Vulkan backends on
+   the same Engine/Session seam; enumerated-shape ANE graphs (demoted — the
+   fixed-512 padding costs only ~0.05 s per prompt).

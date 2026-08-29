@@ -18,21 +18,34 @@ use hyper_util::rt::TokioIo;
 use serde_json::json;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
+use tokio::sync::Semaphore;
 
-pub fn serve(engine: Arc<dyn Engine>, tokenizer: Arc<Tokenizer>, port: u16) -> crate::Result<()> {
+pub fn serve(
+    engine: Arc<dyn Engine>,
+    tokenizer: Arc<Tokenizer>,
+    port: u16,
+    max_concurrent: usize,
+) -> crate::Result<()> {
     // main() is plain sync code — build the tokio runtime here at the async boundary.
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-        eprintln!("listening on http://127.0.0.1:{port} — try:");
+        // Admission control: the GPU's aggregate decode throughput saturates at a few
+        // concurrent generations (measured ~4 on an M1 Pro) — beyond that, extra
+        // concurrency only splits the same tokens/sec across more requests and holds
+        // more KV caches in RAM. The semaphore is a FIFO queue: max_concurrent
+        // requests generate, the rest wait their turn.
+        let sem = Arc::new(Semaphore::new(max_concurrent.max(1)));
+        eprintln!("listening on http://127.0.0.1:{port} ({max_concurrent} concurrent, rest queue) — try:");
         eprintln!("  curl http://127.0.0.1:{port}/generate -d '{{\"prompt\": \"Once upon a time\"}}'");
         loop {
             let (stream, _) = listener.accept().await?;
-            let (engine, tokenizer) = (engine.clone(), tokenizer.clone());
+            let (engine, tokenizer, sem) = (engine.clone(), tokenizer.clone(), sem.clone());
             // One connection = one task, so a slow connection never blocks the others.
             tokio::spawn(async move {
-                let service =
-                    service_fn(move |req| handle(req, engine.clone(), tokenizer.clone()));
+                let service = service_fn(move |req| {
+                    handle(req, engine.clone(), tokenizer.clone(), sem.clone())
+                });
                 let conn = http1::Builder::new().serve_connection(TokioIo::new(stream), service);
                 if let Err(e) = conn.await {
                     eprintln!("connection error: {e}");
@@ -46,6 +59,7 @@ async fn handle(
     req: Request<Incoming>,
     engine: Arc<dyn Engine>,
     tokenizer: Arc<Tokenizer>,
+    sem: Arc<Semaphore>,
 ) -> std::result::Result<Response<Full<Bytes>>, hyper::Error> {
     if (req.method(), req.uri().path()) != (&Method::POST, "/generate") {
         return Ok(reply(
@@ -62,10 +76,16 @@ async fn handle(
         }
     };
 
+    // Wait for a generation slot (FIFO). The permit moves into the blocking task so
+    // the slot frees exactly when generation finishes.
+    let permit = sem.acquire_owned().await.expect("semaphore is never closed");
+
     // Heavy compute must leave the async threads, or it stalls tokio's event loop.
-    let result =
-        tokio::task::spawn_blocking(move || generate(engine.as_ref(), &tokenizer, &opt, |_| {}))
-            .await;
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        generate(engine.as_ref(), &tokenizer, &opt, |_| {})
+    })
+    .await;
 
     Ok(match result {
         Ok(Ok(out)) => reply(

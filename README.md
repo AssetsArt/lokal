@@ -47,6 +47,26 @@ backend pushes prompt processing onto the Neural Engine, which is faster
 still, draws far less power, and leaves the GPU free to decode for other
 requests in serve mode.
 
+What that means end to end (669-token prompt, 200 tokens generated):
+
+| backend | first token after | decode | total |
+|---|---|---|---|
+| cpu | 18.4 s | ~27 tok/s | ~26 s |
+| metal | 0.90 s | ~62 tok/s | ~4.2 s |
+| ane | **0.37 s** | ~62 tok/s | ~3.6 s |
+
+The `ane` backend doesn't change decode speed — it cuts time-to-first-token,
+which is the number you actually feel in a chat.
+
+Serving is where the hybrid pays off most: requests share no mutable state,
+so they overlap across devices with no locks — the Neural Engine prefills
+one request while the GPU decodes the others:
+
+| 4 concurrent requests (451-token prompts) | metal | ane (hybrid) |
+|---|---|---|
+| prefill + wait, per request | ~1.9 s | **~0.1 s** |
+| aggregate throughput | 77 tok/s | **124 tok/s** |
+
 ## Supported models
 
 Any Llama-architecture checkpoint with safetensors weights should work; these
@@ -88,8 +108,10 @@ curl http://127.0.0.1:8080/generate -d '{"prompt": "Once upon a time", "max_toke
 ```
 
 Single endpoint, JSON in and out: `prompt` (required), `max_tokens`,
-`temperature`, `top_p`, `seed`, `chat`. Requests run concurrently; the reply
-includes token counts and tokens/sec.
+`temperature`, `top_p`, `seed`, `chat`. The reply includes token counts and
+tokens/sec. Up to `--max-concurrent` requests (default 4 — where an M1 Pro's
+aggregate throughput saturates) generate at once; the rest queue FIFO, so
+per-request speed stays flat under burst load.
 
 ## CLI reference
 
@@ -107,6 +129,7 @@ lokal path [-m <model>]   download if needed, then print the model's local direc
     --seed <N>           reproducible sampling
     --chat               ChatML template for -Instruct models
     --port <N>           serve-mode port                        [8080]
+    --max-concurrent <N> serve mode: parallel generations       [4]
 ```
 
 ## Development
@@ -123,11 +146,15 @@ adding new backends live in [DESIGN.md](DESIGN.md).
 
 ## Roadmap
 
+- [ ] Faster long-context decode — split-position attention + f16 KV cache on Metal
 - [ ] OpenAI-compatible API in serve mode (`/v1/chat/completions`, works with existing clients)
 - [ ] Streaming responses (SSE)
 - [ ] Quantized weights (int8/int4) for larger models on modest RAM
+- [ ] Continuous batching — one weight read serves every active request
 - [ ] `simdgroup_matrix` (MMA) matmul on Metal
 - [ ] CUDA (NVIDIA) and Vulkan (AMD/portable) backends
+- [ ] ANE decode via Core ML stateful models (MLState)
+- [ ] Hybrid scheduler — route each phase to the best device automatically, no `--backend` flag needed
 - [ ] Enumerated-shape ANE graphs so short prompts skip the 512 padding
 - [ ] Repetition penalty and top-k sampling
 

@@ -23,7 +23,7 @@ tokenizers = "0.23"     # Hugging Face BPE tokenizer
 http-body-util = "0.1"  # body helpers for hyper
 hyper = { version = "1.11", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }   # hyper <-> tokio glue
-tokio = { version = "1.53", features = ["rt-multi-thread", "net"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "net", "sync"] }
 
 # GPU / ANE backends (compiled only where the hardware exists; see src/gpu/, src/ane.rs)
 [target.'cfg(target_os = "macos")'.dependencies]
