@@ -87,9 +87,11 @@ Architectures: `LlamaForCausalLM`, `Qwen2ForCausalLM`, `MistralForCausalLM`.
 
 ## Backends
 
-Pick with `-b cpu | metal | ane`. All three are verified to produce identical
-greedy output, so switching backends never changes what the model says — only
-how fast it says it.
+Pick with `-b cpu | metal | ane`. cpu and metal are verified to produce
+identical greedy output. The ane backend is an fp16 path held to a measured
+numeric envelope; on long prompts it may resolve a greedy near-tie into a
+different (equally sensible) token than the f32 backends — see DESIGN.md for
+the exact gate.
 
 ### ANE setup (optional, once per model)
 
@@ -152,8 +154,10 @@ cargo test
 
 The main correctness gate is deterministic cross-backend comparison: with
 `--temperature 0`, the same prompt must produce token-identical output on
-cpu, metal, and ane. Architecture notes, backend internals, and the guide for
-adding new backends live in [DESIGN.md](DESIGN.md).
+cpu and metal; the fp16 ane backend is held to a numeric envelope vs the f32
+reference (position-flat, no NaN) and may differ at greedy near-ties on long
+prompts. Architecture notes, backend internals, and the guide for adding new
+backends live in [DESIGN.md](DESIGN.md).
 
 ## Roadmap
 

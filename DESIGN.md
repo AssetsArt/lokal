@@ -199,12 +199,22 @@ one-time Python export step and keeps the runtime pure Rust + Core ML.
 
 The correctness instrument is the **golden greedy test**: at `--temperature 0`
 the system is fully deterministic, and the three backends are independent
-implementations of the same contract. Running the same prompt on cpu, metal,
-and ane must produce token-identical output — in practice it does, including
-across prefill chunk boundaries and Qwen2's bias path. Divergence caused by
-fp16 rounding at a near-tie in the logits is theoretically possible; divergence
-into gibberish is a bug, and the fragility of a 30-layer transformer makes
-gibberish loud.
+implementations of the same contract. cpu and metal both accumulate in f32
+and must produce token-identical output — any flip between them is a bug,
+full stop. The ane backend is an fp16 path end to end, and measurement
+(2026-08-29) showed its token-identity with the f32 backends is
+*prompt-dependent*: the more of a prompt runs through the ANE, the more
+chances a greedy near-tie resolves differently (observed once ~5,700 words
+into an 8k continuation — both branches plausible text; the same flip class
+exists at 2k with the plain graph on some prompts). The ane gate is therefore
+numeric, built from the signatures that separate rounding from bugs:
+per-graph max |Δ| vs the torch f32 reference within the shipped envelope and
+**flat across positions** (error growing with position is the bug signature —
+exactly how the in-graph fp16 position bug presented), zero NaN, and NE-class
+placement. A greedy flip that coexists with a passing envelope is a near-tie
+by construction — a large-gap flip would require an envelope violation.
+Divergence into gibberish is a bug, and the fragility of a 30-layer
+transformer makes gibberish loud.
 
 Unit tests cover the leaf math (`math.rs`, `sampler.rs`) with hand-checkable
 values and run offline.
@@ -391,17 +401,16 @@ Roughly ordered by leverage:
    the metal backend (the ANE hybrid hides this on another device).
    Interleaving PREFILL_CHUNK-sized pieces with decode steps caps the stall
    at one chunk.
-4. **Wider ANE windows.** The windowed graph caps at 6,144 positions — a
-   limit chosen while the failures were still misattributed (the real bug
-   was in-graph fp16 positions, fixed by feeding cos/sin as inputs). The
-   true ceiling with the fixed graph is unmeasured: probe P=7168 and beyond,
-   and raise the cap toward the model's context length if it stays clean.
-   For prompts past whatever the ANE covers, a flash-attention-style Metal
-   prefill kernel (f32 accumulation, no fp16 cliffs) is the complementary
-   lever.
+4. **Flash-style Metal prefill kernel.** The windowed ANE graph now covers
+   8,192 positions (probed 2026-08-29: the fp16 numeric envelope holds at
+   that width — the old 6,144 cap was the misdiagnosed position bug — while
+   first-load ANECompilerService cost scales superlinearly, 99 s @6,144 →
+   250 s @8,192 → 21+ min @16,384, making wider windows a per-machine
+   product liability rather than a numeric question). Everything past the
+   window still prefills through the scores-scratch Metal path with a
+   serial weighted-V loop — for 10k+ prompts that tail is the dominant
+   cost, and a flash-attention-style kernel (f32 accumulation, online
+   softmax, no scores scratch) is the next big prefill lever.
 5. The rest: an OpenAI-compatible API (`/v1/chat/completions`) and SSE
-   streaming in serve mode; flash-style attention for the *prefill* path
-   (its weighted-V loop is still serial per thread, and it is now the
-   dominant prefill cost — the matmuls run on simdgroup matrix hardware);
-   a hybrid scheduler that picks the backend automatically; CUDA/Vulkan
-   backends on the same Engine/Session seam.
+   streaming in serve mode; a hybrid scheduler that picks the backend
+   automatically; CUDA/Vulkan backends on the same Engine/Session seam.
