@@ -160,7 +160,7 @@ adding new backends live in [DESIGN.md](DESIGN.md).
 - [x] Speculative decoding (`--draft`) — exact greedy verification, adaptive block size
 - [ ] f16 model loading — halve load RAM so 3B+ targets fit (what makes `--draft` pay off)
 - [ ] Lossless speculative sampling (temperature > 0)
-- [ ] f16 KV cache — halve the attention bandwidth bill at long context
+- [x] f16 KV cache — half the memory per session, flatter long-context decode
 - [ ] OpenAI-compatible API in serve mode (`/v1/chat/completions`, works with existing clients)
 - [ ] Streaming responses (SSE)
 - [ ] Quantized weights (int8/int4) for larger models on modest RAM

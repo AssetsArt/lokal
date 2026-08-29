@@ -103,11 +103,12 @@ invariants worth keeping are in `src/gpu/mod.rs`.
 `gpu/metal.rs` + `gpu/kernels.metal`. Four decisions carry all of its
 performance:
 
-1. **Weights are f16 and resident.** Decode is memory-bandwidth-bound: every
-   generated token must stream every weight byte once. Halving the bytes
-   roughly doubles decode speed; uploading once at engine creation makes the
-   per-token traffic weights-only. Activations and the KV cache stay f32, and
-   all accumulation is f32.
+1. **Weights and the KV cache are f16 and resident.** Decode is
+   memory-bandwidth-bound: every generated token must stream every weight
+   byte once. Halving the bytes roughly doubles decode speed; uploading once
+   at engine creation makes the per-token traffic weights-only. The KV cache
+   is f16 too — half the memory per session and half the attention bandwidth
+   at long context. Activations stay f32, and all accumulation is f32.
 2. **One command buffer per step.** A CPU↔GPU sync costs ~100 µs; a forward
    pass is ~450 dispatches. All of them are encoded into a single serial
    command buffer, submitted once, waited on once. Token ids go in, logits come
@@ -177,8 +178,9 @@ one-time Python export step and keeps the runtime pure Rust + Core ML.
 ## Numerics and correctness
 
 - Reference path: f32 everywhere.
-- Metal: f16 weights, f32 activations/accumulation.
-- ANE: fp16 graph end to end (Core ML converts), K/V returned as f32.
+- Metal: f16 weights and KV cache, f32 activations/accumulation.
+- ANE: fp16 graph end to end (Core ML converts), K/V converted to the f16
+  cache during the handoff.
 
 The correctness instrument is the **golden greedy test**: at `--temperature 0`
 the system is fully deterministic, and the three backends are independent
@@ -312,11 +314,11 @@ where every ANE↔GPU boundary costs a graph invocation.
 
 Roughly ordered by leverage:
 
-1. **f16 KV cache** — the last piece of the decode-speed work (the
-   flash-decoding attention, fused decode kernels, and vectorized loads
-   landed already — ~76 → ~237 tok/s at ~500 positions). Halving the KV
-   bytes flattens the remaining per-position cost; it touches both attention
-   paths, the RoPE cache writes, and the ANE handoff.
+1. **f16 model loading** — weights currently expand to f32 in RAM during
+   loading, so a 3B checkpoint needs ~12 GB before the GPU copy exists.
+   Loading bf16 → f16 directly (for the GPU backends) halves that and admits
+   3B+ targets on 16 GB — which is also what makes speculative decoding pay
+   off (see the Speculative decoding section).
 2. **Quantization (int8/int4)** — shrinks the bandwidth bill that sets the
    decode floor on every device, and admits 1B–8B models on modest RAM.
    Needs its own quality methodology: quantized greedy output no longer

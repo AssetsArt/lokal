@@ -101,9 +101,12 @@ struct Pipelines {
     matvec_acc: ComputePipelineState,
     matvec_swiglu: ComputePipelineState,
     matvec_qkv: ComputePipelineState,
+    matvec_h: ComputePipelineState,
     matmul: ComputePipelineState,
+    matmul_h: ComputePipelineState,
     rmsnorm: ComputePipelineState,
     rope: ComputePipelineState,
+    rope_h: ComputePipelineState,
     rope_qk_decode: ComputePipelineState,
     attention: ComputePipelineState,
     attention_decode_partial: ComputePipelineState,
@@ -174,6 +177,11 @@ fn f32_buffer(device: &Device, len: usize) -> Buffer {
     device.new_buffer((len * 4) as u64, MTLResourceOptions::StorageModeShared)
 }
 
+/// Uninitialized f16 buffer — the KV cache's dtype.
+fn f16_empty_buffer(device: &Device, len: usize) -> Buffer {
+    device.new_buffer((len * 2) as u64, MTLResourceOptions::StorageModeShared)
+}
+
 impl MetalEngine {
     /// Takes a loaded CPU-side Model and moves it onto the GPU (the Model is dropped after).
     pub fn new(model: Model) -> crate::Result<Self> {
@@ -196,9 +204,12 @@ impl MetalEngine {
             matvec_acc: pipe("matvec_acc")?,
             matvec_swiglu: pipe("matvec_swiglu")?,
             matvec_qkv: pipe("matvec_qkv")?,
+            matvec_h: pipe("matvec_h")?,
             matmul: pipe("matmul")?,
+            matmul_h: pipe("matmul_h")?,
             rmsnorm: pipe("rmsnorm")?,
             rope: pipe("rope")?,
+            rope_h: pipe("rope_h")?,
             rope_qk_decode: pipe("rope_qk_decode")?,
             attention: pipe("attention")?,
             attention_decode_partial: pipe("attention_decode_partial")?,
@@ -282,9 +293,39 @@ impl MetalEngine {
         y_off: u64,
         n_rows: usize,
     ) {
+        self.enc_linear_with(&self.pipes.matvec, &self.pipes.matmul, enc, l, x, x_off, y, y_off, n_rows);
+    }
+
+    /// enc_linear writing f16 — the k/v projections, whose output IS the KV cache.
+    #[allow(clippy::too_many_arguments)]
+    fn enc_linear_kv(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        l: &GpuLinear,
+        x: &Buffer,
+        y: &Buffer,
+        y_off: u64,
+        n_rows: usize,
+    ) {
+        self.enc_linear_with(&self.pipes.matvec_h, &self.pipes.matmul_h, enc, l, x, 0, y, y_off, n_rows);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enc_linear_with(
+        &self,
+        matvec: &ComputePipelineState,
+        matmul: &ComputePipelineState,
+        enc: &ComputeCommandEncoderRef,
+        l: &GpuLinear,
+        x: &Buffer,
+        x_off: u64,
+        y: &Buffer,
+        y_off: u64,
+        n_rows: usize,
+    ) {
         if n_rows == 1 {
             let p = MatvecParams { in_dim: l.in_dim, out_dim: l.out_dim };
-            enc.set_compute_pipeline_state(&self.pipes.matvec);
+            enc.set_compute_pipeline_state(matvec);
             enc.set_buffer(0, Some(&l.w), 0);
             enc.set_buffer(1, Some(&l.bias), 0);
             enc.set_buffer(2, Some(x), x_off);
@@ -293,7 +334,7 @@ impl MetalEngine {
             dispatch_simdgroup_rows(enc, l.out_dim);
         } else {
             let p = MatmulParams { in_dim: l.in_dim, out_dim: l.out_dim, n_rows: n_rows as u32 };
-            enc.set_compute_pipeline_state(&self.pipes.matmul);
+            enc.set_compute_pipeline_state(matmul);
             enc.set_buffer(0, Some(&l.w), 0);
             enc.set_buffer(1, Some(&l.bias), 0);
             enc.set_buffer(2, Some(x), x_off);
@@ -336,6 +377,7 @@ impl MetalEngine {
         n_heads: usize,
         pos0: usize,
         n_rows: usize,
+        f16: bool, // true = an f16 buffer (rows in the KV cache), false = f32 (q)
     ) {
         let hd = self.cfg.head_dim();
         let p = RopeParams {
@@ -345,7 +387,7 @@ impl MetalEngine {
             theta: self.cfg.rope_theta,
             n_rows: n_rows as u32,
         };
-        enc.set_compute_pipeline_state(&self.pipes.rope);
+        enc.set_compute_pipeline_state(if f16 { &self.pipes.rope_h } else { &self.pipes.rope });
         enc.set_buffer(0, Some(x), x_off);
         enc.set_bytes(1, size_of::<RopeParams>() as u64, &p as *const _ as *const _);
         dispatch_grid(enc, n_rows * n_heads * hd / 2);
@@ -581,8 +623,8 @@ impl MetalEngine {
                 d,
                 cfg.num_attention_heads * max_seq.div_ceil(ATTN_SPLIT) * (cfg.head_dim() + 2),
             ),
-            k_cache: (0..cfg.num_hidden_layers).map(|_| f32_buffer(d, max_seq * cfg.kv_dim())).collect(),
-            v_cache: (0..cfg.num_hidden_layers).map(|_| f32_buffer(d, max_seq * cfg.kv_dim())).collect(),
+            k_cache: (0..cfg.num_hidden_layers).map(|_| f16_empty_buffer(d, max_seq * cfg.kv_dim())).collect(),
+            v_cache: (0..cfg.num_hidden_layers).map(|_| f16_empty_buffer(d, max_seq * cfg.kv_dim())).collect(),
             max_seq,
             engine: self,
         }
@@ -617,7 +659,7 @@ impl MetalSession<'_> {
         let e = self.engine;
         let cfg = &e.cfg;
         let (h, n) = (cfg.hidden_size, ids.len());
-        let kv_byte_off = (pos0 * cfg.kv_dim() * 4) as u64; // this chunk's first cache slot
+        let kv_byte_off = (pos0 * cfg.kv_dim() * 2) as u64; // this chunk's first (f16) cache slot
 
         // Push the token ids to the GPU (unified memory: write into the buffer pre-commit).
         unsafe { std::ptr::copy_nonoverlapping(ids.as_ptr(), self.ids.contents() as *mut u32, n) };
@@ -649,10 +691,10 @@ impl MetalSession<'_> {
             // Attention half.
             e.enc_rmsnorm(enc, &self.x, &blk.input_layernorm, &self.xn, n);
             e.enc_linear(enc, &blk.q_proj, &self.xn, 0, &self.q, 0, n);
-            e.enc_linear(enc, &blk.k_proj, &self.xn, 0, &self.k_cache[l], kv_byte_off, n);
-            e.enc_linear(enc, &blk.v_proj, &self.xn, 0, &self.v_cache[l], kv_byte_off, n);
-            e.enc_rope(enc, &self.q, 0, cfg.num_attention_heads, pos0, n);
-            e.enc_rope(enc, &self.k_cache[l], kv_byte_off, cfg.num_key_value_heads, pos0, n);
+            e.enc_linear_kv(enc, &blk.k_proj, &self.xn, &self.k_cache[l], kv_byte_off, n);
+            e.enc_linear_kv(enc, &blk.v_proj, &self.xn, &self.v_cache[l], kv_byte_off, n);
+            e.enc_rope(enc, &self.q, 0, cfg.num_attention_heads, pos0, n, false);
+            e.enc_rope(enc, &self.k_cache[l], kv_byte_off, cfg.num_key_value_heads, pos0, n, true);
             e.enc_attention(enc, &self.q, &self.k_cache[l], &self.v_cache[l], &self.scores, &self.att, pos0, n, self.max_seq);
             e.enc_linear(enc, &blk.o_proj, &self.att, 0, &self.xb, 0, n);
             e.enc_elementwise(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
@@ -687,15 +729,20 @@ impl MetalSession<'_> {
         Ok(logits.to_vec())
     }
 
-    /// Write K,V computed elsewhere (e.g. on the ANE) into the cache at pos0 onward.
-    /// With unified memory, "transferring between devices" is just a memcpy.
+    /// Write K,V computed elsewhere (e.g. on the ANE) into the cache at pos0 onward,
+    /// converting to the cache's f16 on the way. With unified memory this is the
+    /// whole "device transfer".
     pub(crate) fn write_kv(&mut self, layer: usize, pos0: usize, k: &[f32], v: &[f32]) {
         let kvd = self.engine.cfg.kv_dim();
         unsafe {
-            let kp = (self.k_cache[layer].contents() as *mut f32).add(pos0 * kvd);
-            std::ptr::copy_nonoverlapping(k.as_ptr(), kp, k.len());
-            let vp = (self.v_cache[layer].contents() as *mut f32).add(pos0 * kvd);
-            std::ptr::copy_nonoverlapping(v.as_ptr(), vp, v.len());
+            let kp = (self.k_cache[layer].contents() as *mut u16).add(pos0 * kvd);
+            for (i, &x) in k.iter().enumerate() {
+                *kp.add(i) = f16::from_f32(x).to_bits();
+            }
+            let vp = (self.v_cache[layer].contents() as *mut u16).add(pos0 * kvd);
+            for (i, &x) in v.iter().enumerate() {
+                *vp.add(i) = f16::from_f32(x).to_bits();
+            }
         }
     }
 

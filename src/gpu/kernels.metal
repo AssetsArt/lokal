@@ -10,8 +10,8 @@
 //   prefill → n_rows = a whole prompt chunk (matrix-matrix — the source of the speedup)
 // One code path serves both modes; only the dispatched grid size differs.
 //
-// Data-type convention: weights are half (f16) to halve memory traffic;
-// activations and the KV cache stay float (f32); accumulation is always float.
+// Data-type convention: weights and the KV cache are half (f16) to halve memory
+// traffic; activations stay float (f32); accumulation is always float.
 //
 // Every params struct must match its #[repr(C)] counterpart in gpu/metal.rs exactly.
 
@@ -156,8 +156,8 @@ kernel void matvec_qkv(
     device const half *b_v [[buffer(5)]],
     device const float *x [[buffer(6)]],
     device float *q [[buffer(7)]],
-    device float *k_cache [[buffer(8)]],
-    device float *v_cache [[buffer(9)]],
+    device half *k_cache [[buffer(8)]],
+    device half *v_cache [[buffer(9)]],
     constant QkvParams &p [[buffer(10)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint sgid [[simdgroup_index_in_threadgroup]],
@@ -170,20 +170,26 @@ kernel void matvec_qkv(
     }
     device const half *w;
     device const half *bias;
-    device float *y;
     uint r;
     if (row < p.q_dim) {
-        w = w_q; bias = b_q; y = q; r = row;
+        w = w_q; bias = b_q; r = row;
     } else if (row < p.q_dim + p.kv_dim) {
         r = row - p.q_dim;
-        w = w_k; bias = b_k; y = k_cache + p.kv_off;
+        w = w_k; bias = b_k;
     } else {
         r = row - p.q_dim - p.kv_dim;
-        w = w_v; bias = b_v; y = v_cache + p.kv_off;
+        w = w_v; bias = b_v;
     }
     float sum = simd_sum(dot_wx(w + (ulong)r * p.in_dim, x, p.in_dim, lane));
     if (lane == 0) {
-        y[r] = sum + (float)bias[r];
+        float val = sum + (float)bias[r];
+        if (row < p.q_dim) {
+            q[r] = val; // activations stay f32
+        } else if (row < p.q_dim + p.kv_dim) {
+            k_cache[p.kv_off + r] = (half)val; // the cache is f16
+        } else {
+            v_cache[p.kv_off + r] = (half)val;
+        }
     }
 }
 
@@ -254,6 +260,79 @@ kernel void matmul(
     uint go = out0 + n;
     if (gr < p.n_rows && go < p.out_dim) {
         y[(ulong)gr * p.out_dim + go] = acc + (float)bias[go];
+    }
+}
+
+// Same tiled matmul, but writing f16 — for prefill's k/v projections, which land
+// directly in the (f16) KV cache.
+kernel void matmul_h(
+    device const half *w [[buffer(0)]],
+    device const half *bias [[buffer(1)]],
+    device const float *x [[buffer(2)]],
+    device half *y [[buffer(3)]],
+    constant MatmulParams &p [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint2 tpos [[thread_position_in_threadgroup]])
+{
+    uint tid = tpos.x;
+    uint m = tid / MM_TN;
+    uint n = tid % MM_TN;
+    uint row0 = tgid.y * MM_TM;
+    uint out0 = tgid.x * MM_TN;
+
+    threadgroup float Xs[MM_TM][MM_TK];
+    threadgroup half Ws[MM_TN][MM_TK];
+
+    float acc = 0.0f;
+    for (uint k0 = 0; k0 < p.in_dim; k0 += MM_TK) {
+        {
+            uint lm = tid / MM_TK;
+            uint lk = tid % MM_TK;
+            uint gr = row0 + lm;
+            uint gk = k0 + lk;
+            Xs[lm][lk] = (gr < p.n_rows && gk < p.in_dim) ? x[(ulong)gr * p.in_dim + gk] : 0.0f;
+        }
+        for (uint i = 0; i < 4; i++) {
+            uint idx = tid + i * 256;
+            uint ln = idx / MM_TK;
+            uint lk = idx % MM_TK;
+            uint go = out0 + ln;
+            uint gk = k0 + lk;
+            Ws[ln][lk] = (go < p.out_dim && gk < p.in_dim) ? w[(ulong)go * p.in_dim + gk] : (half)0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < MM_TK; k++) {
+            acc += Xs[m][k] * (float)Ws[n][k];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint gr = row0 + m;
+    uint go = out0 + n;
+    if (gr < p.n_rows && go < p.out_dim) {
+        y[(ulong)gr * p.out_dim + go] = (half)(acc + (float)bias[go]);
+    }
+}
+
+// matvec writing f16 — the k/v projections on the rare non-fused decode path.
+kernel void matvec_h(
+    device const half *w [[buffer(0)]],
+    device const half *bias [[buffer(1)]],
+    device const float *x [[buffer(2)]],
+    device half *y [[buffer(3)]],
+    constant MatvecParams &p [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint sg_per_tg [[simdgroups_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint row = tgid * sg_per_tg + sgid;
+    if (row >= p.out_dim) {
+        return;
+    }
+    float sum = simd_sum(dot_wx(w + (ulong)row * p.in_dim, x, p.in_dim, lane));
+    if (lane == 0) {
+        y[row] = (half)(sum + (float)bias[row]);
     }
 }
 
@@ -337,6 +416,32 @@ kernel void rope(
     head[i + half_dim] = a * s + b * c;
 }
 
+// Same rotation on an f16 buffer — prefill's freshly written k rows in the KV cache.
+kernel void rope_h(
+    device half *x [[buffer(0)]],
+    constant RopeParams &p [[buffer(1)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint half_dim = p.head_dim / 2;
+    uint per_row = p.n_heads * half_dim;
+    if (gid >= p.n_rows * per_row) {
+        return;
+    }
+    uint row = gid / per_row;
+    uint h = (gid % per_row) / half_dim;
+    uint i = gid % half_dim;
+
+    float freq = pow(p.theta, -2.0f * (float)i / (float)p.head_dim);
+    float angle = (float)(p.pos0 + row) * freq;
+    float c = cos(angle);
+    float s = sin(angle);
+    device half *head = x + (ulong)row * p.n_heads * p.head_dim + h * p.head_dim;
+    float a = head[i];
+    float b = head[i + half_dim];
+    head[i] = (half)(a * c - b * s);
+    head[i + half_dim] = (half)(a * s + b * c);
+}
+
 // Decode-only RoPE: rotate q (n_q_heads) and this position's new k row (n_kv_heads)
 // in a single dispatch — the grid covers the q pairs first, then the k pairs.
 struct RopeQkParams {
@@ -349,7 +454,7 @@ struct RopeQkParams {
 
 kernel void rope_qk_decode(
     device float *q [[buffer(0)]],
-    device float *k [[buffer(1)]], // already offset to this position's cache row
+    device half *k [[buffer(1)]], // already offset to this position's (f16) cache row
     constant RopeQkParams &p [[buffer(2)]],
     uint gid [[thread_position_in_grid]])
 {
@@ -367,11 +472,19 @@ kernel void rope_qk_decode(
     float angle = (float)p.pos * freq;
     float c = cos(angle);
     float s = sin(angle);
-    device float *head = (is_q ? q : k) + h * p.head_dim;
-    float a = head[i];
-    float b = head[i + half_dim];
-    head[i] = a * c - b * s;
-    head[i + half_dim] = a * s + b * c;
+    if (is_q) {
+        device float *head = q + h * p.head_dim;
+        float a = head[i];
+        float b = head[i + half_dim];
+        head[i] = a * c - b * s;
+        head[i + half_dim] = a * s + b * c;
+    } else {
+        device half *head = k + h * p.head_dim;
+        float a = head[i];
+        float b = head[i + half_dim];
+        head[i] = (half)(a * c - b * s);
+        head[i + half_dim] = (half)(a * s + b * c);
+    }
 }
 
 // ---------- attention (model.rs::attention) ----------
@@ -392,8 +505,8 @@ struct AttnParams {
 
 kernel void attention(
     device const float *q [[buffer(0)]],
-    device const float *k_cache [[buffer(1)]],
-    device const float *v_cache [[buffer(2)]],
+    device const half *k_cache [[buffer(1)]],
+    device const half *v_cache [[buffer(2)]],
     device float *scores [[buffer(3)]], // scratch: [n_rows × n_heads × max_seq]
     device float *out [[buffer(4)]],
     constant AttnParams &p [[buffer(5)]],
@@ -416,10 +529,10 @@ kernel void attention(
     // Phase 1: q·k score for every position 0..=q_pos, tracking the max for a stable exp.
     float local_max = -INFINITY;
     for (uint t = tid; t <= q_pos; t += ATTN_TG) {
-        device const float *k_t = k_cache + (ulong)t * kvd + kv_off;
+        device const half *k_t = k_cache + (ulong)t * kvd + kv_off;
         float dot = 0.0f;
         for (uint i = 0; i < hd; i++) {
-            dot += q_head[i] * k_t[i];
+            dot += q_head[i] * (float)k_t[i];
         }
         dot *= scale;
         sc[t] = dot;
@@ -459,7 +572,7 @@ kernel void attention(
     for (uint i = tid; i < hd; i += ATTN_TG) {
         float acc = 0.0f;
         for (uint t = 0; t <= q_pos; t++) {
-            acc += sc[t] * v_cache[(ulong)t * kvd + kv_off + i];
+            acc += sc[t] * (float)v_cache[(ulong)t * kvd + kv_off + i];
         }
         out[(ulong)row * p.n_heads * hd + head * hd + i] = acc / score_sum;
     }
@@ -490,8 +603,8 @@ struct AttnDecParams {
 // V sum relative to this window's own max; the reduce step rescales.
 kernel void attention_decode_partial(
     device const float *q [[buffer(0)]],
-    device const float *k_cache [[buffer(1)]],
-    device const float *v_cache [[buffer(2)]],
+    device const half *k_cache [[buffer(1)]],
+    device const half *v_cache [[buffer(2)]],
     device float *partials [[buffer(3)]],
     constant AttnDecParams &p [[buffer(4)]],
     uint2 tg [[threadgroup_position_in_grid]], // x = head, y = window
@@ -514,12 +627,12 @@ kernel void attention_decode_partial(
     uint t = t0 + tid;
     float score = -INFINITY;
     if (t < t_end) {
-        // float4 loads: head_dim is a multiple of 4 in every supported model.
-        device const float4 *k_t = (device const float4 *)(k_cache + (ulong)t * kvd + kv_off);
+        // Wide loads: head_dim is a multiple of 4 in every supported model.
+        device const half4 *k_t = (device const half4 *)(k_cache + (ulong)t * kvd + kv_off);
         device const float4 *q4 = (device const float4 *)q_head;
         float d = 0.0f;
         for (uint i = 0; i < hd / 4; i++) {
-            d += dot(q4[i], k_t[i]);
+            d += dot(q4[i], float4(k_t[i]));
         }
         score = d * scale;
     }
@@ -555,7 +668,7 @@ kernel void attention_decode_partial(
     float acc = 0.0f;
     if (pl < P) {
         for (uint tt = t0 + pl; tt < t_end; tt += P) {
-            acc += es[tt - t0] * v_cache[(ulong)tt * kvd + kv_off + di];
+            acc += es[tt - t0] * (float)v_cache[(ulong)tt * kvd + kv_off + di];
         }
     }
     red[tid] = acc;
