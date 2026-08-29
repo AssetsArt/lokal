@@ -19,7 +19,7 @@ use crate::model::Model;
 use half::f16;
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState,
-    Device, MTLResourceOptions, MTLSize,
+    Device, FunctionConstantValues, MTLDataType, MTLResourceOptions, MTLSize,
 };
 
 /// Maximum tokens processed together during prefill (one command buffer per chunk).
@@ -158,6 +158,8 @@ struct Pipelines {
 const ATTN_SPLIT: usize = 128;
 /// Threads per decode-attention threadgroup — must match DEC_TG in kernels.metal.
 const DEC_TG: usize = 128;
+/// Max q heads one GQA decode threadgroup covers — must match MAX_GQA_CHUNK in kernels.metal.
+const MAX_GQA_CHUNK: usize = 8;
 /// Max rows the logits buffer holds — the ceiling for one speculative verify batch.
 const SPEC_MAX: usize = 8;
 
@@ -237,6 +239,25 @@ impl MetalEngine {
                 .new_compute_pipeline_state_with_function(&f)
                 .map_err(|e| format!("kernel {name}: {e}").into())
         };
+        // The GQA decode kernels are specialized per model: function constant 0
+        // (GQA_CHUNK) is the q-head group width one threadgroup covers, fixed here
+        // so the per-head loops in the kernel unroll flat.
+        let gqa_chunk = (model.cfg.num_attention_heads / model.cfg.num_key_value_heads)
+            .min(MAX_GQA_CHUNK) as u32;
+        let gqa_pipe = |name: &str| -> crate::Result<ComputePipelineState> {
+            let consts = FunctionConstantValues::new();
+            consts.set_constant_value_at_index(
+                &gqa_chunk as *const u32 as *const _,
+                MTLDataType::UInt,
+                0,
+            );
+            let f = lib
+                .get_function(name, Some(consts))
+                .map_err(|e| format!("kernel {name}: {e}"))?;
+            device
+                .new_compute_pipeline_state_with_function(&f)
+                .map_err(|e| format!("kernel {name}: {e}").into())
+        };
         let pipes = Pipelines {
             embed: pipe("embed")?,
             matvec: pipe("matvec")?,
@@ -251,7 +272,7 @@ impl MetalEngine {
             rope_h: pipe("rope_h")?,
             rope_qk_decode: pipe("rope_qk_decode")?,
             attention: pipe("attention")?,
-            attention_decode_partial: pipe("attention_decode_partial")?,
+            attention_decode_partial: gqa_pipe("attention_decode_partial")?,
             attention_decode_reduce: pipe("attention_decode_reduce")?,
             silu_mul: pipe("silu_mul")?,
             add_inplace: pipe("add_inplace")?,
@@ -259,7 +280,7 @@ impl MetalEngine {
             matvec_acc_batch: pipe("matvec_acc_batch")?,
             matvec_swiglu_batch: pipe("matvec_swiglu_batch")?,
             rope_qk_batch: pipe("rope_qk_batch")?,
-            attention_decode_partial_batch: pipe("attention_decode_partial_batch")?,
+            attention_decode_partial_batch: gqa_pipe("attention_decode_partial_batch")?,
             attention_decode_reduce_batch: pipe("attention_decode_reduce_batch")?,
         };
 
@@ -586,14 +607,18 @@ impl MetalEngine {
             n_splits: n_splits as u32,
         };
         let heads = self.cfg.num_attention_heads as u64;
+        let (grid_x, tg_mem) = self.gqa_decode_dims();
         enc.set_compute_pipeline_state(&self.pipes.attention_decode_partial);
         enc.set_buffer(0, Some(q), 0);
         enc.set_buffer(1, Some(k_cache), cache_off);
         enc.set_buffer(2, Some(v_cache), cache_off);
         enc.set_buffer(3, Some(partials), 0);
         enc.set_bytes(4, size_of::<AttnDecParams>() as u64, &p as *const _ as *const _);
+        for (i, len) in tg_mem.iter().enumerate() {
+            enc.set_threadgroup_memory_length(i as u64, *len);
+        }
         enc.dispatch_thread_groups(
-            MTLSize::new(heads, n_splits as u64, 1),
+            MTLSize::new(grid_x, n_splits as u64, 1),
             MTLSize::new(DEC_TG as u64, 1, 1),
         );
 
@@ -605,6 +630,28 @@ impl MetalEngine {
             MTLSize::new(heads, 1, 1),
             MTLSize::new(self.cfg.head_dim() as u64, 1, 1),
         );
+    }
+
+    /// Grid width and threadgroup memory sizes for the GQA-aware decode partial
+    /// kernels: one threadgroup per (kv head × group chunk, window), covering up to
+    /// MAX_GQA_CHUNK q heads of one kv head's group.
+    fn gqa_decode_dims(&self) -> (u64, [u64; 4]) {
+        let cfg = &self.cfg;
+        let group = cfg.num_attention_heads / cfg.num_key_value_heads;
+        let chunk = group.min(MAX_GQA_CHUNK);
+        let grid_x = (cfg.num_key_value_heads * group.div_ceil(chunk)) as u64;
+        // Sizes must mirror the kernel's q_s / es / acc_red / red layouts, padded to
+        // Metal's 16-byte threadgroup-allocation granularity.
+        let f32s = |n: usize| (n * 4).next_multiple_of(16) as u64;
+        (
+            grid_x,
+            [
+                f32s(chunk * cfg.head_dim()),
+                f32s(chunk * ATTN_SPLIT),
+                f32s(DEC_TG * (chunk | 1)),
+                f32s(chunk * (DEC_TG / 32) + chunk),
+            ],
+        )
     }
 
     fn enc_elementwise(
@@ -665,22 +712,19 @@ impl MetalEngine {
         let v_caches = (0..cfg.num_hidden_layers)
             .map(|_| f16_empty_buffer(d, max_seq * cfg.kv_dim()))
             .collect::<Vec<_>>();
-        self.session_with_cache(max_seq, caches, v_caches, 0)
+        let scratch = self.session_scratch(max_seq);
+        self.session_with_cache(max_seq, caches, v_caches, 0, scratch)
     }
 
-    /// A session whose KV cache lives inside a shared pool (continuous batching):
-    /// the buffers are shared, kv_base points at this session's slot.
-    pub(crate) fn session_with_cache(
-        &self,
-        max_seq: usize,
-        k_cache: Vec<Buffer>,
-        v_cache: Vec<Buffer>,
-        kv_base: u64,
-    ) -> MetalSession<'_> {
+    /// GPU scratch for one session: activations, logits, attention partials, and the
+    /// prefill scores buffer (chunk × heads × max_seq floats — by far the big one).
+    /// Buffers are refcounted, so this can be allocated once and cloned into many
+    /// sessions as long as no two of them run at the same time.
+    fn session_scratch(&self, max_seq: usize) -> SessionScratch {
         let cfg = &self.cfg;
         let d = &self.device;
         let chunk = PREFILL_CHUNK.min(max_seq); // scratch sized per chunk (decode uses row 0 only)
-        MetalSession {
+        SessionScratch {
             ids: d.new_buffer((chunk * 4) as u64, MTLResourceOptions::StorageModeShared),
             x: f32_buffer(d, chunk * cfg.hidden_size),
             xn: f32_buffer(d, chunk * cfg.hidden_size),
@@ -695,6 +739,32 @@ impl MetalEngine {
                 d,
                 cfg.num_attention_heads * max_seq.div_ceil(ATTN_SPLIT) * (cfg.head_dim() + 2),
             ),
+        }
+    }
+
+    /// A session whose KV cache lives inside a shared pool (continuous batching):
+    /// the buffers are shared, kv_base points at this session's slot.
+    pub(crate) fn session_with_cache(
+        &self,
+        max_seq: usize,
+        k_cache: Vec<Buffer>,
+        v_cache: Vec<Buffer>,
+        kv_base: u64,
+        scratch: SessionScratch,
+    ) -> MetalSession<'_> {
+        let SessionScratch { ids, x, xn, q, att, xb, gate, up, logits, scores, partials } = scratch;
+        MetalSession {
+            ids,
+            x,
+            xn,
+            q,
+            att,
+            xb,
+            gate,
+            up,
+            logits,
+            scores,
+            partials,
             k_cache,
             v_cache,
             kv_base,
@@ -702,6 +772,24 @@ impl MetalEngine {
             engine: self,
         }
     }
+}
+
+/// The scratch buffers behind a MetalSession, separated from the KV cache so the
+/// batcher can allocate them ONCE and reuse them for every admitted request —
+/// re-allocating scores alone would cost ~hundreds of MB per admission.
+#[derive(Clone)]
+pub(crate) struct SessionScratch {
+    ids: Buffer,
+    x: Buffer,
+    xn: Buffer,
+    q: Buffer,
+    att: Buffer,
+    xb: Buffer,
+    gate: Buffer,
+    up: Buffer,
+    logits: Buffer,
+    scores: Buffer,
+    partials: Buffer,
 }
 
 /// One generation run's GPU state — the KV cache lives on the GPU and never leaves it.
@@ -863,6 +951,9 @@ pub(crate) struct MetalBatcher<'a> {
     gate: Buffer,
     logits: Buffer,
     partials: Buffer,
+    /// One prefill-session scratch set shared by every slot admission (slot sessions
+    /// are created and dropped one at a time on the scheduler thread).
+    session_scratch: SessionScratch,
 }
 
 // Same justification as MetalEngine: every Metal object here is documented
@@ -901,6 +992,7 @@ impl MetalEngine {
                 d,
                 n_slots * cfg.num_attention_heads * splits_max * (cfg.head_dim() + 2),
             ),
+            session_scratch: self.session_scratch(max_seq),
             splits_max,
             max_seq,
             engine: self,
@@ -919,6 +1011,7 @@ impl MetalBatcher<'_> {
             self.k_cache.clone(),
             self.v_cache.clone(),
             base,
+            self.session_scratch.clone(),
         )
     }
 }
@@ -1008,8 +1101,12 @@ impl crate::engine::Batcher for MetalBatcher<'_> {
             enc.set_buffer(3, Some(&self.partials), 0);
             enc.set_buffer(4, Some(&self.meta), 0);
             enc.set_bytes(5, size_of::<AttnDecBatchParams>() as u64, &p as *const _ as *const _);
+            let (grid_x, tg_mem) = e.gqa_decode_dims();
+            for (i, len) in tg_mem.iter().enumerate() {
+                enc.set_threadgroup_memory_length(i as u64, *len);
+            }
             enc.dispatch_thread_groups(
-                MTLSize::new(cfg.num_attention_heads as u64, splits_now as u64, n as u64),
+                MTLSize::new(grid_x, splits_now as u64, n as u64),
                 MTLSize::new(DEC_TG as u64, 1, 1),
             );
             enc.set_compute_pipeline_state(&e.pipes.attention_decode_reduce_batch);
@@ -1101,5 +1198,38 @@ impl Session for MetalSession<'_> {
         let vocab = self.engine.cfg.vocab_size;
         let flat = self.run(ids, pos0, ids.len())?;
         Ok(flat.chunks(vocab).map(|c| c.to_vec()).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Not a correctness test: measures the host-side f32→f16 loop that write_kv runs
+    /// on every ANE→Metal handoff, at a 6k-token Qwen-shaped handoff (kv_dim 128,
+    /// 24 layers, K+V), without needing ANE graphs or a GPU. Run explicitly:
+    ///   cargo test --release write_kv_conversion -- --ignored --nocapture
+    #[test]
+    #[ignore = "timing evidence, not a pass/fail check"]
+    fn write_kv_conversion_microbench() {
+        let (rows, kvd, layers) = (6144usize, 128usize, 24usize);
+        let src: Vec<f32> = (0..rows * kvd).map(|i| (i % 251) as f32 * 0.01 - 1.0).collect();
+        let mut dst = vec![0u16; rows * kvd];
+        let t = std::time::Instant::now();
+        for _ in 0..layers * 2 {
+            // Mirrors the write_kv loop: scalar conversion through a raw pointer.
+            let dp = std::hint::black_box(dst.as_mut_ptr());
+            for (i, &x) in src.iter().enumerate() {
+                unsafe { *dp.add(i) = f16::from_f32(x).to_bits() };
+            }
+        }
+        std::hint::black_box(&dst);
+        eprintln!(
+            "write_kv-shaped handoff ({} rows × kv_dim {} × {} layers × K+V): {:?} total",
+            rows,
+            kvd,
+            layers,
+            t.elapsed()
+        );
     }
 }

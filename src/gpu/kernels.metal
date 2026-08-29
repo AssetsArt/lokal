@@ -664,14 +664,28 @@ kernel void attention(
 // The kernel above dispatches one threadgroup per (head, row). During decode that is
 // n_heads threadgroups total (9 for SmolLM2) — most of the GPU idles, and the cost per
 // token grows linearly with context. Here the cached positions are split into windows
-// of ATTN_SPLIT: one threadgroup computes a *partial* softmax-weighted sum per
-// (head, window), all in parallel, and a second tiny kernel merges the windows with
-// the online-softmax rule. Scores never touch device memory.
+// of ATTN_SPLIT: one threadgroup computes *partial* softmax-weighted sums per window,
+// all in parallel, and a second tiny kernel merges the windows with the online-softmax
+// rule. Scores never touch device memory.
+//
+// GQA twist: q heads sharing a kv head also share its K/V rows, so one threadgroup
+// walks a kv head's window ONCE and scores every q head of the group against it —
+// per-q-head walks would read each cached byte group-times over (7x for Qwen2.5's
+// 14:2 heads), and at long context that KV traffic dominates decode. The group width
+// is baked in per model via the GQA_CHUNK function constant; a group wider than
+// MAX_GQA_CHUNK is covered by several chunks (grid x = kv heads × chunks).
 //
 // Requires head_dim <= DEC_TG (the Rust side falls back to the kernel above otherwise).
 
 #define ATTN_SPLIT 128 // cached positions per window
 #define DEC_TG 128     // threads per threadgroup: one per position in the window
+// Upper bound on q heads per threadgroup — sizes the per-thread accumulator arrays.
+#define MAX_GQA_CHUNK 8
+// q heads actually processed per threadgroup: min(n_heads / n_kv_heads, MAX_GQA_CHUNK),
+// set when the pipeline is built so the per-head loops below unroll flat.
+constant uint GQA_CHUNK [[function_constant(0)]];
+// Odd row stride for the phase-3 scratch keeps its column reads off bank conflicts.
+#define ACC_STRIDE (GQA_CHUNK | 1u)
 
 struct AttnDecParams {
     uint head_dim;
@@ -681,6 +695,136 @@ struct AttnDecParams {
     uint n_splits; // ceil((pos + 1) / ATTN_SPLIT)
 };
 
+// Per-head window results every thread holds after attn_dec_gqa_walk.
+struct GqaPartial {
+    float m[MAX_GQA_CHUNK]; // window max score
+    float l[MAX_GQA_CHUNK]; // sum of exp(score - m) over the window
+};
+
+// Shared body of the two partial kernels: walk the K/V window [t0, t_end) of one
+// kv head once, scoring q heads head_base..head_base+local_n against it. Leaves the
+// exp-weighted V partials in acc_red (summed over position lanes by the caller) and
+// returns m/l per head. Entries for g >= local_n are garbage — callers skip them.
+static GqaPartial attn_dec_gqa_walk(
+    device const float *q_base, // first q row of the group (rows contiguous, stride hd)
+    device const half *k_cache, // this sequence's cache (slot base already applied)
+    device const half *v_cache,
+    uint kvd, uint kv_off, uint hd, uint local_n, uint t0, uint t_end, uint tid,
+    threadgroup float *q_s,     // [GQA_CHUNK × hd] staged q rows
+    threadgroup float *es,      // [GQA_CHUNK × ATTN_SPLIT] exp(score - m)
+    threadgroup float *acc_red, // [DEC_TG × ACC_STRIDE] phase-3 partial sums
+    threadgroup float *red)     // [GQA_CHUNK × DEC_TG/32 + GQA_CHUNK] reduce scratch
+{
+    float scale = rsqrt((float)hd);
+    threadgroup float *bcast = red + GQA_CHUNK * (DEC_TG / 32);
+
+    // Stage the group's q rows: every thread re-reads them hd/4 times below.
+    for (uint i = tid; i < local_n * hd; i += DEC_TG) {
+        q_s[i] = q_base[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // One thread = one position: read the K row once, score it against every q head.
+    uint t = t0 + tid;
+    float sc[MAX_GQA_CHUNK];
+    for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
+        sc[g] = -INFINITY;
+    }
+    if (t < t_end) {
+        // Wide loads: head_dim is a multiple of 4 in every supported model.
+        device const half4 *k_t = (device const half4 *)(k_cache + (ulong)t * kvd + kv_off);
+        float d[MAX_GQA_CHUNK] = {};
+        for (uint i = 0; i < hd / 4; i++) {
+            float4 k4 = float4(k_t[i]);
+            for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
+                if (g < GQA_CHUNK) {
+                    d[g] += dot(((threadgroup const float4 *)(q_s + g * hd))[i], k4);
+                }
+            }
+        }
+        for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
+            sc[g] = d[g] * scale;
+        }
+    }
+
+    // Per-head max: simdgroup-first (see rmsnorm), then one thread per head folds
+    // the simdgroup results and broadcasts through bcast.
+    for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
+        if (g < GQA_CHUNK) {
+            float sm = simd_max(sc[g]);
+            if (tid % 32 == 0) {
+                red[g * (DEC_TG / 32) + tid / 32] = sm;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < GQA_CHUNK) {
+        float mm = -INFINITY;
+        for (uint j = 0; j < DEC_TG / 32; j++) {
+            mm = max(mm, red[tid * (DEC_TG / 32) + j]);
+        }
+        bcast[tid] = mm;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    GqaPartial o;
+    for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
+        if (g < GQA_CHUNK) {
+            o.m[g] = bcast[g];
+        }
+    }
+
+    // exp(score - m) per head (kept in es for phase 3), then the per-head sum.
+    for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
+        if (g < GQA_CHUNK) {
+            float e = (t < t_end) ? exp(sc[g] - o.m[g]) : 0.0f;
+            es[g * ATTN_SPLIT + tid] = e;
+            float ss = simd_sum(e);
+            if (tid % 32 == 0) {
+                red[g * (DEC_TG / 32) + tid / 32] = ss;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < GQA_CHUNK) {
+        float total = 0.0f;
+        for (uint j = 0; j < DEC_TG / 32; j++) {
+            total += red[tid * (DEC_TG / 32) + j];
+        }
+        bcast[tid] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
+        if (g < GQA_CHUNK) {
+            o.l[g] = bcast[g];
+        }
+    }
+
+    // Weighted V sum, threads reshaped as (position lane × output dim): each V element
+    // is read once and weighted into every head of the group. tid = pl * hd + di, so
+    // each output dim is covered by P position lanes.
+    uint P = DEC_TG / hd;
+    uint pl = tid / hd;
+    uint di = tid % hd;
+    float acc[MAX_GQA_CHUNK] = {};
+    if (pl < P) {
+        for (uint tt = t0 + pl; tt < t_end; tt += P) {
+            float v = (float)v_cache[(ulong)tt * kvd + kv_off + di];
+            for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
+                if (g < GQA_CHUNK) {
+                    acc[g] += es[g * ATTN_SPLIT + tt - t0] * v;
+                }
+            }
+        }
+    }
+    for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
+        if (g < GQA_CHUNK) {
+            acc_red[tid * ACC_STRIDE + g] = acc[g];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return o;
+}
+
 // Partial per (head, window): [max, sum, acc[head_dim]] — acc is the exp-weighted
 // V sum relative to this window's own max; the reduce step rescales.
 kernel void attention_decode_partial(
@@ -689,95 +833,44 @@ kernel void attention_decode_partial(
     device const half *v_cache [[buffer(2)]],
     device float *partials [[buffer(3)]],
     constant AttnDecParams &p [[buffer(4)]],
-    uint2 tg [[threadgroup_position_in_grid]], // x = head, y = window
+    threadgroup float *q_s [[threadgroup(0)]],
+    threadgroup float *es [[threadgroup(1)]],
+    threadgroup float *acc_red [[threadgroup(2)]],
+    threadgroup float *red [[threadgroup(3)]],
+    uint2 tg [[threadgroup_position_in_grid]], // x = kv head × group chunk, y = window
     uint2 tpos [[thread_position_in_threadgroup]])
 {
     uint tid = tpos.x;
-    uint head = tg.x;
     uint hd = p.head_dim;
-    uint kvd = p.n_kv_heads * hd;
-    uint kv_off = (head / (p.n_heads / p.n_kv_heads)) * hd;
+    uint group = p.n_heads / p.n_kv_heads;
+    uint gchunks = (group + GQA_CHUNK - 1) / GQA_CHUNK;
+    uint kvh = tg.x / gchunks;
+    uint gc = tg.x % gchunks;
+    uint head_base = kvh * group + gc * GQA_CHUNK;
+    uint local_n = min(GQA_CHUNK, group - gc * GQA_CHUNK);
     uint t0 = tg.y * ATTN_SPLIT;
     uint t_end = min(t0 + ATTN_SPLIT, p.pos + 1); // exclusive
-    device const float *q_head = q + head * hd;
-    float scale = rsqrt((float)hd);
 
-    threadgroup float es[ATTN_SPLIT]; // this window's scores, then exp(score - max)
-    threadgroup float red[DEC_TG];
+    GqaPartial o = attn_dec_gqa_walk(q + head_base * hd, k_cache, v_cache,
+        p.n_kv_heads * hd, kvh * hd, hd, local_n, t0, t_end, tid, q_s, es, acc_red, red);
 
-    // One thread = one position: score, then cooperative max / sum reductions.
-    uint t = t0 + tid;
-    float score = -INFINITY;
-    if (t < t_end) {
-        // Wide loads: head_dim is a multiple of 4 in every supported model.
-        device const half4 *k_t = (device const half4 *)(k_cache + (ulong)t * kvd + kv_off);
-        device const float4 *q4 = (device const float4 *)q_head;
-        float d = 0.0f;
-        for (uint i = 0; i < hd / 4; i++) {
-            d += dot(q4[i], float4(k_t[i]));
-        }
-        score = d * scale;
-    }
-    // Simdgroup-first max/sum (see rmsnorm) — red's tail doubles as phase-3 scratch.
-    float sg_max = simd_max(score);
-    if (tid % 32 == 0) {
-        red[tid / 32] = sg_max;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        float mm = -INFINITY;
-        for (uint j = 0; j < DEC_TG / 32; j++) {
-            mm = max(mm, red[j]);
-        }
-        red[0] = mm;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float m = red[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float e = (t < t_end) ? exp(score - m) : 0.0f;
-    es[tid] = e;
-    float sg_sum = simd_sum(e);
-    if (tid % 32 == 0) {
-        red[tid / 32] = sg_sum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        float total = 0.0f;
-        for (uint j = 0; j < DEC_TG / 32; j++) {
-            total += red[j];
-        }
-        red[0] = total;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float l = red[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Weighted V sum, threads reshaped as (position lane × output dim):
-    // tid = pl * hd + di, so each output dim is covered by P position lanes.
+    device float *out = partials + ((ulong)head_base * p.n_splits + tg.y) * (hd + 2);
+    ulong head_stride = (ulong)p.n_splits * (hd + 2);
     uint P = DEC_TG / hd;
-    uint pl = tid / hd;
-    uint di = tid % hd;
-    float acc = 0.0f;
-    if (pl < P) {
-        for (uint tt = t0 + pl; tt < t_end; tt += P) {
-            acc += es[tt - t0] * (float)v_cache[(ulong)tt * kvd + kv_off + di];
+    for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
+        if (g < GQA_CHUNK && g < local_n) {
+            if (tid == 0) {
+                out[g * head_stride] = o.m[g];
+                out[g * head_stride + 1] = o.l[g];
+            }
+            if (tid < hd) {
+                float a = 0.0f;
+                for (uint j = 0; j < P; j++) {
+                    a += acc_red[(j * hd + tid) * ACC_STRIDE + g];
+                }
+                out[g * head_stride + 2 + tid] = a;
+            }
         }
-    }
-    red[tid] = acc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    device float *out = partials + ((ulong)head * p.n_splits + tg.y) * (hd + 2);
-    if (tid == 0) {
-        out[0] = m;
-        out[1] = l;
-    }
-    if (tid < hd) {
-        float a = 0.0f;
-        for (uint j = 0; j < P; j++) {
-            a += red[j * hd + tid];
-        }
-        out[2 + tid] = a;
     }
 }
 
@@ -1000,7 +1093,11 @@ kernel void attention_decode_partial_batch(
     device float *partials [[buffer(3)]],
     device const RowMeta *meta [[buffer(4)]],
     constant AttnDecBatchParams &p [[buffer(5)]],
-    uint3 tg [[threadgroup_position_in_grid]], // x = head, y = window, z = batch row
+    threadgroup float *q_s [[threadgroup(0)]],
+    threadgroup float *es [[threadgroup(1)]],
+    threadgroup float *acc_red [[threadgroup(2)]],
+    threadgroup float *red [[threadgroup(3)]],
+    uint3 tg [[threadgroup_position_in_grid]], // x = kv head × group chunk, y = window, z = batch row
     uint3 tpos [[thread_position_in_threadgroup]])
 {
     uint tid = tpos.x;
@@ -1010,87 +1107,38 @@ kernel void attention_decode_partial_batch(
     if (t0 > pos) {
         return; // this row has fewer windows than the widest in the batch
     }
-    uint head = tg.x;
     uint hd = p.head_dim;
-    uint kvd = p.kv_dim;
-    uint kv_off = (head / (p.n_heads / p.n_kv_heads)) * hd;
+    uint group = p.n_heads / p.n_kv_heads;
+    uint gchunks = (group + GQA_CHUNK - 1) / GQA_CHUNK;
+    uint kvh = tg.x / gchunks;
+    uint gc = tg.x % gchunks;
+    uint head_base = kvh * group + gc * GQA_CHUNK;
+    uint local_n = min(GQA_CHUNK, group - gc * GQA_CHUNK);
     uint t_end = min(t0 + ATTN_SPLIT, pos + 1);
-    ulong base = (ulong)meta[b].slot * p.max_seq;
-    device const float *q_head = q + (ulong)b * p.n_heads * hd + head * hd;
-    float scale = rsqrt((float)hd);
+    ulong base = (ulong)meta[b].slot * p.max_seq * p.kv_dim;
 
-    threadgroup float es[ATTN_SPLIT];
-    threadgroup float red[DEC_TG];
-
-    uint t = t0 + tid;
-    float score = -INFINITY;
-    if (t < t_end) {
-        device const half4 *k_t = (device const half4 *)(k_cache + (base + t) * kvd + kv_off);
-        device const float4 *q4 = (device const float4 *)q_head;
-        float d = 0.0f;
-        for (uint i = 0; i < hd / 4; i++) {
-            d += dot(q4[i], float4(k_t[i]));
-        }
-        score = d * scale;
-    }
-    float sg_max = simd_max(score);
-    if (tid % 32 == 0) {
-        red[tid / 32] = sg_max;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        float mm = -INFINITY;
-        for (uint j = 0; j < DEC_TG / 32; j++) {
-            mm = max(mm, red[j]);
-        }
-        red[0] = mm;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float m = red[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float e = (t < t_end) ? exp(score - m) : 0.0f;
-    es[tid] = e;
-    float sg_sum = simd_sum(e);
-    if (tid % 32 == 0) {
-        red[tid / 32] = sg_sum;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        float total = 0.0f;
-        for (uint j = 0; j < DEC_TG / 32; j++) {
-            total += red[j];
-        }
-        red[0] = total;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float l = red[0];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint P = DEC_TG / hd;
-    uint pl = tid / hd;
-    uint di = tid % hd;
-    float acc = 0.0f;
-    if (pl < P) {
-        for (uint tt = t0 + pl; tt < t_end; tt += P) {
-            acc += es[tt - t0] * (float)v_cache[(base + tt) * kvd + kv_off + di];
-        }
-    }
-    red[tid] = acc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    GqaPartial o = attn_dec_gqa_walk(q + ((ulong)b * p.n_heads + head_base) * hd,
+        k_cache + base, v_cache + base, p.kv_dim, kvh * hd, hd, local_n, t0, t_end, tid,
+        q_s, es, acc_red, red);
 
     device float *out = partials
-        + (((ulong)b * p.n_heads + head) * p.splits_max + tg.y) * (hd + 2);
-    if (tid == 0) {
-        out[0] = m;
-        out[1] = l;
-    }
-    if (tid < hd) {
-        float a = 0.0f;
-        for (uint j = 0; j < P; j++) {
-            a += red[j * hd + tid];
+        + (((ulong)b * p.n_heads + head_base) * p.splits_max + tg.y) * (hd + 2);
+    ulong head_stride = (ulong)p.splits_max * (hd + 2);
+    uint P = DEC_TG / hd;
+    for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
+        if (g < GQA_CHUNK && g < local_n) {
+            if (tid == 0) {
+                out[g * head_stride] = o.m[g];
+                out[g * head_stride + 1] = o.l[g];
+            }
+            if (tid < hd) {
+                float a = 0.0f;
+                for (uint j = 0; j < P; j++) {
+                    a += acc_red[(j * hd + tid) * ACC_STRIDE + g];
+                }
+                out[g * head_stride + 2 + tid] = a;
+            }
         }
-        out[2 + tid] = a;
     }
 }
 
