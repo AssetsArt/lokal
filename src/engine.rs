@@ -31,6 +31,14 @@ pub trait Session {
         }
         Ok(logits)
     }
+
+    /// Process a short batch starting at `pos0` → logits for EVERY position, not just
+    /// the last. This is speculative decoding's verification step: the target model
+    /// checks a whole block of draft tokens in one pass. The default loops over
+    /// `forward`; the Metal backend overrides it with one batched submission.
+    fn forward_batch(&mut self, ids: &[u32], pos0: usize) -> crate::Result<Vec<Vec<f32>>> {
+        ids.iter().enumerate().map(|(i, &t)| self.forward(t, pos0 + i)).collect()
+    }
 }
 
 /// Build an engine by backend name — adding a backend means adding one arm here

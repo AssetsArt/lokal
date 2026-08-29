@@ -130,6 +130,7 @@ lokal serve [options]     HTTP server (POST /generate)
 lokal path [-m <model>]   download if needed, then print the model's local directory
 
 -m, --model <repo|dir>   Hugging Face repo or local directory
+    --draft <repo|dir>   smaller same-tokenizer model: speculative decoding (greedy)
 -b, --backend <name>     cpu | metal | ane                      [cpu]
 -p, --prompt <text>      prompt text
 -n, --max-tokens <N>     generation budget                      [200]
@@ -156,6 +157,9 @@ adding new backends live in [DESIGN.md](DESIGN.md).
 ## Roadmap
 
 - [x] Fast decode on Metal — flash-decoding attention, fused kernels, vectorized loads
+- [x] Speculative decoding (`--draft`) — exact greedy verification, adaptive block size
+- [ ] f16 model loading — halve load RAM so 3B+ targets fit (what makes `--draft` pay off)
+- [ ] Lossless speculative sampling (temperature > 0)
 - [ ] f16 KV cache — halve the attention bandwidth bill at long context
 - [ ] OpenAI-compatible API in serve mode (`/v1/chat/completions`, works with existing clients)
 - [ ] Streaming responses (SSE)

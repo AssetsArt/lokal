@@ -238,6 +238,33 @@ Each device has its own cost structure:
 The consequence: the open optimization frontier is no longer the matmul — it
 is decode state management and scheduling work across devices.
 
+## Speculative decoding
+
+`generate::speculative`, active with `--draft <model>` at temperature 0. A small
+same-tokenizer model proposes a block of tokens; the target verifies the whole
+block in one batched pass (`Session::forward_batch` — one Metal submission with
+lm_head on every row). Greedy acceptance compares argmax against argmax, so the
+output is token-identical to running the target alone — verified: a target
+drafting for itself accepts 100% of proposals.
+
+Design notes:
+
+- **Position-addressed KV caches make rollback free.** Both backends write K,V
+  by explicit position, so a rejected token's rows are simply overwritten on
+  the next round — `draft_pos = draft_pos.min(seq.len())` is the entire
+  unwind logic.
+- **The block size adapts** (grow on full accept, shrink on none) between 1
+  and 7, keeping the verify batch inside the Metal logits buffer.
+- **When it pays — the honest arithmetic.** A round costs ~γ draft steps plus
+  one verify (≈ one target step); it emits `accepted + 1` tokens. With the
+  pairs that fit in 16 GB today the draft is too expensive relative to its
+  target (Qwen2.5-0.5B is ~37% of a 1.5B step; acceptance measured 46%) —
+  break-even, not a win. The technique needs a target ~6x+ the draft, i.e.
+  3B+ targets with a 0.5B draft. The blocker is the loader (weights expand to
+  f32 in RAM, so 3B needs ~12 GB just to load); f16 loading is the unlock and
+  is on the roadmap. The machinery itself is correct, exact, and free when
+  `--draft` is not passed.
+
 ## Serve-mode concurrency
 
 Because an Engine is immutable and every Session owns its own state,

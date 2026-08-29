@@ -116,6 +116,8 @@ struct Pipelines {
 const ATTN_SPLIT: usize = 128;
 /// Threads per decode-attention threadgroup — must match DEC_TG in kernels.metal.
 const DEC_TG: usize = 128;
+/// Max rows the logits buffer holds — the ceiling for one speculative verify batch.
+const SPEC_MAX: usize = 8;
 
 /// A linear layer on the GPU: f16 weights + f16 bias (all-zero when the model has none —
 /// adding zero is free and avoids a branch in the kernel).
@@ -573,7 +575,7 @@ impl MetalEngine {
             xb: f32_buffer(d, chunk * cfg.hidden_size),
             gate: f32_buffer(d, chunk * cfg.intermediate_size),
             up: f32_buffer(d, chunk * cfg.intermediate_size),
-            logits: f32_buffer(d, cfg.vocab_size),
+            logits: f32_buffer(d, SPEC_MAX * cfg.vocab_size),
             scores: f32_buffer(d, chunk * cfg.num_attention_heads * max_seq),
             partials: f32_buffer(
                 d,
@@ -609,8 +611,9 @@ pub(crate) struct MetalSession<'a> {
 impl MetalSession<'_> {
     /// Process n_rows tokens (positions pos0..pos0+n_rows) in one command buffer.
     /// The dispatch order below mirrors Model::forward on the CPU line by line.
-    /// want_logits=false for intermediate prefill chunks that only fill the KV cache.
-    fn run(&mut self, ids: &[u32], pos0: usize, want_logits: bool) -> crate::Result<Vec<f32>> {
+    /// `logits_rows` = how many trailing positions need logits: 0 for intermediate
+    /// prefill chunks, 1 for decode / the last chunk, n for speculative verification.
+    fn run(&mut self, ids: &[u32], pos0: usize, logits_rows: usize) -> crate::Result<Vec<f32>> {
         let e = self.engine;
         let cfg = &e.cfg;
         let (h, n) = (cfg.hidden_size, ids.len());
@@ -662,23 +665,25 @@ impl MetalSession<'_> {
             e.enc_linear(enc, &blk.down_proj, &self.gate, 0, &self.xb, 0, n);
             e.enc_elementwise(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
         }
-        if want_logits {
-            // Only the last position's logits matter — norm every row (cheap), then
-            // run the big lm_head matvec on the final row alone.
+        if logits_rows > 0 {
+            // Norm every row (cheap), then run the big lm_head only on the rows whose
+            // logits are wanted — the final one for decode, all of them for verification.
             e.enc_rmsnorm(enc, &self.x, &e.norm, &self.xn, n);
-            e.enc_linear(enc, &e.lm_head, &self.xn, ((n - 1) * h * 4) as u64, &self.logits, 0, 1);
+            let first = n - logits_rows;
+            e.enc_linear(enc, &e.lm_head, &self.xn, (first * h * 4) as u64, &self.logits, 0, logits_rows);
         }
 
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed(); // the single sync point for the whole chunk
 
-        if !want_logits {
+        if logits_rows == 0 {
             return Ok(Vec::new());
         }
         // Unified memory: read logits straight out of the buffer, no device copy.
-        let logits =
-            unsafe { std::slice::from_raw_parts(self.logits.contents() as *const f32, cfg.vocab_size) };
+        let logits = unsafe {
+            std::slice::from_raw_parts(self.logits.contents() as *const f32, logits_rows * cfg.vocab_size)
+        };
         Ok(logits.to_vec())
     }
 
@@ -701,7 +706,7 @@ impl MetalSession<'_> {
         let mut logits = Vec::new();
         for chunk in ids.chunks(PREFILL_CHUNK) {
             let is_last = pos0 + chunk.len() == end;
-            logits = self.run(chunk, pos0, is_last)?;
+            logits = self.run(chunk, pos0, is_last as usize)?;
             pos0 += chunk.len();
         }
         Ok(logits)
@@ -710,12 +715,23 @@ impl MetalSession<'_> {
 
 impl Session for MetalSession<'_> {
     fn forward(&mut self, token: u32, pos: usize) -> crate::Result<Vec<f32>> {
-        self.run(&[token], pos, true)
+        self.run(&[token], pos, 1)
     }
 
     /// Batch prefill: split the prompt into PREFILL_CHUNK-sized chunks. Later chunks
     /// automatically attend to earlier chunks' K,V through the cache (via pos0).
     fn prefill(&mut self, ids: &[u32]) -> crate::Result<Vec<f32>> {
         self.prefill_from(ids, 0)
+    }
+
+    /// Speculative verification: the whole batch in one submission, logits for every
+    /// position. Falls back to the one-by-one loop past the logits buffer's capacity.
+    fn forward_batch(&mut self, ids: &[u32], pos0: usize) -> crate::Result<Vec<Vec<f32>>> {
+        if ids.len() > SPEC_MAX {
+            return ids.iter().enumerate().map(|(i, &t)| self.forward(t, pos0 + i)).collect();
+        }
+        let vocab = self.engine.cfg.vocab_size;
+        let flat = self.run(ids, pos0, ids.len())?;
+        Ok(flat.chunks(vocab).map(|c| c.to_vec()).collect())
     }
 }

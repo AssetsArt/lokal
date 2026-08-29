@@ -32,6 +32,7 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 
 struct Args {
     model: String,
+    draft: Option<String>,
     backend: String,
     serve: bool,
     path_only: bool,
@@ -49,6 +50,7 @@ Usage:
 
 Options:
   -m, --model <repo|dir>   Hugging Face repo or local directory [HuggingFaceTB/SmolLM2-135M]
+      --draft <repo|dir>   smaller same-tokenizer model for speculative decoding (greedy only)
   -b, --backend <name>     cpu, metal (Apple GPU), ane (Neural Engine prefill + Metal decode) [cpu]
   -p, --prompt <text>      prompt text [\"Once upon a time\"]
   -n, --max-tokens <N>     maximum number of tokens to generate [200]
@@ -64,6 +66,7 @@ impl Args {
     fn parse() -> Result<Self> {
         let mut a = Self {
             model: "HuggingFaceTB/SmolLM2-135M".into(),
+            draft: None,
             backend: "cpu".into(),
             serve: false,
             path_only: false,
@@ -78,6 +81,7 @@ impl Args {
                 "serve" => a.serve = true,
                 "path" => a.path_only = true,
                 "-m" | "--model" => a.model = val()?,
+                "--draft" => a.draft = Some(val()?),
                 "-b" | "--backend" => a.backend = val()?,
                 "-p" | "--prompt" => a.opt.prompt = val()?,
                 "-n" | "--max-tokens" => a.opt.max_tokens = val()?.parse()?,
@@ -136,9 +140,34 @@ fn run() -> Result<()> {
     let engine = engine::create(&args.backend, model, &dir)?;
     eprintln!("backend: {}", engine.name());
 
+    // Optional draft model for speculative decoding. It must share the target's
+    // tokenizer (same model family); vocab size is the cheap proxy check. The draft
+    // never uses the ane backend — its prompt share is small and the ANE graphs may
+    // not exist for it.
+    let draft = match &args.draft {
+        None => None,
+        Some(name) => {
+            let ddir = hub::resolve_model(name)?;
+            let dcfg = config::ModelConfig::load(&ddir.join("config.json"))?;
+            if dcfg.vocab_size != cfg.vocab_size {
+                return Err(format!(
+                    "draft model {name} has vocab {} but the target has {} — they must share a tokenizer",
+                    dcfg.vocab_size, cfg.vocab_size
+                )
+                .into());
+            }
+            let dmodel = model::Model::load(&ddir, dcfg)?;
+            let dbackend = if args.backend == "ane" { "metal" } else { &args.backend };
+            let dengine = engine::create(dbackend, dmodel, &ddir)?;
+            eprintln!("draft: {name} ({})", dengine.name());
+            Some(dengine)
+        }
+    };
+
     if args.serve {
         return server::serve(
             Arc::from(engine),
+            draft.map(Arc::from),
             Arc::new(tokenizer),
             args.port,
             args.max_concurrent,
@@ -153,7 +182,7 @@ fn run() -> Result<()> {
     }
     std::io::stdout().flush()?;
 
-    let out = generate::generate(engine.as_ref(), &tokenizer, &args.opt, |piece| {
+    let out = generate::generate(engine.as_ref(), draft.as_deref(), &tokenizer, &args.opt, |piece| {
         print!("{piece}");
         let _ = std::io::stdout().flush();
     })?;

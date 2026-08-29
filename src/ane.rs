@@ -209,6 +209,10 @@ impl Session for AneSession<'_> {
         self.metal.forward(token, pos) // decoding stays entirely on Metal
     }
 
+    fn forward_batch(&mut self, ids: &[u32], pos0: usize) -> crate::Result<Vec<Vec<f32>>> {
+        self.metal.forward_batch(ids, pos0) // speculative verification too
+    }
+
     /// Division of labor: the ANE takes the prompt's head (up to the chosen graph's
     /// seq), Metal takes any overflow — and always the final token, because we need
     /// the last position's logits and the ANE graphs deliberately omit lm_head (one

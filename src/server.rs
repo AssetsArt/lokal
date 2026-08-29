@@ -22,6 +22,7 @@ use tokio::sync::Semaphore;
 
 pub fn serve(
     engine: Arc<dyn Engine>,
+    draft: Option<Arc<dyn Engine>>,
     tokenizer: Arc<Tokenizer>,
     port: u16,
     max_concurrent: usize,
@@ -40,11 +41,12 @@ pub fn serve(
         eprintln!("  curl http://127.0.0.1:{port}/generate -d '{{\"prompt\": \"Once upon a time\"}}'");
         loop {
             let (stream, _) = listener.accept().await?;
-            let (engine, tokenizer, sem) = (engine.clone(), tokenizer.clone(), sem.clone());
+            let (engine, draft, tokenizer, sem) =
+                (engine.clone(), draft.clone(), tokenizer.clone(), sem.clone());
             // One connection = one task, so a slow connection never blocks the others.
             tokio::spawn(async move {
                 let service = service_fn(move |req| {
-                    handle(req, engine.clone(), tokenizer.clone(), sem.clone())
+                    handle(req, engine.clone(), draft.clone(), tokenizer.clone(), sem.clone())
                 });
                 let conn = http1::Builder::new().serve_connection(TokioIo::new(stream), service);
                 if let Err(e) = conn.await {
@@ -58,6 +60,7 @@ pub fn serve(
 async fn handle(
     req: Request<Incoming>,
     engine: Arc<dyn Engine>,
+    draft: Option<Arc<dyn Engine>>,
     tokenizer: Arc<Tokenizer>,
     sem: Arc<Semaphore>,
 ) -> std::result::Result<Response<Full<Bytes>>, hyper::Error> {
@@ -83,7 +86,7 @@ async fn handle(
     // Heavy compute must leave the async threads, or it stalls tokio's event loop.
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        generate(engine.as_ref(), &tokenizer, &opt, |_| {})
+        generate(engine.as_ref(), draft.as_deref(), &tokenizer, &opt, |_| {})
     })
     .await;
 
