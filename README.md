@@ -87,9 +87,10 @@ Architectures: `LlamaForCausalLM`, `Qwen2ForCausalLM`, `MistralForCausalLM`.
 
 ## Backends
 
-Pick with `-b cpu | metal | ane`. All three are verified to produce identical
-greedy output, so switching backends never changes what the model says — only
-how fast it says it.
+Pick with `-b cpu | metal | ane`. cpu and metal are verified to produce
+identical greedy output; ane matches them in practice too, though on very
+long prompts fp16 rounding can pick a different — equally sensible — token
+at a near-tie.
 
 ### ANE setup (optional, once per model)
 
@@ -158,8 +159,10 @@ cargo test
 
 The main correctness gate is deterministic cross-backend comparison: with
 `--temperature 0`, the same prompt must produce token-identical output on
-cpu, metal, and ane. Architecture notes, backend internals, and the guide for
-adding new backends live in [DESIGN.md](DESIGN.md).
+cpu and metal; the fp16 ane backend is held to a numeric envelope vs the f32
+reference and may differ at rare greedy near-ties on long prompts.
+Architecture notes, backend internals, and the guide for adding new backends
+live in [DESIGN.md](DESIGN.md).
 
 ## Roadmap
 
@@ -175,8 +178,8 @@ adding new backends live in [DESIGN.md](DESIGN.md).
 - [x] `simdgroup_matrix` (MMA) matmul on Metal
 - [ ] CUDA (NVIDIA) and Vulkan (AMD/portable) backends
 - [x] Multi-size ANE prefill graphs (512/2048) with automatic routing per prompt length
-- [x] Windowed ANE prefill — long prompts chunk through the ANE with fed-back KV (~6k coverage)
-- [ ] ANE decode via Core ML stateful models (MLState)
+- [x] Windowed ANE prefill — long prompts chunk through the ANE with fed-back KV (8k coverage)
+- [x] MLState decode spike — measured no-go on this toolchain (three hard ceilings; see DESIGN.md)
 - [ ] Hybrid scheduler — route each phase to the best device automatically, no `--backend` flag needed
 - [ ] Repetition penalty and top-k sampling
 
