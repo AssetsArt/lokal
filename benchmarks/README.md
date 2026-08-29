@@ -55,6 +55,120 @@ Raw per-run output: [results.jsonl](results.jsonl).
   admission-bound: each join prefills ~0.5 s on the same GPU — chunked
   prefill scheduling is the known fix.
 
+## Long-context baseline (2026-08-29)
+
+The table above is a ~460-token prompt, which is not the length anyone
+actually runs at. This section is the same comparison at 2k-32k on
+Qwen2.5-0.5B-Instruct (32k context window) instead of SmolLM2, because the
+question that steers the roadmap is what prefill and decode cost at real input
+sizes.
+
+- Prompt: natural prose sliced out of Project Gutenberg ebook 2701 (*Moby
+  Dick*, public domain), pinned by sha256 and fetched on first use into
+  `benchmarks/.cache/` rather than committed. Every engine gets the same text
+  and is asked for its own token count, so tok/s is normalized by what that
+  engine tokenized instead of by a shared guess. The unique-nonce prefix from
+  the short-prompt method is kept, so no server answers from a prefix cache.
+- Method: greedy, `max_tokens 128`, median of 3 runs per cell.
+- Machine: one M1 Pro shared by three agents working in parallel, so every row
+  records the machine state it was measured under (`machine_before` /
+  `machine_after` in results.jsonl) and the harness refuses to write a row
+  taken while something else is busy. An earlier pass of this table was thrown
+  away for exactly that reason: contention cost it 8% of its prefill and 12-17%
+  of its decode, which is small enough to read as noise and large enough to
+  reverse a ranking. Those rows are kept in results.jsonl tagged
+  `longctx-baseline-CONTAMINATED`.
+
+**Prefill (wall / tokens per second)**
+
+| prompt | lokal `-b ane` (cli) |
+|---|---|
+| 2k | 1.79 s / 1155 tok/s |
+| 6k | 4.35 s / 1393 tok/s |
+| 10k | 34.72 s / 294 tok/s |
+| 16k | 102.80 s / 158 tok/s |
+
+**Decode (marginal tokens per second)**
+
+| prompt | lokal `-b ane` (cli) |
+|---|---|
+| 2k | 103 tok/s |
+| 6k | 78 tok/s |
+| 10k | 63 tok/s |
+| 16k | 49 tok/s |
+
+**Prompt length as each engine tokenized it**
+
+| prompt | lokal `-b ane` (cli) |
+|---|---|
+| 2k | 2067 |
+| 6k | 6058 |
+| 10k | 10204 |
+| 16k | 16272 |
+
+### Where lokal's prefill time goes
+
+| prompt | lokal `-b ane` (cli) |
+|---|---|
+| 2k | ANE 2066 tok / 1.67 s + Metal 1 tok / 0.12 s |
+| 6k | ANE 6057 tok / 4.22 s + Metal 1 tok / 0.13 s |
+| 10k | ANE 6144 tok / 4.21 s + Metal 4060 tok / 30.51 s |
+| 16k | ANE 6144 tok / 4.21 s + Metal 10128 tok / 98.59 s |
+
+The ANE is a flat cost and the Metal tail is a compounding one. lokal's only
+windowed graph for this model is `prefill-1024w5120`, so `prefill_chunked` in
+ane.rs covers `s + p` = 6144 positions and Metal prefills every token past
+that. The ANE spends 4.21 s on those 6144 positions at a 10k prompt and the
+identical 4.21 s at 16k — same window, same work. The tail does not merely
+grow, it gets slower per token as it grows (133 tok/s over 4060 tokens, 103
+tok/s over 10128), because each tail token attends to everything before it.
+That is the whole story of the prefill column: 1393 tok/s at 6k, where the
+prompt still fits the window, against 158 tok/s at 16k, where two thirds of it
+does not.
+
+### The 8192-token serve gap
+
+lokal's HTTP server cannot be measured past 8192 tokens at all. Continuous
+batching pools each slot at `POOL_SEQ_CAP` (batch.rs), and a longer prompt is
+refused outright:
+
+```
+$ curl -s localhost:8080/generate -d '{"prompt": "<10k tokens>", ...}'
+{"error":"prompt (10182 tokens) is empty or exceeds the 8192-token budget"}
+```
+
+So every lokal row above 8k here is measured through the CLI path
+(`bench_engines.py --api cli`), which parses the prefill/decode split the
+binary already prints. Raising that cap with chunked-prefill admission is a
+known phase-2 item; this table documents the gap rather than benchmarking
+around it.
+
+### Reproducing the long-context table
+
+`run_longctx.py` owns the server lifecycle — 16 GB does not hold three
+inference servers and a 32k KV cache at once, and an idle engine still skews
+the one being timed, so it starts one, sweeps every prompt size against it,
+kills its process group, and moves on.
+
+```bash
+# the cross-engine sweep (lokal goes through its cli above 8k, see above)
+python3 benchmarks/run_longctx.py --engines lokal-ane-cli,llamacpp,omlx \
+    --sizes 2000,6000,10000,16000,24000,32000 --ctx 34816 --runs 3
+
+# 4-way concurrency at 10k; llama.cpp splits one KV allocation across slots
+python3 benchmarks/run_longctx.py --engines llamacpp,omlx --sizes 10000 \
+    --ctx 45056 --parallel 4 --concurrency 4 --tag longctx-conc
+
+# then rebuild the tables above
+python3 benchmarks/summarize_longctx.py --tag longctx-baseline
+```
+
+The engines need their own weights: llama.cpp wants
+`Qwen/Qwen2.5-0.5B-Instruct-GGUF:fp16` and oMLX wants
+`mlx-community/Qwen2.5-0.5B-Instruct-bf16` unpacked under `~/.omlx/models/`.
+lokal's ANE backend needs the exported Core ML graphs beside the model in the
+HF cache (`prefill-512`, `prefill-2048`, `prefill-1024w5120`).
+
 ## Reproduce
 
 Each engine serves the same model; run the harness against it:
