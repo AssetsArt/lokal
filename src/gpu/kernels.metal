@@ -564,17 +564,27 @@ kernel void attention(
     // combine) — a couple of barriers instead of a log2(256)-step tree.
     threadgroup float red[ATTN_TG / 32];
 
-    // Phase 1: q·k score for every position 0..=q_pos, tracking the max for a stable exp.
+    // Phase 1: q·k score for every position 0..=q_pos, tracking the max for a stable
+    // exp. Wide loads when head_dim allows (it does for every supported model).
+    bool vec4 = (hd % 4) == 0;
     float local_max = -INFINITY;
     for (uint t = tid; t <= q_pos; t += ATTN_TG) {
         device const half *k_t = k_cache + (ulong)t * kvd + kv_off;
-        float dot = 0.0f;
-        for (uint i = 0; i < hd; i++) {
-            dot += q_head[i] * (float)k_t[i];
+        float d = 0.0f;
+        if (vec4) {
+            device const half4 *k4 = (device const half4 *)k_t;
+            device const float4 *q4 = (device const float4 *)q_head;
+            for (uint i = 0; i < hd / 4; i++) {
+                d += dot(q4[i], float4(k4[i]));
+            }
+        } else {
+            for (uint i = 0; i < hd; i++) {
+                d += q_head[i] * (float)k_t[i];
+            }
         }
-        dot *= scale;
-        sc[t] = dot;
-        local_max = max(local_max, dot);
+        d *= scale;
+        sc[t] = d;
+        local_max = max(local_max, d);
     }
     float sg_max = simd_max(local_max);
     if (tid % 32 == 0) {
@@ -616,13 +626,37 @@ kernel void attention(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float score_sum = red[0];
 
-    // Phase 3: output = weighted average of v — one thread per output dimension.
-    for (uint i = tid; i < hd; i += ATTN_TG) {
+    // Phase 3: output = weighted average of v. Threads reshape as
+    // (position lane × output dim) so every thread works — the position loop
+    // splits ATTN_TG/head_dim ways instead of running serially per dim (this was
+    // the long-prompt prefill bottleneck).
+    threadgroup float acc_red[ATTN_TG];
+    if (hd <= ATTN_TG && (ATTN_TG % hd) == 0) {
+        uint pn = ATTN_TG / hd;
+        uint pl = tid / hd;
+        uint di = tid % hd;
         float acc = 0.0f;
-        for (uint t = 0; t <= q_pos; t++) {
-            acc += sc[t] * (float)v_cache[(ulong)t * kvd + kv_off + i];
+        for (uint t = pl; t <= q_pos; t += pn) {
+            acc += sc[t] * (float)v_cache[(ulong)t * kvd + kv_off + di];
         }
-        out[(ulong)row * p.n_heads * hd + head * hd + i] = acc / score_sum;
+        acc_red[tid] = acc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < hd) {
+            float a = 0.0f;
+            for (uint j = 0; j < pn; j++) {
+                a += acc_red[j * hd + tid];
+            }
+            out[(ulong)row * p.n_heads * hd + head * hd + tid] = a / score_sum;
+        }
+    } else {
+        // Fallback for exotic head sizes: one thread per output dimension.
+        for (uint i = tid; i < hd; i += ATTN_TG) {
+            float acc = 0.0f;
+            for (uint t = 0; t <= q_pos; t++) {
+                acc += sc[t] * (float)v_cache[(ulong)t * kvd + kv_off + i];
+            }
+            out[(ulong)row * p.n_heads * hd + head * hd + i] = acc / score_sum;
+        }
     }
 }
 
