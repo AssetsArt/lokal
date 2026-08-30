@@ -171,6 +171,11 @@ const MAX_GQA_CHUNK: usize = 8;
 /// The head_dim the flash prefill attention kernel is specialized for (FA_HD in
 /// kernels.metal); other head sizes take the scores-scratch fallback kernel.
 const FLASH_HEAD_DIM: usize = 64;
+/// Flash tile shape, injected into the shader source as FA_BR/FA_BC so the
+/// kernel layout and the dispatch geometry share one source of truth.
+const FLASH_BR: usize = 32;
+const FLASH_BC: usize = 32;
+const FLASH_THREADS: usize = FLASH_BR / 8 * 32;
 /// Max rows the logits buffer holds — the ceiling for one speculative verify batch.
 const SPEC_MAX: usize = 8;
 
@@ -243,7 +248,13 @@ impl MetalEngine {
 
         // Kernels are compiled at runtime — edit kernels.metal and just cargo run again.
         let lib = device
-            .new_library_with_source(include_str!("kernels.metal"), &CompileOptions::new())
+            .new_library_with_source(
+                &format!(
+                    "#define FA_BR {FLASH_BR}\n#define FA_BC {FLASH_BC}\n{}",
+                    include_str!("kernels.metal")
+                ),
+                &CompileOptions::new(),
+            )
             .map_err(|e| format!("failed to compile kernels.metal: {e}"))?;
         let pipe = |name: &str| -> crate::Result<ComputePipelineState> {
             let f = lib.get_function(name, None).map_err(|e| format!("kernel {name}: {e}"))?;
@@ -596,8 +607,12 @@ impl MetalEngine {
             enc.set_bytes(4, size_of::<AttnParams>() as u64, &p as *const _ as *const _);
             enc.set_buffer(5, Some(out_h), 0);
             enc.dispatch_thread_groups(
-                MTLSize::new(self.cfg.num_attention_heads as u64, n_rows.div_ceil(32) as u64, 1),
-                MTLSize::new(128, 1, 1),
+                MTLSize::new(
+                    self.cfg.num_attention_heads as u64,
+                    n_rows.div_ceil(FLASH_BR) as u64,
+                    1,
+                ),
+                MTLSize::new(FLASH_THREADS as u64, 1, 1),
             );
             return;
         }
