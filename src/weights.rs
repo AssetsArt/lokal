@@ -27,7 +27,8 @@ pub fn load(dir: &Path) -> crate::Result<TensorMap> {
 }
 
 /// Weight file list: the single standard file, or multiple shards per the index.
-fn shard_files(dir: &Path) -> crate::Result<Vec<String>> {
+/// (pub(crate): the lowmem manifest walks the same shards without loading them.)
+pub(crate) fn shard_files(dir: &Path) -> crate::Result<Vec<String>> {
     if dir.join("model.safetensors").exists() {
         return Ok(vec!["model.safetensors".into()]);
     }
@@ -47,7 +48,7 @@ fn shard_files(dir: &Path) -> crate::Result<Vec<String>> {
 
 /// Convert raw little-endian data to f32.
 /// bf16 is f32 with the mantissa truncated to 8 bits — same range, less precision.
-fn to_f32(dtype: Dtype, data: &[u8]) -> crate::Result<Vec<f32>> {
+pub(crate) fn to_f32(dtype: Dtype, data: &[u8]) -> crate::Result<Vec<f32>> {
     let out = match dtype {
         Dtype::F32 => data
             .chunks_exact(4)

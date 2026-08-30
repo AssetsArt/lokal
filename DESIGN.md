@@ -190,6 +190,76 @@ one-time Python export step and keeps the runtime pure Rust + Core ML.
   we check with the MLComputePlan API (1,733 ops on the NeuralEngine device,
   6 on the CPU for SmolLM2-135M) and `powermetrics --samplers ane_power`.
 
+## Lowmem backend (disk-backed, bounded memory)
+
+`-b lowmem` is a different philosophy from metal/hybrid: those move the whole
+model onto the GPU and win on speed; lowmem promises a **bounded, predictable
+footprint** — including for models larger than RAM — and accepts what that
+costs. It is not "metal with less RAM" but a disk-backed, bounded-memory
+inference engine that trades model/context capability for predictable memory
+use and speed.
+
+**The physics the numbers must respect.** Decode reads every weight once per
+token. When the model exceeds RAM, that read comes from disk: decode tok/s ≈
+SSD_read_BW / model_bytes ≈ 5.5 GB/s / 29 GB ≈ **0.2 tok/s** for a 14B-class
+model on a 16 GB machine. That is not a defect of this backend, it is the
+physics of model>RAM autoregression; llama.cpp under the same constraint
+behaves the same. Prefill amortizes each weight read over a whole chunk
+(512 tokens per read), so the same disk stream supports ~100 tok/s prefill.
+The backend's value: (a) it works at all where metal OOMs, with a flat,
+predictable footprint; (b) a model that fits RAM but exceeds the budget runs
+mostly from page cache at near-metal speed with a bounded footprint. Never
+publish a number that hides this asymmetry.
+
+Four pieces (all in `src/lowmem/`):
+
+- **WeightManifest** (manifest.rs): every safetensors shard mmapped once,
+  headers parsed to a name → {dtype, shape, byte range} table. Nothing is read
+  up front; the mmap is the source of truth and the OS is free to drop clean
+  pages under pressure — which is what lets a 29 GB model open on 16 GB.
+- **WeightPool** (pool.rs): an LRU byte budget of staged pages. A page is a
+  row block (≤ 16 MB) of one tensor, converted bf16→f16 on its way into an
+  exactly-sized shared MTLBuffer; there is never a whole-tensor (let alone
+  whole-model) copy in RAM. Pages referenced by the command buffer being
+  encoded are pinned; pages referenced by in-flight command buffers are
+  protected by an epoch stamp until the GPU finishes. Every weight matmul
+  dispatches per row block, so even the ~1.5 GB lm_head of a 14B model never
+  needs to be resident at once.
+- **The forward pass** (forward.rs): one command buffer per layer, committed
+  WITHOUT waiting — while the GPU runs layer N, the CPU stages layer N+1's
+  pages from the mmap (the overlap that hides disk latency). The embedding
+  lookup is a CPU-side gather straight from the mmap: a chunk touches at most
+  512 scattered rows, which never justifies a resident vocab × hidden table.
+- **Windowed attention with sinks**: the KV store per layer is a sink region
+  (positions 0..4 pinned forever, StreamingLLM-style — without them coherence
+  collapses a few hundred tokens past the window) plus a ring holding the last
+  window of positions. Each query attends its last `--context-window` (2048)
+  tokens plus the sinks; older KV is simply overwritten — dropped, never
+  spilled (an evicted token can never be attended again, so a disk tier would
+  be dead code). Storage is closed-form in the window and independent of
+  context length, and so is the attention walk — which is why prefill
+  throughput is flat from 2k to 32k instead of collapsing quadratically.
+  The kernels are the same flash/GQA-decode kernels the metal backend runs,
+  specialized through function constants; unspecialized they compile to
+  exactly the metal code.
+
+**Budget.** `--memory-budget` (4096 MB) splits closed-form: KV and activation
+scratch are computed exactly, a fixed overhead estimate covers the runtime,
+and the weight pool takes the rest; the split prints as one line at load, and
+an impossible budget refuses to start with the arithmetic in the message.
+Conformance is measured as **phys_footprint** (`vmmap -summary`), NOT ps RSS:
+file-backed clean mmap pages are reclaimable cache the OS keeps only while
+free RAM exists — counting them would report "over budget" for what is really
+the OS using otherwise-idle RAM as cache.
+
+**Positions caveat.** RoPE uses true absolute positions (cache-relative
+repositioning is future work): past a model's trained range quality degrades —
+an accepted trade; long-context verification therefore runs on Qwen2.5 models
+(trained to 32k) where absolute positions stay in-distribution. Output for
+prompts within the window is mathematically full causal attention (byte-equal
+to `-b metal` in practice); beyond it, quality reduction is the documented,
+intentional trade.
+
 ## Numerics and correctness
 
 - Reference path: f32 everywhere.

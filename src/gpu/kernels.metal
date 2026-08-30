@@ -50,11 +50,39 @@ kernel void embed(
 // memory-bandwidth-bound, and wide loads are what gets a small kernel near peak
 // bandwidth. A scalar tail handles in_dim % 4 (zero for every supported model).
 
+// -b lowmem direct-read specialization: with LM_W_BF16 set, the matvec family
+// reads its weight buffer as RAW bf16 checkpoint bytes (bound over the mmap's
+// no-copy view — pages the pool has no room for stream straight from the page
+// cache, touching the bus once instead of thrice). Every value still rounds
+// through f16 on the way into the dot product, so results are bit-identical
+// to the staged path. Unspecialized pipelines fold the branch away.
+constant bool LM_W_BF16_FC [[function_constant(24)]];
+constant bool LM_W_BF16 = is_function_constant_defined(LM_W_BF16_FC) && LM_W_BF16_FC;
+
 inline float dot_wx(device const half *w_row, device const float *x, uint in_dim, uint lane) {
+    float acc = 0.0f;
+    if (LM_W_BF16) {
+        // ushort2 keeps 4-byte alignment for any 4-aligned tensor offset
+        // (the host falls back to staging when a span is odder than that).
+        device const ushort2 *w2 = (device const ushort2 *)w_row;
+        device const float2 *x2 = (device const float2 *)x;
+        uint n2 = in_dim / 2;
+#pragma clang loop unroll_count(4)
+        for (uint i = lane; i < n2; i += 32) {
+            ushort2 wb = w2[i];
+            half2 h = half2((half)as_type<float>((uint)wb.x << 16),
+                            (half)as_type<float>((uint)wb.y << 16));
+            acc += dot(float2(h), x2[i]);
+        }
+        for (uint i = n2 * 2 + lane; i < in_dim; i += 32) {
+            device const ushort *wu = (device const ushort *)w_row;
+            acc += (float)(half)as_type<float>((uint)wu[i] << 16) * x[i];
+        }
+        return acc;
+    }
     device const half4 *w4 = (device const half4 *)w_row;
     device const float4 *x4 = (device const float4 *)x;
     uint n4 = in_dim / 4;
-    float acc = 0.0f;
     // Partially unrolled so the scheduler can keep several loads in flight —
     // this loop is where decode spends its memory-bound time.
 #pragma clang loop unroll_count(4)
@@ -232,6 +260,8 @@ struct MatmulParams {
     uint n_rows;
 };
 
+// NOTE: matmul_pg below is this kernel plus a y_stride — a fix or improvement
+// in one belongs in both, or lowmem numerics silently drift from metal's.
 kernel void matmul(
     device const half *w [[buffer(0)]],
     device const half *bias [[buffer(1)]],
@@ -340,6 +370,121 @@ kernel void matmul(
             uint go = out0 + n;
             if (gr < p.n_rows && go < p.out_dim) {
                 y[(ulong)gr * p.out_dim + go] = Cs[m * MM_TN + n];
+            }
+        }
+    }
+}
+
+// Paged-tensor matmul (-b lowmem): identical algorithm to `matmul` above (keep
+// them in sync — that kernel is the source of truth), with one difference: the
+// weight buffer holds only a ROW BLOCK of the full tensor (a pool page), so the
+// output columns this dispatch produces land inside a wider row. `out_dim` is
+// the block's row count (guards + W indexing), `y_stride` the full output width;
+// the y/bias buffers are bound with a byte offset selecting the block's columns.
+struct MatmulPagedParams {
+    uint in_dim;
+    uint out_dim;   // rows in this weight block = output columns produced here
+    uint n_rows;
+    uint y_stride;  // full out_dim of the logical tensor
+};
+
+kernel void matmul_pg(
+    device const half *w [[buffer(0)]],
+    device const half *bias [[buffer(1)]],
+    device const float *x [[buffer(2)]],
+    device float *y [[buffer(3)]],
+    constant MatmulPagedParams &p [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint2 tpos [[thread_position_in_threadgroup]])
+{
+    uint tid = tpos.x;
+    uint sgid = tid / 32;
+    uint out0 = tgid.x * MM_TN;
+    uint row0 = tgid.y * MM_TM;
+
+    threadgroup float shared_[2048];
+    threadgroup half *sa = (threadgroup half *)shared_;
+    threadgroup half *sb = (threadgroup half *)(shared_ + 1024);
+    threadgroup float *biasTile = shared_ + 1536;
+    threadgroup float *Cs = shared_;
+
+    for (uint idx = tid; idx < 8 * MM_TN; idx += MM_THREADS) {
+        uint o = idx % MM_TN;
+        biasTile[idx] = (out0 + o < p.out_dim) ? (float)bias[out0 + o] : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (uint i = 0; i < 8; i++) {
+        simdgroup_load(mc[i], biasTile + (sgid % 2) * 32 + (i % 4) * 8, MM_TN);
+    }
+
+    uint w_row = tid / 2;
+    uint w_strip = tid % 2;
+    uint x_row = tid / 4;
+    uint x_blk = tid % 4;
+
+    for (uint k0 = 0; k0 < p.in_dim; k0 += MM_TK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < 16; i++) {
+            uint gk = k0 + w_strip * 16 + i;
+            uint go = out0 + w_row;
+            half v = (go < p.out_dim && gk < p.in_dim) ? w[(ulong)go * p.in_dim + gk] : 0.0h;
+            uint ib = 8 * (2 * w_strip + i / 8) + w_row / 8;
+            sa[64 * ib + 8 * (i % 8) + w_row % 8] = v;
+        }
+        for (uint i = 0; i < 8; i++) {
+            uint gk = k0 + x_blk * 8 + i;
+            uint gr = row0 + x_row;
+            half v = (gr < p.n_rows && gk < p.in_dim) ? (half)x[(ulong)gr * p.in_dim + gk] : 0.0h;
+            uint ib = 4 * x_blk + x_row / 8;
+            sb[64 * ib + 8 * (x_row % 8) + i] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half *lsma = sa + 4 * 64 * (sgid % 2);
+        threadgroup const half *lsmb = sb + 2 * 64 * (sgid / 2);
+        for (uint ik = 0; ik < MM_TK / 8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (uint i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, ulong2(0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            for (uint i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, ulong2(0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            for (uint i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    if (row0 + MM_TM <= p.n_rows && out0 + MM_TN <= p.out_dim) {
+        for (uint i = 0; i < 8; i++) {
+            ulong gr = row0 + (sgid / 2) * 16 + (i / 4) * 8;
+            ulong go = out0 + (sgid % 2) * 32 + (i % 4) * 8;
+            simdgroup_store(mc[i], y + gr * p.y_stride + go, p.y_stride);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < 8; i++) {
+            uint t0 = (sgid / 2) * 16 + (i / 4) * 8;
+            uint o0 = (sgid % 2) * 32 + (i % 4) * 8;
+            simdgroup_store(mc[i], Cs + t0 * MM_TN + o0, MM_TN);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < MM_TM * MM_TN; idx += MM_THREADS) {
+            uint m = idx / MM_TN;
+            uint n = idx % MM_TN;
+            uint gr = row0 + m;
+            uint go = out0 + n;
+            if (gr < p.n_rows && go < p.out_dim) {
+                y[(ulong)gr * p.y_stride + go] = Cs[m * MM_TN + n];
             }
         }
     }
@@ -863,11 +1008,47 @@ kernel void rope_qk_decode(
     }
 }
 
+// ---------- windowed attention (-b lowmem), as function constants ----------
+// The lowmem backend's KV store is a SINK region (slots [0, LM_SINKPAD), holding
+// pinned positions 0..LM_SINK) followed by a RING of LM_RING slots holding the
+// last window of positions: slot(p) = LM_SINKPAD + (p - LM_SINK) % LM_RING.
+// Each query attends its last LM_WINDOW positions plus the sinks (StreamingLLM
+// shape — sinks prevent the well-documented post-window collapse). The three
+// attention kernels below gain windowed variants through these constants; left
+// undefined (every existing metal/hybrid pipeline) the branches fold away and
+// the kernels compile exactly as before.
+constant uint LM_SINK [[function_constant(20)]];    // pinned sink tokens S
+constant uint LM_SINKPAD [[function_constant(21)]]; // sink region width, 128-aligned
+constant uint LM_RING [[function_constant(22)]];    // ring slots R, 128-aligned
+constant uint LM_WINDOW [[function_constant(23)]];  // window W
+constant bool LM_WINDOWED = is_function_constant_defined(LM_RING);
+
+// Absolute position held by buffer slot `s` once `f` tokens exist (frontier —
+// every position < f is written), or UINT_MAX for a slot holding nothing.
+// The ring slot's position is the LATEST p < f with (p - LM_SINK) % LM_RING
+// matching; padding slots between LM_SINK and LM_SINKPAD are never written.
+inline uint lm_slot_pos(uint s, uint f) {
+    if (s < LM_SINKPAD) {
+        return (s < LM_SINK && s < f) ? s : 0xFFFFFFFFu;
+    }
+    uint rel = s - LM_SINKPAD;
+    if (f <= LM_SINK + rel) {
+        return 0xFFFFFFFFu;
+    }
+    return LM_SINK + rel + ((f - 1 - LM_SINK - rel) / LM_RING) * LM_RING;
+}
+
+// May the query at position qp attend position t? (UINT_MAX fails t <= qp.)
+inline bool lm_attend(uint t, uint qp) {
+    return t <= qp && (t + LM_WINDOW > qp || t < LM_SINK);
+}
+
 // ---------- attention (model.rs::attention) ----------
 // One threadgroup per (query head, query row): the same three phases as the CPU code —
 // scores → softmax → weighted sum of V — with barriers making each phase's results
 // visible before the next. The causal mask falls out of the loop bound: the row at
-// position q_pos only iterates over 0..=q_pos.
+// position q_pos only iterates over 0..=q_pos. The windowed variant walks the
+// bounded slot buffer instead and masks by reconstructed position.
 
 #define ATTN_TG 256
 
@@ -905,11 +1086,18 @@ kernel void attention(
     // combine) — a couple of barriers instead of a log2(256)-step tree.
     threadgroup float red[ATTN_TG / 32];
 
-    // Phase 1: q·k score for every position 0..=q_pos, tracking the max for a stable
-    // exp. Wide loads when head_dim allows (it does for every supported model).
+    // Phase 1: q·k score for every position 0..=q_pos (windowed: every slot of
+    // the bounded store, masked by reconstructed position), tracking the max for
+    // a stable exp. Wide loads when head_dim allows (every supported model).
+    uint t_lim = LM_WINDOWED ? (LM_SINKPAD + LM_RING) : (q_pos + 1);
+    uint frontier = p.pos0 + p.n_rows;
     bool vec4 = (hd % 4) == 0;
     float local_max = -INFINITY;
-    for (uint t = tid; t <= q_pos; t += ATTN_TG) {
+    for (uint t = tid; t < t_lim; t += ATTN_TG) {
+        if (LM_WINDOWED && !lm_attend(lm_slot_pos(t, frontier), q_pos)) {
+            sc[t] = -INFINITY;
+            continue;
+        }
         device const half *k_t = k_cache + (ulong)t * kvd + kv_off;
         float d = 0.0f;
         if (vec4) {
@@ -943,9 +1131,10 @@ kernel void attention(
     float score_max = red[0];
     threadgroup_barrier(mem_flags::mem_threadgroup); // red[] is reused — wait until everyone read red[0]
 
-    // Phase 2: exponentiate and sum (the softmax denominator).
+    // Phase 2: exponentiate and sum (the softmax denominator). Masked slots
+    // hold -inf and exponentiate to an exact 0 weight.
     float local_sum = 0.0f;
-    for (uint t = tid; t <= q_pos; t += ATTN_TG) {
+    for (uint t = tid; t < t_lim; t += ATTN_TG) {
         float e = exp(sc[t] - score_max);
         sc[t] = e;
         local_sum += e;
@@ -977,7 +1166,7 @@ kernel void attention(
         uint pl = tid / hd;
         uint di = tid % hd;
         float acc = 0.0f;
-        for (uint t = pl; t <= q_pos; t += pn) {
+        for (uint t = pl; t < t_lim; t += pn) {
             acc += sc[t] * (float)v_cache[(ulong)t * kvd + kv_off + di];
         }
         acc_red[tid] = acc;
@@ -993,7 +1182,7 @@ kernel void attention(
         // Fallback for exotic head sizes: one thread per output dimension.
         for (uint i = tid; i < hd; i += ATTN_TG) {
             float acc = 0.0f;
-            for (uint t = 0; t <= q_pos; t++) {
+            for (uint t = 0; t < t_lim; t++) {
                 acc += sc[t] * (float)v_cache[(ulong)t * kvd + kv_off + i];
             }
             out[(ulong)row * p.n_heads * hd + head * hd + i] = acc / score_sum;
@@ -1096,10 +1285,14 @@ kernel void attention_prefill_flash(
     }
 
     // With 8-row tiles the causal loop bound is tight per tile: positions past
-    // the tile's last query row are never visited at all.
+    // the tile's last query row are never visited at all. The windowed variant
+    // instead walks the WHOLE bounded slot store (sinks + ring) — that width is
+    // a constant, which is exactly what makes windowed prefill cost flat.
     uint t_hi = p.pos0 + min(r0 + FA_Q, p.n_rows);
+    uint t_walk = LM_WINDOWED ? (LM_SINKPAD + LM_RING) : t_hi;
+    uint frontier = p.pos0 + p.n_rows;
 
-    for (uint t0 = 0; t0 < t_hi; t0 += FA_C) {
+    for (uint t0 = 0; t0 < t_walk; t0 += FA_C) {
         // Phase 1 — S = Q·K^T: simdgroup sgid owns FA_C/8/FA_NSG score columns.
         // K blocks load in pairs so the compiler batches the device reads ahead
         // of the two MMAs (the issue pattern llama.cpp's fa kernel relies on).
@@ -1125,7 +1318,9 @@ kernel void attention_prefill_flash(
         // inside the causal region every position of the tile is valid for every
         // row, so the mask arithmetic drops out of the hot path entirely (the
         // guarded path computes identical values — the guards are all true).
-        bool tile_full = (t0 + FA_C <= p.pos0 + r0) && (r0 + FA_Q <= p.n_rows);
+        // Windowed pipelines always take the guarded path, with validity coming
+        // from the slot's reconstructed position instead of the causal bound.
+        bool tile_full = !LM_WINDOWED && (t0 + FA_C <= p.pos0 + r0) && (r0 + FA_Q <= p.n_rows);
         for (uint rr = sgid * (FA_Q / FA_NSG); rr < (sgid + 1) * (FA_Q / FA_NSG); rr++) {
             uint gr_s = r0 + rr;
             uint q_pos = p.pos0 + gr_s;
@@ -1138,7 +1333,10 @@ kernel void attention_prefill_flash(
             } else {
                 for (uint j = lane; j < FA_C; j += 32) {
                     uint t = t0 + j;
-                    if (row_live && t <= q_pos && t < t_hi) {
+                    bool valid = LM_WINDOWED
+                        ? (row_live && lm_attend(lm_slot_pos(t, frontier), q_pos))
+                        : (row_live && t <= q_pos && t < t_hi);
+                    if (valid) {
                         lmax = max(lmax, S[rr * FA_C + j] * scale);
                     }
                 }
@@ -1157,7 +1355,13 @@ kernel void attention_prefill_flash(
             } else {
                 for (uint j = lane; j < FA_C; j += 32) {
                     uint t = t0 + j;
-                    bool valid = row_live && t <= q_pos && t < t_hi;
+                    bool valid = LM_WINDOWED
+                        ? (row_live && lm_attend(lm_slot_pos(t, frontier), q_pos))
+                        : (row_live && t <= q_pos && t < t_hi);
+                    // A row can meet a tile with no valid columns at all
+                    // (padding or not-yet-written ring slots): m_new stays
+                    // -inf there, and exp(-inf - -inf) would be NaN — the
+                    // valid guard forces those weights to an exact 0.
                     float pv = valid ? exp(S[rr * FA_C + j] * scale - m_new) : 0.0f;
                     P[rr * FA_C + j] = (half)pv;
                     lsum += pv;
@@ -1257,11 +1461,13 @@ struct GqaPartial {
 // kv head once, scoring q heads head_base..head_base+local_n against it. Leaves the
 // exp-weighted V partials in acc_red (summed over position lanes by the caller) and
 // returns m/l per head. Entries for g >= local_n are garbage — callers skip them.
+// `qpos` is the query's position — only the windowed variant reads it, to mask
+// slots by their reconstructed absolute position.
 static GqaPartial attn_dec_gqa_walk(
     device const float *q_base, // first q row of the group (rows contiguous, stride hd)
     device const half *k_cache, // this sequence's cache (slot base already applied)
     device const half *v_cache,
-    uint kvd, uint kv_off, uint hd, uint local_n, uint t0, uint t_end, uint tid,
+    uint kvd, uint kv_off, uint hd, uint local_n, uint t0, uint t_end, uint qpos, uint tid,
     threadgroup float *q_s,     // [GQA_CHUNK × hd] staged q rows
     threadgroup float *es,      // [GQA_CHUNK × ATTN_SPLIT] exp(score - m)
     threadgroup float *acc_red, // [DEC_TG × ACC_STRIDE] phase-3 partial sums
@@ -1282,7 +1488,11 @@ static GqaPartial attn_dec_gqa_walk(
     for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
         sc[g] = -INFINITY;
     }
-    if (t < t_end) {
+    bool live = t < t_end;
+    if (LM_WINDOWED && live) {
+        live = lm_attend(lm_slot_pos(t, qpos + 1), qpos);
+    }
+    if (live) {
         // Wide loads: head_dim is a multiple of 4 in every supported model.
         device const half4 *k_t = (device const half4 *)(k_cache + (ulong)t * kvd + kv_off);
         float d[MAX_GQA_CHUNK] = {};
@@ -1326,9 +1536,11 @@ static GqaPartial attn_dec_gqa_walk(
     }
 
     // exp(score - m) per head (kept in es for phase 3), then the per-head sum.
+    // The windowed variant guards on the score itself: a split whose every slot
+    // is masked has m = -inf, and exp(-inf - -inf) would be NaN.
     for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
         if (g < GQA_CHUNK) {
-            float e = (t < t_end) ? exp(sc[g] - o.m[g]) : 0.0f;
+            float e = (LM_WINDOWED ? live : (t < t_end)) ? exp(sc[g] - o.m[g]) : 0.0f;
             es[g * ATTN_SPLIT + tid] = e;
             float ss = simd_sum(e);
             if (tid % 32 == 0) {
@@ -1401,10 +1613,11 @@ kernel void attention_decode_partial(
     uint head_base = kvh * group + gc * GQA_CHUNK;
     uint local_n = min(GQA_CHUNK, group - gc * GQA_CHUNK);
     uint t0 = tg.y * ATTN_SPLIT;
-    uint t_end = min(t0 + ATTN_SPLIT, p.pos + 1); // exclusive
+    uint lim = LM_WINDOWED ? (LM_SINKPAD + LM_RING) : (p.pos + 1);
+    uint t_end = min(t0 + ATTN_SPLIT, lim); // exclusive
 
     GqaPartial o = attn_dec_gqa_walk(q + head_base * hd, k_cache, v_cache,
-        p.n_kv_heads * hd, kvh * hd, hd, local_n, t0, t_end, tid, q_s, es, acc_red, red);
+        p.n_kv_heads * hd, kvh * hd, hd, local_n, t0, t_end, p.pos, tid, q_s, es, acc_red, red);
 
     device float *out = partials + ((ulong)head_base * p.n_splits + tg.y) * (hd + 2);
     ulong head_stride = (ulong)p.n_splits * (hd + 2);
@@ -1670,7 +1883,7 @@ kernel void attention_decode_partial_batch(
     ulong base = (ulong)meta[b].slot * p.max_seq * p.kv_dim;
 
     GqaPartial o = attn_dec_gqa_walk(q + ((ulong)b * p.n_heads + head_base) * hd,
-        k_cache + base, v_cache + base, p.kv_dim, kvh * hd, hd, local_n, t0, t_end, tid,
+        k_cache + base, v_cache + base, p.kv_dim, kvh * hd, hd, local_n, t0, t_end, pos, tid,
         q_s, es, acc_red, red);
 
     device float *out = partials
@@ -1764,6 +1977,32 @@ kernel void silu_mul_hf(
     float v = (g / (1.0f + exp(-g))) * up[gid];
     gate[gid] = v;
     gate_h[gid] = (half)v;
+}
+
+// -b lowmem stage-in: convert a weight page's raw bf16 bits — read STRAIGHT
+// from the checkpoint's mmap through a no-copy buffer — into its f16 pool page.
+// bf16 → f32 is an exact bit shift; f32 → f16 rounds to nearest even, the same
+// two steps the CPU path takes, so the staged values are identical while the
+// CPU's share of staging drops to zero (the OS pages the file in under the
+// GPU's reads). p.x = element count, p.y = element offset after the 4-byte
+// buffer-offset alignment. A value past f16 range flips the flag for the
+// host's once-only warning.
+kernel void bf16_to_f16_copy(
+    device const ushort *src [[buffer(0)]],
+    device half *dst [[buffer(1)]],
+    constant uint2 &p [[buffer(2)]],
+    device atomic_uint *clip [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= p.x) {
+        return;
+    }
+    float v = as_type<float>((uint)src[p.y + gid] << 16);
+    half h = (half)v;
+    if (isinf(h) && !isinf(v)) {
+        atomic_store_explicit(clip, 1u, memory_order_relaxed);
+    }
+    dst[gid] = h;
 }
 
 // x += y  (residual connection)

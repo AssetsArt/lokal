@@ -25,7 +25,7 @@ use metal::{
 /// Maximum tokens processed together during prefill (one command buffer per chunk).
 /// Bigger chunks amortize weight reads better but grow the scratch buffers
 /// (the attention scores buffer in particular).
-const PREFILL_CHUNK: usize = 512;
+pub(crate) const PREFILL_CHUNK: usize = 512;
 
 // ---------- kernel parameters passed via set_bytes — must match the MSL structs exactly ----------
 
@@ -174,18 +174,18 @@ struct Pipelines {
 }
 
 /// Cached positions per flash-decoding window — must match ATTN_SPLIT in kernels.metal.
-const ATTN_SPLIT: usize = 128;
+pub(crate) const ATTN_SPLIT: usize = 128;
 /// Threads per decode-attention threadgroup — must match DEC_TG in kernels.metal.
-const DEC_TG: usize = 128;
+pub(crate) const DEC_TG: usize = 128;
 /// Max q heads one GQA decode threadgroup covers — must match MAX_GQA_CHUNK in kernels.metal.
-const MAX_GQA_CHUNK: usize = 8;
+pub(crate) const MAX_GQA_CHUNK: usize = 8;
 /// The head_dim the flash prefill attention kernel is specialized for (FA_HD in
 /// kernels.metal); other head sizes take the scores-scratch fallback kernel.
-const FLASH_HEAD_DIM: usize = 64;
+pub(crate) const FLASH_HEAD_DIM: usize = 64;
 /// Flash kernel dispatch geometry (FA_Q / FA_C / FA_THREADS in the shader).
-const FLASH_Q: usize = 8;
-const FLASH_C: usize = 64;
-const FLASH_THREADS: usize = 128;
+pub(crate) const FLASH_Q: usize = 8;
+pub(crate) const FLASH_C: usize = 64;
+pub(crate) const FLASH_THREADS: usize = 128;
 /// Token-rows per tensor-ops matmul tile (MM_TROWS in the shader).
 const MM_TILE_ROWS: usize = 64;
 /// Max rows the logits buffer holds — the ceiling for one speculative verify batch.
@@ -231,10 +231,20 @@ pub struct MetalEngine {
 unsafe impl Send for MetalEngine {}
 unsafe impl Sync for MetalEngine {}
 
+/// The full shader source with its injected compile-time constants — the one
+/// place the #define preamble lives (the lowmem backend compiles its own
+/// pipeline set from the same string).
+pub(crate) fn shader_source(kvd: usize) -> String {
+    format!(
+        "#define MM_TROWS {MM_TILE_ROWS}\n#define FA_KVD {kvd}\n{}",
+        include_str!("kernels.metal")
+    )
+}
+
 /// Convert f32 → f16 and upload as a GPU buffer. StorageModeShared means unified
 /// memory: on M-series chips the CPU and GPU see the same bytes — no PCIe copies
 /// like on discrete GPUs.
-fn f16_buffer(device: &Device, data: &[f32]) -> Buffer {
+pub(crate) fn f16_buffer(device: &Device, data: &[f32]) -> Buffer {
     let halves: Vec<u16> = data.iter().map(|&v| f16::from_f32(v).to_bits()).collect();
     device.new_buffer_with_data(
         halves.as_ptr() as *const _,
@@ -243,7 +253,7 @@ fn f16_buffer(device: &Device, data: &[f32]) -> Buffer {
     )
 }
 
-fn f32_buffer(device: &Device, len: usize) -> Buffer {
+pub(crate) fn f32_buffer(device: &Device, len: usize) -> Buffer {
     device.new_buffer((len * 4) as u64, MTLResourceOptions::StorageModeShared)
 }
 
@@ -253,7 +263,7 @@ fn f32_buffer(device: &Device, len: usize) -> Buffer {
 /// scores never reach the output, but the P·V accumulate still multiplies the
 /// raw values by zero — and 0 x NaN is NaN, so uninitialized rows must not be
 /// able to hold NaN bit patterns.
-fn f16_empty_buffer(device: &Device, len: usize) -> Buffer {
+pub(crate) fn f16_empty_buffer(device: &Device, len: usize) -> Buffer {
     let buf = device.new_buffer((len * 2) as u64, MTLResourceOptions::StorageModeShared);
     unsafe { std::ptr::write_bytes(buf.contents() as *mut u8, 0, len * 2) };
     buf
@@ -267,17 +277,22 @@ impl MetalEngine {
 
         // Kernels are compiled at runtime — edit kernels.metal and just cargo run again.
         let lib = device
-            .new_library_with_source(
-                &format!(
-                    "#define MM_TROWS {MM_TILE_ROWS}\n#define FA_KVD {kvd}\n{}",
-                    include_str!("kernels.metal"),
-                    kvd = model.cfg.kv_dim(),
-                ),
-                &CompileOptions::new(),
-            )
+            .new_library_with_source(&shader_source(model.cfg.kv_dim()), &CompileOptions::new())
             .map_err(|e| format!("failed to compile kernels.metal: {e}"))?;
         let pipe = |name: &str| -> crate::Result<ComputePipelineState> {
             let f = lib.get_function(name, None).map_err(|e| format!("kernel {name}: {e}"))?;
+            device
+                .new_compute_pipeline_state_with_function(&f)
+                .map_err(|e| format!("kernel {name}: {e}").into())
+        };
+        // Kernels that REFERENCE function constants (the lowmem LM_* window set)
+        // must be built through the specialization API even with no constant
+        // set: the empty set resolves is_function_constant_defined() to false
+        // and compiles exactly the unwindowed code this backend always ran.
+        let default_spec = |name: &str| -> crate::Result<ComputePipelineState> {
+            let f = lib
+                .get_function(name, Some(FunctionConstantValues::new()))
+                .map_err(|e| format!("kernel {name}: {e}"))?;
             device
                 .new_compute_pipeline_state_with_function(&f)
                 .map_err(|e| format!("kernel {name}: {e}").into())
@@ -303,11 +318,14 @@ impl MetalEngine {
         };
         let pipes = Pipelines {
             embed: pipe("embed")?,
-            matvec: pipe("matvec")?,
-            matvec_acc: pipe("matvec_acc")?,
-            matvec_swiglu: pipe("matvec_swiglu")?,
-            matvec_qkv: pipe("matvec_qkv")?,
-            matvec_h: pipe("matvec_h")?,
+            // The matvec family references the lowmem LM_W_BF16 function
+            // constant through dot_wx — unspecialized builds are refused, so
+            // these take the empty specialization (identical code).
+            matvec: default_spec("matvec")?,
+            matvec_acc: default_spec("matvec_acc")?,
+            matvec_swiglu: default_spec("matvec_swiglu")?,
+            matvec_qkv: default_spec("matvec_qkv")?,
+            matvec_h: default_spec("matvec_h")?,
             matmul: pipe("matmul")?,
             matmul_t: pipe("matmul_t")?,
             matmul_th: pipe("matmul_th")?,
@@ -322,15 +340,15 @@ impl MetalEngine {
             rope_qk_prefill: pipe("rope_qk_prefill")?,
             matmul_tb: pipe("matmul_tb")?,
             rope_qk_decode: pipe("rope_qk_decode")?,
-            attention: pipe("attention")?,
-            attention_prefill_flash: pipe("attention_prefill_flash")?,
+            attention: default_spec("attention")?,
+            attention_prefill_flash: default_spec("attention_prefill_flash")?,
             attention_decode_partial: gqa_pipe("attention_decode_partial")?,
             attention_decode_reduce: pipe("attention_decode_reduce")?,
             silu_mul: pipe("silu_mul")?,
             add_inplace: pipe("add_inplace")?,
-            matvec_qkv_batch: pipe("matvec_qkv_batch")?,
-            matvec_acc_batch: pipe("matvec_acc_batch")?,
-            matvec_swiglu_batch: pipe("matvec_swiglu_batch")?,
+            matvec_qkv_batch: default_spec("matvec_qkv_batch")?,
+            matvec_acc_batch: default_spec("matvec_acc_batch")?,
+            matvec_swiglu_batch: default_spec("matvec_swiglu_batch")?,
             rope_qk_batch: pipe("rope_qk_batch")?,
             attention_decode_partial_batch: gqa_pipe("attention_decode_partial_batch")?,
             attention_decode_reduce_batch: pipe("attention_decode_reduce_batch")?,
@@ -794,26 +812,8 @@ impl MetalEngine {
         );
     }
 
-    /// Grid width and threadgroup memory sizes for the GQA-aware decode partial
-    /// kernels: one threadgroup per (kv head × group chunk, window), covering up to
-    /// MAX_GQA_CHUNK q heads of one kv head's group.
     fn gqa_decode_dims(&self) -> (u64, [u64; 4]) {
-        let cfg = &self.cfg;
-        let group = cfg.num_attention_heads / cfg.num_key_value_heads;
-        let chunk = group.min(MAX_GQA_CHUNK);
-        let grid_x = (cfg.num_key_value_heads * group.div_ceil(chunk)) as u64;
-        // Sizes must mirror the kernel's q_s / es / acc_red / red layouts, padded to
-        // Metal's 16-byte threadgroup-allocation granularity.
-        let f32s = |n: usize| (n * 4).next_multiple_of(16) as u64;
-        (
-            grid_x,
-            [
-                f32s(chunk * cfg.head_dim()),
-                f32s(chunk * ATTN_SPLIT),
-                f32s(DEC_TG * (chunk | 1)),
-                f32s(chunk * (DEC_TG / 32) + chunk),
-            ],
-        )
+        gqa_decode_dims(&self.cfg)
     }
 
     fn enc_elementwise(
@@ -833,15 +833,37 @@ impl MetalEngine {
     }
 }
 
+/// Grid width and threadgroup memory sizes for the GQA-aware decode partial
+/// kernels: one threadgroup per (kv head × group chunk, window), covering up to
+/// MAX_GQA_CHUNK q heads of one kv head's group. Free function because the
+/// lowmem backend dispatches the same kernels from its own engine.
+pub(crate) fn gqa_decode_dims(cfg: &ModelConfig) -> (u64, [u64; 4]) {
+    let group = cfg.num_attention_heads / cfg.num_key_value_heads;
+    let chunk = group.min(MAX_GQA_CHUNK);
+    let grid_x = (cfg.num_key_value_heads * group.div_ceil(chunk)) as u64;
+    // Sizes must mirror the kernel's q_s / es / acc_red / red layouts, padded to
+    // Metal's 16-byte threadgroup-allocation granularity.
+    let f32s = |n: usize| (n * 4).next_multiple_of(16) as u64;
+    (
+        grid_x,
+        [
+            f32s(chunk * cfg.head_dim()),
+            f32s(chunk * ATTN_SPLIT),
+            f32s(DEC_TG * (chunk | 1)),
+            f32s(chunk * (DEC_TG / 32) + chunk),
+        ],
+    )
+}
+
 /// One-thread-per-element dispatch — kernels guard the tail with `if (gid < dim)`.
-fn dispatch_grid(enc: &ComputeCommandEncoderRef, n: usize) {
+pub(crate) fn dispatch_grid(enc: &ComputeCommandEncoderRef, n: usize) {
     let tg = 256u64;
     enc.dispatch_thread_groups(MTLSize::new((n as u64).div_ceil(tg), 1, 1), MTLSize::new(tg, 1, 1));
 }
 
 /// One-simdgroup-per-output-row dispatch, 4 rows per threadgroup — shared by every
 /// matvec-family kernel (they guard the tail with `if (row >= out_dim)`).
-fn dispatch_simdgroup_rows(enc: &ComputeCommandEncoderRef, rows: u32) {
+pub(crate) fn dispatch_simdgroup_rows(enc: &ComputeCommandEncoderRef, rows: u32) {
     let rows_per_tg = 4u64;
     let tgs = (rows as u64).div_ceil(rows_per_tg);
     enc.dispatch_thread_groups(MTLSize::new(tgs, 1, 1), MTLSize::new(32 * rows_per_tg, 1, 1));

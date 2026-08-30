@@ -18,6 +18,8 @@ mod engine;
 mod generate;
 mod gpu;
 mod hub;
+#[cfg(target_os = "macos")]
+mod lowmem;
 mod math;
 mod model;
 mod sampler;
@@ -40,6 +42,7 @@ struct Args {
     graphs_path: bool,
     port: u16,
     max_concurrent: usize,
+    lowmem: engine::LowMemOpts,
     opt: GenOptions,
 }
 
@@ -54,7 +57,13 @@ Usage:
 Options:
   -m, --model <repo|dir>   Hugging Face repo or local directory [HuggingFaceTB/SmolLM2-135M]
       --draft <repo|dir>   smaller same-tokenizer model for speculative decoding (greedy only)
-  -b, --backend <name>     cpu, metal (Apple GPU), hybrid (Neural Engine + GPU together) [cpu]
+  -b, --backend <name>     cpu, metal (Apple GPU), hybrid (Neural Engine + GPU together),
+                           lowmem (disk-backed paged inference — optimized for models larger
+                           than available RAM; uses a bounded attention window and may reduce
+                           long-context quality) [cpu]
+      --memory-budget <MB> lowmem only: total working-set budget [4096]
+      --context-window <N> lowmem only: sliding attention window in tokens [2048]
+      --attention-sink <N> lowmem only: pinned initial tokens, 0 disables [4]
   -p, --prompt <text>      prompt text [\"Once upon a time\"]
   -n, --max-tokens <N>     maximum number of tokens to generate [200]
   -t, --temperature <T>    0 = greedy (fully deterministic), higher = more adventurous [0.7]
@@ -76,6 +85,7 @@ impl Args {
             graphs_path: false,
             port: 8080,
             max_concurrent: 4,
+            lowmem: engine::LowMemOpts::default(),
             opt: GenOptions { prompt: "Once upon a time".into(), ..Default::default() },
         };
         let mut it = std::env::args().skip(1);
@@ -96,6 +106,9 @@ impl Args {
                 "--chat" => a.opt.chat = true,
                 "--port" => a.port = val()?.parse()?,
                 "--max-concurrent" => a.max_concurrent = val()?.parse()?,
+                "--memory-budget" => a.lowmem.memory_budget_mb = Some(val()?.parse()?),
+                "--context-window" => a.lowmem.context_window = Some(val()?.parse()?),
+                "--attention-sink" => a.lowmem.attention_sink = Some(val()?.parse()?),
                 "-h" | "--help" => {
                     println!("{USAGE}");
                     std::process::exit(0);
@@ -139,22 +152,32 @@ fn run() -> Result<()> {
     let cfg = config::ModelConfig::load(&dir.join("config.json"))?;
     let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))?;
 
-    let t0 = Instant::now();
-    let model = model::Model::load(&dir, cfg.clone())?;
-    eprintln!(
-        "{} | {} layers | hidden {} | {} q heads / {} kv | vocab {} | {:.1}M params (loaded in {:.1}s)",
-        args.model,
-        cfg.num_hidden_layers,
-        cfg.hidden_size,
-        cfg.num_attention_heads,
-        cfg.num_key_value_heads,
-        cfg.vocab_size,
-        model.n_params as f64 / 1e6,
-        t0.elapsed().as_secs_f64(),
-    );
-
-    // Wrap the model in the selected backend (cpu uses it directly, metal uploads to the GPU).
-    let engine = engine::create(&args.backend, model, &dir)?;
+    // Wrap the model in the selected backend (cpu uses it directly, metal uploads
+    // to the GPU). lowmem builds itself from the model directory — it must never
+    // go through Model::load's full-RAM materialization (see src/lowmem/).
+    let engine = if args.backend == "lowmem" {
+        engine::create_lowmem(&dir, cfg.clone(), &args.lowmem)?
+    } else if args.lowmem.any_set() {
+        return Err(
+            "--memory-budget, --context-window, and --attention-sink apply to -b lowmem only"
+                .into(),
+        );
+    } else {
+        let t0 = Instant::now();
+        let model = model::Model::load(&dir, cfg.clone())?;
+        eprintln!(
+            "{} | {} layers | hidden {} | {} q heads / {} kv | vocab {} | {:.1}M params (loaded in {:.1}s)",
+            args.model,
+            cfg.num_hidden_layers,
+            cfg.hidden_size,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.vocab_size,
+            model.n_params as f64 / 1e6,
+            t0.elapsed().as_secs_f64(),
+        );
+        engine::create(&args.backend, model, &dir)?
+    };
     eprintln!("backend: {}", engine.name());
 
     // Optional draft model for speculative decoding. It must share the target's
@@ -174,7 +197,11 @@ fn run() -> Result<()> {
                 .into());
             }
             let dmodel = model::Model::load(&ddir, dcfg)?;
-            let dbackend = if args.backend == "hybrid" || args.backend == "ane" { "metal" } else { &args.backend };
+            // A draft model is small: composite/paged backends hand it plain metal.
+            let dbackend = match args.backend.as_str() {
+                "hybrid" | "ane" | "lowmem" => "metal",
+                b => b,
+            };
             let dengine = engine::create(dbackend, dmodel, &ddir)?;
             eprintln!("draft: {name} ({})", dengine.name());
             Some(dengine)
