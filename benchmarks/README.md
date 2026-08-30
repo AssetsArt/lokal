@@ -22,14 +22,14 @@ ones lokal loses — they exist to steer the roadmap, not to advertise.
 
 ## Results (2026-08-30)
 
-| engine | version | prefill (~500 tok) | decode | 4x concurrent aggregate |
-|---|---|---|---|---|
-| lokal `-b metal` | main | 0.34 s | 246 tok/s | 216 tok/s |
-| lokal `-b ane` | main | **0.06 s** | 234 tok/s | **374 tok/s** |
-| llama.cpp | b9960 | **0.06 s** | 172 tok/s ² | 314 tok/s |
-| oMLX | 0.6.3 | 0.12 s | **255 tok/s** | 322 tok/s |
-| vLLM Metal | 0.1.0 | 0.08 s | 253 tok/s ¹ | 217 tok/s ¹ |
-| SGLang | — | n/a: no macOS support | | |
+| engine | version | prefill (~500 tok) | prefill tok/s | decode | 4x concurrent aggregate |
+|---|---|---|---|---|---|
+| lokal `-b metal` | main | 0.34 s | 1,461 | 246 tok/s | 216 tok/s |
+| lokal `-b ane` | main | **0.06 s** | 8,617 | 234 tok/s | **374 tok/s** |
+| llama.cpp | b9960 | **0.06 s** | **8,792** | 172 tok/s ² | 314 tok/s |
+| oMLX | 0.6.3 | 0.12 s | 4,328 | **255 tok/s** | 322 tok/s |
+| vLLM Metal | 0.1.0 | 0.08 s | ~5,750 ¹ | 253 tok/s ¹ | 217 tok/s ¹ |
+| SGLang | — | n/a: no macOS support | | | |
 
 Before the decode-optimization pass (commit 05dbba1: pre flash-decoding
 attention, unfused kernels, scalar loads) lokal decoded at 76 tok/s and
