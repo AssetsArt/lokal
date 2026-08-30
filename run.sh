@@ -30,7 +30,7 @@ case "$cmd" in
     if [ -d "$MODEL" ]; then DIR="$MODEL"; else DIR="$("$BIN" path -m "$MODEL")"; fi
     echo "note: six front-half graphs, ~15-20 s to export and ~150 MB on disk each" >&2
     echo "      (every rung carries its own weight copy), plus one ANE compile per" >&2
-    echo "      rung on this machine's first load. Enable with LOKAL_SPLIT_PREFILL=1." >&2
+    echo "      rung on this machine's first load. Once exported, -b hybrid uses it." >&2
     # Exactly the ladder that was measured on 2026-08-30: stride 128 with 20 front
     # layers for short prompts, stride 256 with 15 for longer ones — the split point
     # moves with the chunk width because it is the GPU half that runs out of work
@@ -66,7 +66,7 @@ case "$cmd" in
     echo "  hybrid [text]   Neural Engine + GPU together, decode on Metal (needs export-ane once)"
     echo "  export-ane      build the Core ML prefill graphs (once per model)"
     echo "  export-ane-long add the long-context windowed graph (slow)"
-    echo "  export-ane-split add the split-prefill ladder, for LOKAL_SPLIT_PREFILL=1 (slow)"
+    echo "  export-ane-split add the split-prefill ladder that -b hybrid runs on (slow)"
     echo "  chat <question> Q&A against an Instruct model"
     echo "  serve [port]    start the HTTP server (default 8080)"
     echo "  test            run unit tests"

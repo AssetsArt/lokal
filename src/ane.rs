@@ -455,7 +455,7 @@ impl AneEngine {
 
 impl Engine for AneEngine {
     fn name(&self) -> &'static str {
-        "ane+metal"
+        "hybrid (ANE + Metal)"
     }
     fn config(&self) -> &ModelConfig {
         self.metal.config()
