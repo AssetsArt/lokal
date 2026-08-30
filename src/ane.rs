@@ -421,9 +421,23 @@ impl AneEngine {
             .iter()
             .map(|(path, seq)| CoreMlPrefill::load(path, *seq))
             .collect::<crate::Result<Vec<_>>>()?;
+        let win_on_disk = win.is_some();
+        // The windowed graph lost its reason to run (measured 2026-08-30, M1 Pro,
+        // Qwen2.5-0.5B): its 8,192-token head alone takes 7.94 s where Metal does
+        // the same head in ~4.5 s — and past the head both paths run the same
+        // Metal tail, so it cannot win at ANY prompt length on this hardware. It
+        // was the right choice when Metal prefill ran at 1,461 tok/s; Metal is
+        // now ~7x that. The graph also weighs ~0.9 GB in memory, which on a
+        // 16 GB machine with other servers resident is the difference between
+        // fitting and a SIGKILL. Loading it is opt-in for A/B archaeology:
+        // LOKAL_WINDOWED_PREFILL=1.
         let windowed = match win {
-            Some((path, s, p)) => Some(CoreMlWindowed::load(&path, s, p)?),
-            None => None,
+            Some((path, s, p))
+                if std::env::var("LOKAL_WINDOWED_PREFILL").is_ok_and(|v| v != "0" && !v.is_empty()) =>
+            {
+                Some(CoreMlWindowed::load(&path, s, p)?)
+            }
+            _ => None,
         };
         // The ladder loads whenever it exists: split prefill is what this backend
         // does, not a mode. A model with no front graphs (nothing to load) stays
@@ -452,6 +466,12 @@ impl AneEngine {
                 w.s, w.p
             ),
             None => eprintln!("ANE: loaded prefill graphs {shapes:?} (Core ML, compute = CPU+ANE)"),
+        }
+        if windowed.is_none() && win_on_disk {
+            eprintln!(
+                "ANE: windowed graph present but idle — Metal outruns it at every length on this \
+                 hardware (LOKAL_WINDOWED_PREFILL=1 loads it anyway)"
+            );
         }
         if !front.is_empty() {
             // Announce the routing once, here — prefill_split itself reports per
@@ -851,6 +871,23 @@ impl Session for AneSession<'_> {
         let largest = self.graphs.last().map(|g| g.seq).unwrap_or(0);
         if want > largest && self.windowed.is_some() {
             return self.prefill_chunked(ids, want);
+        }
+        // Plain-head guard: a padded head graph only pays while it beats Metal on
+        // the same rows, and that inverted for the big shapes when Metal got its
+        // 7x (measured 2026-08-30, Qwen: the S=2048 graph takes 0.86 s where
+        // Metal does those rows in ~0.66 s — so every no-ladder prompt that
+        // reached for it lost to `-b metal` outright, while the S=512 head still
+        // wins on both models). Past twice the smallest graph the head costs
+        // more than it saves: hand the whole prompt to Metal instead. A model
+        // with a split ladder never reaches this point for such lengths.
+        let smallest = self.graphs.first().map(|g| g.seq).unwrap_or(0);
+        if want > 2 * smallest {
+            eprintln!(
+                "  ANE skipped: {}-token prompt — Metal outruns the padded {largest}-token graph here \
+                 (export a split ladder to put the ANE back to work)",
+                ids.len()
+            );
+            return self.metal.prefill_from(ids, 0);
         }
         let g = pick_graph(self.graphs, want);
         let ane_n = want.min(g.seq);

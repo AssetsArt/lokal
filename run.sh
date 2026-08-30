@@ -28,19 +28,33 @@ case "$cmd" in
   export-ane-split) # ./run.sh export-ane-split [repo or dir]  — add the split-prefill ladder (slow)
     MODEL="${1:-HuggingFaceTB/SmolLM2-135M}"
     if [ -d "$MODEL" ]; then DIR="$MODEL"; else DIR="$("$BIN" path -m "$MODEL")"; fi
-    echo "note: eight front-half graphs, ~15-20 s to export and ~150 MB on disk each" >&2
-    echo "      (every rung carries its own weight copy), plus one ANE compile per" >&2
-    echo "      rung on this machine's first load. Once exported, -b hybrid uses it." >&2
-    # Exactly the ladder the 2026-08-30 curve was measured with: stride 128 with 20
-    # front layers for short prompts, stride 256 with 13 for longer ones (the split
-    # point moves with the chunk width; 15, 12 and 11 all measured slower at 256),
-    # a P=0 rung so the first chunk pays no past attention, and a 512 rung that
-    # closes the mid-band gap. Do not add rungs casually: the widest rung of a
-    # stride sets how far the ANE reaches (ane_total = s + p_max in ane.rs), so a
-    # new one silently changes which part of a prompt runs where.
+    # The ladder is per model, and so is its split point: where the GPU half
+    # binds, the ANE should carry more layers, and that balance moves with the
+    # chunk width AND the model shape. Every spec below is exactly what its
+    # model's published numbers were measured with (2026-08-30); an A sweep on
+    # each side of every value measured slower. Do not add rungs casually: the
+    # widest rung of a stride sets how far the ANE reaches (ane_total = s +
+    # p_max in ane.rs), so a new one silently changes which part of a prompt
+    # runs where. P=0 rungs let the first chunk skip the phantom past attention.
+    case "$MODEL" in
+      *[Qq]wen*)
+        # 24 layers x 896 hidden: stride 512, 9 front layers (8 and 10 both
+        # measured slower at 7.7k). ~500 MB per rung — the 272 MB embedding
+        # table rides along in every one.
+        SPEC=512x0x9,512x2048x9,512x4096x9,512x7168x9
+        N=four ;;
+      *)
+        # SmolLM2 (30 layers x 576 hidden) and the default for untested models:
+        # stride 128 @ 20 front layers short, stride 256 @ 13 beyond, long-band
+        # rungs so an 8k prompt still pipelines instead of draining to Metal.
+        SPEC=128x128x20,128x384x20,256x0x13,256x256x13,256x512x13,256x768x13,256x1280x13,256x2048x13,256x3072x13,256x4608x13,256x7168x13
+        N=eleven ;;
+    esac
+    echo "note: $N front-half graphs (every rung carries its own weight copy), plus one" >&2
+    echo "      ANE compile per rung on this machine's first load. Once exported," >&2
+    echo "      -b hybrid uses the ladder automatically." >&2
     exec uv run --python 3.12 --with torch --with coremltools --with safetensors --with numpy --with tokenizers \
-      tools/export_prefill.py "$DIR" --shapes none --window none \
-      --front 128x128x20,128x384x20,256x0x13,256x256x13,256x512x13,256x768x13,256x1280x13,256x2048x13
+      tools/export_prefill.py "$DIR" --shapes none --window none --front "$SPEC"
     ;;
   export-ane-long) # ./run.sh export-ane-long [repo or dir]  — add the long-context windowed graph (slow)
     MODEL="${1:-HuggingFaceTB/SmolLM2-135M}"
