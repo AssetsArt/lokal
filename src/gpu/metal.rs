@@ -894,6 +894,13 @@ pub(crate) struct SessionScratch {
     xh: Buffer,
 }
 
+/// Where a chunk's layer-`layer0` input comes from (see `MetalSession::run_from`).
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    Ids(&'a [u32]),
+    Hidden(&'a [f32]),
+}
+
 /// One generation run's GPU state — the KV cache lives on the GPU and never leaves it.
 pub(crate) struct MetalSession<'a> {
     engine: &'a MetalEngine,
@@ -921,22 +928,47 @@ impl MetalSession<'_> {
     /// `logits_rows` = how many trailing positions need logits: 0 for intermediate
     /// prefill chunks, 1 for decode / the last chunk, n for speculative verification.
     fn run(&mut self, ids: &[u32], pos0: usize, logits_rows: usize) -> crate::Result<Vec<f32>> {
+        self.run_from(Source::Ids(ids), ids.len(), pos0, 0, logits_rows)
+    }
+
+    /// The body of a chunk: `n` tokens at positions pos0.. through layers
+    /// `layer0..L`, then optionally the final norm and lm_head. `src` says where
+    /// the layer-`layer0` input comes from — token ids (embed on the GPU, the
+    /// normal path) or a hidden state computed elsewhere (split prefill: the ANE
+    /// ran layers 0..layer0 for this chunk, see src/ane.rs).
+    fn run_from(
+        &mut self,
+        src: Source<'_>,
+        n: usize,
+        pos0: usize,
+        layer0: usize,
+        logits_rows: usize,
+    ) -> crate::Result<Vec<f32>> {
         let e = self.engine;
         let cfg = &e.cfg;
-        let (h, n) = (cfg.hidden_size, ids.len());
+        let h = cfg.hidden_size;
         let kv_byte_off = self.kv_base + (pos0 * cfg.kv_dim() * 2) as u64; // this chunk's first (f16) cache row
 
-        // Push the token ids to the GPU (unified memory: write into the buffer pre-commit).
-        unsafe { std::ptr::copy_nonoverlapping(ids.as_ptr(), self.ids.contents() as *mut u32, n) };
+        // Unified memory: write the input straight into the buffer pre-commit.
+        match src {
+            Source::Ids(ids) => unsafe {
+                std::ptr::copy_nonoverlapping(ids.as_ptr(), self.ids.contents() as *mut u32, n)
+            },
+            Source::Hidden(x) => unsafe {
+                std::ptr::copy_nonoverlapping(x.as_ptr(), self.x.contents() as *mut f32, n * h)
+            },
+        }
 
         let cb = e.queue.new_command_buffer();
         // Serial encoder: dispatches execute in order, each seeing its predecessors'
         // results — no manual barriers needed.
         let enc = cb.new_compute_command_encoder();
 
-        e.enc_embed(enc, &self.ids, &self.x, n);
+        if matches!(src, Source::Ids(_)) {
+            e.enc_embed(enc, &self.ids, &self.x, n);
+        }
         let fused_decode = n == 1 && cfg.head_dim() <= DEC_TG && cfg.head_dim().is_multiple_of(4);
-        for (l, blk) in e.blocks.iter().enumerate() {
+        for (l, blk) in e.blocks.iter().enumerate().skip(layer0) {
             if fused_decode {
                 // Decode path: fused kernels — 9 dispatches per layer instead of 15.
                 // Same math as the prefill path below, with qkv / swiglu / residual
@@ -1024,6 +1056,43 @@ impl MetalSession<'_> {
                 *vp.add(i) = f16::from_f32(x).to_bits();
             }
         }
+    }
+
+    /// Same as `write_kv`, for K,V that already carry the cache's f16 bits — one
+    /// memcpy per layer instead of a per-element convert. Split prefill converts
+    /// on the ANE thread (it needs the f16 rows anyway, to feed the next chunk's
+    /// past), which keeps the conversion off the thread driving the GPU.
+    pub(crate) fn write_kv_bits(&mut self, layer: usize, pos0: usize, k: &[u16], v: &[u16]) {
+        let kvd = self.engine.cfg.kv_dim();
+        let base = (self.kv_base / 2) as usize;
+        unsafe {
+            let kp = (self.k_cache[layer].contents() as *mut u16).add(base + pos0 * kvd);
+            std::ptr::copy_nonoverlapping(k.as_ptr(), kp, k.len());
+            let vp = (self.v_cache[layer].contents() as *mut u16).add(base + pos0 * kvd);
+            std::ptr::copy_nonoverlapping(v.as_ptr(), vp, v.len());
+        }
+    }
+
+    /// How many rows the per-chunk scratch buffers hold — the hard ceiling on `n`
+    /// for any single `run_from`. Split prefill checks its graph's chunk width
+    /// against this before writing a hidden state into `x`.
+    pub(crate) fn max_chunk_rows(&self) -> usize {
+        PREFILL_CHUNK.min(self.max_seq)
+    }
+
+    /// Split prefill: finish a chunk whose leading `layer0` layers ran on another
+    /// device. `x` is that device's hidden state for these `n` rows (row-major
+    /// [n, hidden_size]); layers 0..layer0 of the KV cache must already hold this
+    /// chunk's rows. Returns the last row's logits when `want_logits`.
+    pub(crate) fn prefill_tail_layers(
+        &mut self,
+        x: &[f32],
+        pos0: usize,
+        n: usize,
+        layer0: usize,
+        want_logits: bool,
+    ) -> crate::Result<Vec<f32>> {
+        self.run_from(Source::Hidden(x), n, pos0, layer0, want_logits as usize)
     }
 
     /// Batch prefill continuing from pos0 (cache slots 0..pos0 must already be filled)
