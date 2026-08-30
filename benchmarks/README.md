@@ -23,49 +23,54 @@ ones lokal loses — they exist to steer the roadmap, not to advertise.
   verified quiet (per-process cpu-time deltas over a 2 s window plus load
   average — not `ps %CPU`, which is a decaying lifetime average), and every
   row in `results.jsonl` carries the machine state it was measured under.
-  All four engines below were measured back-to-back in one quiet session.
+  All five configurations below were measured back-to-back in one session.
 
-## Results (2026-08-30, after the flash-prefill rewrite and split prefill)
+## Results (2026-08-30)
 
 | engine | version | prefill (~500 tok) | prefill tok/s | decode | 4x concurrent aggregate |
 |---|---|---|---|---|---|
-| lokal `-b hybrid` + split | main | **0.05 s** | **9,920** | 232 tok/s | **343 tok/s** |
-| lokal `-b hybrid` | main | 0.06 s | 8,517 | 232 tok/s | 341 tok/s |
-| lokal `-b metal` | main | 0.06 s | 7,863 | 232 tok/s | 338 tok/s |
-| llama.cpp | b9960 | 0.06 s | 8,749 | 205 tok/s | 326 tok/s |
-| oMLX | 0.6.3 | 0.12 s | 4,332 | **255 tok/s** | 324 tok/s |
+| lokal `-b hybrid` + split | main | **0.06 s** | 8,784 | 226 tok/s | **350 tok/s** |
+| lokal `-b hybrid` | main | 0.06 s | 8,466 | 218 tok/s | 339 tok/s |
+| lokal `-b metal` | main | 0.07 s | 7,604 | 205 tok/s | 321 tok/s |
+| llama.cpp | b9960 | 0.06 s | **8,822** | 180 tok/s | 323 tok/s |
+| oMLX | 0.6.3 | 0.12 s | 4,354 | **255 tok/s** | 326 tok/s |
+
+**Run-to-run spread is large enough to change the prefill ranking**, so it
+gets stated rather than hidden. A repeat pass minutes later, same binaries
+and same harness: split prefill 10,405 tok/s, llama.cpp 8,984. Across three
+sessions split measured 8,784 / 9,920 / 10,405 and llama.cpp 8,749 / 8,822 /
+8,984 — llama.cpp is the steadier of the two, split is faster in most runs
+and ties in its worst one. Read the prefill column as *lokal at parity with
+llama.cpp, leading when the machine cooperates*, not as a settled win.
+Decode drifted too (lokal 194–232, llama.cpp 171–205 across the same runs);
+oMLX's decode lead is the one single-stream result that held in every pass.
 
 vLLM Metal 0.1.0 measured 253 tok/s decode / 217 aggregate on 2026-08-29
 (with some completions stopped early); its venv was not rebuilt for this
 pass, so it stays out of the same-session table. SGLang has no macOS
 support.
 
-Aggregate throughput moves ±10% run to run; treat single-digit percentage
-gaps in that column as a tie.
-
 ## Reading
 
-- **Prefill**: the three single-device numbers sit within ~12% of each other
-  — lokal-metal's 7,863 tok/s is the 2026-08-30 flash-attention + Metal 4
-  tensor-ops rewrite (from 1,461 the same morning), the same matmul
-  mechanism llama.cpp's Metal backend uses, and lokal-ane is the Neural
-  Engine doing that work off-GPU. The top row is what neither competitor
-  can do: **split prefill** runs the front layers of each chunk on the ANE
+- **Prefill**: all three lokal configurations and llama.cpp land in the same
+  band; oMLX is half their rate. lokal-metal's 7,604 tok/s is the
+  2026-08-30 flash-attention + Metal 4 tensor-ops rewrite (from 1,461 that
+  morning) — the same matmul mechanism llama.cpp's Metal backend uses.
+  `-b hybrid` moves prompt processing to the Neural Engine, and **split
+  prefill** goes further: the front layers of each chunk run on the ANE
   while the GPU works the back layers of the previous chunk, so one prompt
-  uses both engines at once — 9,920 tok/s, measured back-to-back against
-  llama.cpp's 8,749 in the same session. It is opt-in
-  (`LOKAL_SPLIT_PREFILL=1`) because it needs its own exported graph ladder;
-  see the ANE setup notes in the root README.
-- **Decode**: oMLX leads single-stream (255) and lokal holds 232 on every
-  backend — split prefill does not touch decode. llama.cpp's own decode
-  number moved 176 → 205 between two runs of the same binary an hour apart,
-  which is the honest size of run-to-run spread in this column.
-- **Concurrency**: continuous batching (one weight read serves every active
-  request) puts both lokal backends at the top of the aggregate column. The
-  historic gap between them is gone: metal's admission stall was prompt
-  prefill on the decode GPU, and the flash rewrite shrank it ~8x (216 → 338
-  aggregate in one day). The ane hybrid still adds off-GPU prefill on top —
-  its time-to-first-token stays the best under load.
+  keeps both engines busy. That is the one thing no GPU-only engine here
+  can copy, and it is why the top row exists. It is opt-in
+  (`LOKAL_SPLIT_PREFILL=1`, graphs from `./run.sh export-ane-split`) because
+  the ladder of front graphs costs ~150 MB of disk each.
+- **Decode**: oMLX leads single-stream in every pass (255). lokal sits
+  behind it and ahead of llama.cpp; split prefill does not touch the decode
+  path, so its decode differences from plain `-b hybrid` are noise.
+- **Concurrency**: continuous batching — one weight read serving every
+  active request — puts lokal at the top of the aggregate column in every
+  configuration (321–350 vs 323 and 326), and the hybrid's off-GPU prefill
+  adds to it: newly arrived requests do not stall the batch that is already
+  decoding.
 
 ## Long context
 
@@ -78,11 +83,11 @@ with `summarize_longctx.py` building the tables.
 
 The long-context matrix is pending re-measurement: the lokal-only baseline
 taken on 2026-08-29/30 (2k–24k, in git history) predates the flash-prefill
-rewrite that multiplied the Metal tail's rate 4–6x, so those rows are
-obsolete as a comparison. Facts that survive from that pass: the ANE
-windowed graph covers the first 8,192 positions of a long prompt (Metal
-takes the tail), and a machine pays a one-time ~250 s Apple ANE-compiler
-cost on the first load of that graph (cached afterwards).
+rewrite and split prefill, so those rows are obsolete as a comparison.
+Facts that survive from that pass: the windowed ANE graph covers the first
+8,192 positions of a long prompt (Metal takes the tail), and a machine pays
+a one-time ~250 s Apple ANE-compiler cost on the first load of that graph
+(cached afterwards).
 
 ## Reproduction
 
@@ -92,6 +97,9 @@ One engine, one row — the server is started and stopped for you:
 python3 benchmarks/bench_engines.py --engine lokal-ane
 python3 benchmarks/bench_engines.py --engine llamacpp
 python3 benchmarks/bench_engines.py --engine omlx --out benchmarks/results.jsonl
+
+# the split-prefill row (needs ./run.sh export-ane-split once per model):
+LOKAL_SPLIT_PREFILL=1 python3 benchmarks/bench_engines.py --engine lokal-ane
 ```
 
 `--engine` takes any key from `engines.py`: `lokal-metal`, `lokal-ane`,
