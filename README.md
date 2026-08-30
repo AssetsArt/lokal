@@ -43,8 +43,9 @@ Measured 2026-08-30 on an M1 Pro, 16 GB, `-t 0`, on a verified-quiet machine
 | prefill (Qwen2.5-0.5B) | — | 2,704 tok/s | ² |
 | decode (Qwen2.5-0.5B) | ~27 tok/s | ~113 tok/s | = metal |
 
-¹ with split prefill on (`LOKAL_SPLIT_PREFILL=1`, needs the extra graphs from
-`./run.sh export-ane-split`); plain hybrid does 8,738. Best of 3 passes, as
+¹ the hybrid row implies the split-prefill ladder is exported
+(`./run.sh export-ane-split`, once per model) — with it present, `-b hybrid`
+splits by default; without it hybrid prefill does 8,738. Best of 3 passes, as
 in [benchmarks/](benchmarks/) — a warm laptop reads 15–20% lower.
 ² per-model ANE graphs; see setup below.
 
@@ -66,7 +67,7 @@ Serving is where the hybrid pays off most. Concurrent requests decode as one
 batch — a single read of the weights serves every active request — while the
 Neural Engine prefills newly arrived requests off-GPU:
 
-| 4 concurrent requests (~500-token prompts) | metal | hybrid + split |
+| 4 concurrent requests (~500-token prompts) | metal | hybrid |
 |---|---|---|
 | single-request prefill | 0.06 s | **0.05 s** |
 | aggregate throughput | 359 tok/s | **382 tok/s** |
@@ -101,6 +102,7 @@ at a near-tie.
 ```bash
 ./run.sh export-ane        # builds the plain prefill graphs (512 and 2048 tokens) — a few minutes
 ./run.sh export-ane-long   # optional: adds the long-context windowed graph (slow; see note below)
+./run.sh export-ane-split  # optional: adds the split-prefill ladder — the fastest prefill (see below)
 ./run.sh hybrid "Once upon a time"
 ```
 
@@ -111,6 +113,14 @@ keeping everything up to 8k tokens on the ANE (beyond that, Metal takes the
 tail seamlessly). That is what makes long prompts fast: a 6,086-token prompt
 prefills in 3.3 s vs 14.1 s on Metal alone. Without the windowed graph the
 ANE still serves the first 2,048 tokens and Metal the rest.
+
+With the split ladder exported, `-b hybrid` runs prefill as a two-device
+pipeline by default — the front layers of each prompt chunk on the Neural
+Engine while the GPU works the back layers of the previous one; that is the
+11,080 tok/s row above, and no flag is needed. `LOKAL_SPLIT_PREFILL=0`
+disables it for A/B runs. The ladder costs ~150 MB of disk per front graph
+(each rung carries its own weight copy), and a prompt the ladder cannot
+serve falls back to the plain path automatically.
 
 The windowed graph is the expensive one — minutes to export, and the first
 load on each machine spends a few more minutes in Apple's ANE compiler

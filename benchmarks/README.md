@@ -37,11 +37,16 @@ one that everybody can.
 
 | engine | version | prefill tok/s | prefill spread | decode | 4x concurrent aggregate |
 |---|---|---|---|---|---|
-| lokal `-b hybrid` + split | main | **11,080** | 10,879–11,080 | 239 tok/s | **382 tok/s** |
+| lokal `-b hybrid` | main | **11,080** | 10,879–11,080 | 239 tok/s | **382 tok/s** |
 | llama.cpp | b9960 | 9,641 | 9,511–9,641 | 232 tok/s | 364 tok/s |
-| lokal `-b hybrid` | main | 8,738 | 8,576–8,738 | 237 tok/s | 367 tok/s |
 | lokal `-b metal` | main | 8,271 | 8,251–8,271 | 238 tok/s | 359 tok/s |
 | oMLX | 0.6.3 | 4,544 | 4,493–4,544 | **262 tok/s** | 335 tok/s |
+
+The hybrid row implies the split-prefill ladder is exported
+(`./run.sh export-ane-split`, once per model) — with it present, splitting
+is simply what `-b hybrid` does. Measured without the ladder in the same
+session (`LOKAL_SPLIT_PREFILL=0` reproduces this state): prefill 8,738
+(spread 8,576–8,738), decode 237, aggregate 367.
 
 All five configurations were measured in one session with the machine idle
 between passes, and every pass is a row in `results.jsonl` with its machine
@@ -56,21 +61,21 @@ support.
 
 ## Reading
 
-- **Prefill**: lokal's single-device paths (8,271 metal, 8,738 hybrid) sit
-  below llama.cpp's 9,641 — its Metal backend is still the better GPU-only
-  prefill, and lokal-metal's number is itself the 2026-08-30 rewrite that
-  took this path from 1,461 tok/s using the same Metal 4 tensor-ops matmul
-  mechanism llama.cpp uses. What wins the column is **split prefill**: the
-  front layers of each chunk run on the Neural Engine while the GPU works
+- **Prefill**: lokal's single-device paths (8,271 metal, 8,738 ladder-less
+  hybrid) sit below llama.cpp's 9,641 — its Metal backend is still the better
+  GPU-only prefill, and lokal-metal's number is itself the 2026-08-30 rewrite
+  that took this path from 1,461 tok/s using the same Metal 4 tensor-ops
+  matmul mechanism llama.cpp uses. What wins the column is **split prefill**:
+  the front layers of each chunk run on the Neural Engine while the GPU works
   the back layers of the previous chunk, so one prompt keeps both engines
   busy — 11,080 tok/s, 15% past llama.cpp, and the one result here a
-  GPU-only engine cannot copy. It is opt-in (`LOKAL_SPLIT_PREFILL=1`,
-  graphs from `./run.sh export-ane-split`) because its ladder of front
-  graphs costs ~150 MB of disk each.
+  GPU-only engine cannot copy. It is what `-b hybrid` does whenever the
+  ladder from `./run.sh export-ane-split` is present (~150 MB of disk per
+  front graph); `LOKAL_SPLIT_PREFILL=0` turns it off for A/B runs.
 - **Decode**: oMLX leads single-stream in every pass (262); lokal (236–239)
   and llama.cpp (232) are close behind and effectively tied with each other.
   Split prefill does not touch the decode path, so its decode differences
-  from plain `-b hybrid` are noise.
+  from the ladder-less hybrid are noise.
 - **Concurrency**: continuous batching — one weight read serving every
   active request — puts every lokal configuration at or above llama.cpp
   (359–382 vs 364), with oMLX last (335). Split prefill adds the most here
@@ -103,8 +108,9 @@ python3 benchmarks/bench_engines.py --engine lokal-ane
 python3 benchmarks/bench_engines.py --engine llamacpp
 python3 benchmarks/bench_engines.py --engine omlx --out benchmarks/results.jsonl
 
-# the split-prefill row (needs ./run.sh export-ane-split once per model):
-LOKAL_SPLIT_PREFILL=1 python3 benchmarks/bench_engines.py --engine lokal-ane
+# lokal-ane splits by default once ./run.sh export-ane-split has run;
+# the ladder-less hybrid row, for A/B against it:
+LOKAL_SPLIT_PREFILL=0 python3 benchmarks/bench_engines.py --engine lokal-ane
 ```
 
 `--engine` takes any key from `engines.py`: `lokal-metal`, `lokal-ane`,

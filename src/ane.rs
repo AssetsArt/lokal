@@ -313,10 +313,12 @@ impl CoreMlFront {
     }
 }
 
-/// Opt-in: run prefill as a two-device pipeline (see `AneSession::prefill_split`).
-/// Off by default — with it unset the hybrid backend behaves exactly as before.
+/// Split prefill (see `AneSession::prefill_split`) is what the hybrid backend
+/// does whenever the front-graph ladder is exported next to the model.
+/// `LOKAL_SPLIT_PREFILL=0` is the kill switch — kept for A/B measurement and
+/// debugging, not a mode; any other value, or none, means on.
 fn split_enabled() -> bool {
-    std::env::var("LOKAL_SPLIT_PREFILL").is_ok_and(|v| v != "0" && !v.is_empty())
+    std::env::var("LOKAL_SPLIT_PREFILL").map_or(true, |v| v != "0")
 }
 
 /// Pull an fp16 multiarray output into its raw bits — the KV cache's own dtype,
@@ -352,9 +354,10 @@ pub struct AneEngine {
     metal: MetalEngine,
     graphs: Vec<CoreMlPrefill>, // sorted by seq, ascending — one fixed shape each
     windowed: Option<CoreMlWindowed>,
-    // Split prefill, only loaded when LOKAL_SPLIT_PREFILL is set. A ladder like the
-    // plain graphs: a windowed graph costs its full P+S attention on every chunk
-    // whatever the prompt length, so a short prompt wants a short window.
+    // Split prefill, loaded whenever the ladder is exported (LOKAL_SPLIT_PREFILL=0
+    // skips it). A ladder like the plain graphs: a windowed graph costs its full
+    // P+S attention on every chunk whatever the prompt length, so a short prompt
+    // wants a short window.
     front: Vec<CoreMlFront>, // sorted by reach (s + p), ascending
 }
 
@@ -408,28 +411,24 @@ impl AneEngine {
             Some((path, s, p)) => Some(CoreMlWindowed::load(&path, s, p)?),
             None => None,
         };
-        // The front graph is a separate shape and so a separate ANECompilerService
-        // pass; load it only when split prefill is actually asked for, so the
-        // default backend's start-up cost is exactly what it was.
+        // The ladder loads whenever it exists: split prefill is what this backend
+        // does, not a mode. A model with no front graphs (nothing to load) stays
+        // silent; LOKAL_SPLIT_PREFILL=0 is the kill switch for A/B runs.
         let mut front = Vec::new();
-        if split_enabled() {
+        if !fronts.is_empty() && !split_enabled() {
+            eprintln!("ANE: split prefill disabled (LOKAL_SPLIT_PREFILL=0) — plain ANE prefill");
+        } else {
             fronts.sort_by_key(|&(_, s, p, _)| s + p);
-            if fronts.is_empty() {
-                eprintln!(
-                    "ANE: LOKAL_SPLIT_PREFILL set but no prefill-f<layers>-<s>w<p>.mlmodelc in {} \
-                     — falling back to the normal ane path",
-                    model_dir.display()
-                );
-            }
             for (path, s, p, a) in fronts {
                 // Every new shape is its own ANECompilerService pass on this machine —
-                // silent and slow the first time, cached afterwards. Time it out loud.
+                // silent and slow the first time, cached afterwards. Say so when it
+                // happens; a cached load takes well under a second and stays quiet.
                 let t = Instant::now();
                 front.push(CoreMlFront::load(&path, s, p, a)?);
-                eprintln!(
-                    "ANE: split prefill on — front graph {s}x{p} layers 0..{a} loaded in {:.1}s",
-                    t.elapsed().as_secs_f64()
-                );
+                let dt = t.elapsed().as_secs_f64();
+                if dt >= 1.0 {
+                    eprintln!("ANE: front graph {s}x{p} layers 0..{a} compiled in {dt:.1}s");
+                }
             }
         }
         let shapes: Vec<usize> = graphs.iter().map(|g| g.seq).collect();
@@ -439,6 +438,16 @@ impl AneEngine {
                 w.s, w.p
             ),
             None => eprintln!("ANE: loaded prefill graphs {shapes:?} (Core ML, compute = CPU+ANE)"),
+        }
+        if !front.is_empty() {
+            // Announce the routing once, here — prefill_split itself reports per
+            // prompt, and nobody should have to read code to learn which path ran.
+            let rungs: Vec<String> =
+                front.iter().map(|g| format!("{}x{}@{}", g.s, g.p, g.n_front)).collect();
+            eprintln!(
+                "ANE: split prefill on — ladder [{}]; prompts pipeline ANE+GPU (LOKAL_SPLIT_PREFILL=0 disables)",
+                rungs.join(", ")
+            );
         }
         Ok(Self { metal: MetalEngine::new(model)?, graphs, windowed, front })
     }
@@ -540,7 +549,11 @@ impl AneSession<'_> {
     }
 
 
-    /// Split prefill — the two-device pipeline, opt-in via LOKAL_SPLIT_PREFILL.
+    /// Split prefill — the two-device pipeline, the default whenever a front-graph
+    /// ladder is exported. Returns `Ok(None)` when the ladder cannot serve this
+    /// session at all (nothing has been touched — the caller falls back to the
+    /// plain path); a mid-run `Err` may leave partial KV rows behind, which is
+    /// safe because the plain path rewrites every row from position 0.
     ///
     /// The prompt is cut into chunks of the front graph's S. The ANE runs chunk c
     /// through layers 0..A while Metal runs chunk c-1 through layers A..L, so in
@@ -553,7 +566,7 @@ impl AneSession<'_> {
     /// layer on the GPU and needs all of them. Conversion to the cache's f16
     /// happens on the ANE thread, which needs those same rows for the next
     /// chunk's past anyway, so the thread driving the GPU only memcpys.
-    fn prefill_split(&mut self, ids: &[u32]) -> crate::Result<Vec<f32>> {
+    fn prefill_split(&mut self, ids: &[u32]) -> crate::Result<Option<Vec<f32>>> {
         let kvd = self.kvd;
         let cfg = self.metal.config_ref();
         let (head_dim, theta, hidden) = (cfg.head_dim(), cfg.rope_theta, cfg.hidden_size);
@@ -572,11 +585,10 @@ impl AneSession<'_> {
         strides.sort_unstable();
         strides.dedup();
         let Some(&smallest) = strides.first() else {
-            return Err(format!(
-                "split prefill: every exported front graph is wider than Metal's per-chunk \
-                 scratch ({room} rows) — re-export with a smaller --front chunk"
-            )
-            .into());
+            // Every exported rung is wider than Metal's per-chunk scratch — the
+            // ladder cannot feed this session. Not an error on a default path:
+            // the caller degrades to the plain ANE prefill.
+            return Ok(None);
         };
         let s = strides
             .iter()
@@ -712,9 +724,9 @@ impl AneSession<'_> {
             100.0 * (1.0 - t.elapsed().as_secs_f64() / (ane_s + metal_s)).max(0.0)
         );
         if ane_total < ids.len() {
-            return self.metal.prefill_from(&ids[ane_total..], ane_total);
+            return self.metal.prefill_from(&ids[ane_total..], ane_total).map(Some);
         }
-        Ok(logits)
+        Ok(Some(logits))
     }
 
     /// Prompts longer than the largest plain graph: head chunk through the plain
@@ -794,10 +806,18 @@ impl Session for AneSession<'_> {
             );
             return self.metal.prefill_from(ids, 0);
         }
-        // Opt-in split prefill: `front` is only Some when LOKAL_SPLIT_PREFILL is set,
-        // so the default path below is untouched.
+        // Split prefill is the default whenever the ladder is loaded. A ladder
+        // that cannot serve this prompt (Ok(None)) falls through silently; a
+        // mid-run failure redoes the whole prompt on the plain path below, which
+        // is safe because that path rewrites every KV row from position 0.
         if !self.front.is_empty() {
-            return self.prefill_split(ids);
+            match self.prefill_split(ids) {
+                Ok(Some(logits)) => return Ok(logits),
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("  ANE split prefill failed ({e}) — redoing the prompt on the plain path")
+                }
+            }
         }
         let largest = self.graphs.last().map(|g| g.seq).unwrap_or(0);
         if want > largest && self.windowed.is_some() {
