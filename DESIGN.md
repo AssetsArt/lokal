@@ -394,19 +394,23 @@ Roughly ordered by leverage:
    the metal backend (the ANE hybrid hides this on another device).
    Interleaving PREFILL_CHUNK-sized pieces with decode steps caps the stall
    at one chunk.
-4. **Remaining prefill headroom.** The flash rewrite (2026-08-30) took Metal
-   prefill from 1,606 to 6,243 tok/s at ~500 tokens (SmolLM2) — 65% of
-   llama.cpp's same-day GPU-only rate. Two facts carry the result: hand-tiled
-   simdgroup MMA plateaus around ~700 GFLOPS on this stack no matter the
-   tiling, because llama.cpp's speed on macOS 26 comes from Metal 4 tensor
-   ops (`mpp::tensor_ops::matmul2d`, its `GGML_METAL_HAS_TENSOR` path) — and
-   an FA-2 register-resident attention (no scores scratch on head_dim 64)
-   doubles the 2k rate on top. What's left on the table: tensor ops for the
-   attention matmuls themselves, the kv-projection matmul, per-op
-   concurrency, and a Qwen-specific profile (its bigger lm_head and 14:2
-   GQA lag SmolLM2's ratios). The 8,192-position ANE window remains the
-   long-prompt head start; wider windows stay priced out by the superlinear
-   first-load ANE compile (99 s at 6,144, 250 s at 8,192, 21+ min at 16,384).
+4. **Remaining prefill headroom.** Prefill went 1,461 → 9,920 tok/s on the
+   GPU (and 11,896 hybrid) during 2026-08-30, in three steps: a flash
+   attention kernel with no scores scratch, matmuls moved onto Metal 4
+   tensor ops (`mpp::tensor_ops::matmul2d`, the same path llama.cpp's Metal
+   backend takes on macOS 26 — hand-tiled simdgroup MMA plateaus near
+   ~700 GFLOPS here no matter the tiling), and then the k/v projections onto
+   tensor ops plus a concurrent prefill encoder. What is left: a
+   Qwen-specific profile (its bigger lm_head and 14:2 GQA lag SmolLM2's
+   ratios), and the balance point of the split pipeline, which moved when
+   the GPU stage got faster — the front-layer count per chunk width was
+   tuned against a slower Metal half. **Measured and rejected:** porting the
+   flash kernel's QK^T and P·V to tensor ops costs 39% at 2k — the online
+   softmax between the two matmuls breaks the cooperative-tensor dataflow,
+   and the register-resident FA-2 kernel stays. The 8,192-position ANE
+   window remains the long-prompt head start; wider windows stay priced out
+   by the superlinear first-load ANE compile (99 s at 6,144, 250 s at 8,192,
+   21+ min at 16,384).
 5. The rest: an OpenAI-compatible API (`/v1/chat/completions`) and SSE
    streaming in serve mode; a hybrid scheduler that picks the backend
    automatically; CUDA/Vulkan backends on the same Engine/Session seam.

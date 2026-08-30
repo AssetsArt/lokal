@@ -37,18 +37,12 @@ one that everybody can.
 
 | engine | version | prefill tok/s | prefill spread | decode | 4x concurrent aggregate |
 |---|---|---|---|---|---|
-| lokal `-b hybrid` | main | **11,080** | 10,879–11,080 | 239 tok/s | **382 tok/s** |
-| llama.cpp | b9960 | 9,641 | 9,511–9,641 | 232 tok/s | 364 tok/s |
-| lokal `-b metal` | main | 8,271 | 8,251–8,271 | 238 tok/s | 359 tok/s |
-| oMLX | 0.6.3 | 4,544 | 4,493–4,544 | **262 tok/s** | 335 tok/s |
+| lokal `-b hybrid` | main | **11,896** | 11,608–11,896 | 237 tok/s | **380 tok/s** |
+| lokal `-b metal` | main | 9,920 | 9,490–9,920 | 231 tok/s | 362 tok/s |
+| llama.cpp | b9960 | 9,803 | 9,687–9,803 | 232 tok/s | 366 tok/s |
+| oMLX | 0.6.3 | 4,623 | 4,528–4,623 | **261 tok/s** | 335 tok/s |
 
-The hybrid row implies the split-prefill ladder is exported
-(`./run.sh export-ane-split`, once per model) — with it present, splitting
-is simply what `-b hybrid` does. Measured without the ladder in the same
-session (`LOKAL_SPLIT_PREFILL=0` reproduces this state): prefill 8,738
-(spread 8,576–8,738), decode 237, aggregate 367.
-
-All five configurations were measured in one session with the machine idle
+All four engines were measured in one session with the machine idle
 between passes, and every pass is a row in `results.jsonl` with its machine
 state attached. An earlier session on a machine warm from hours of
 benchmarking read 15–20% lower across the board and reordered the top two —
@@ -61,26 +55,23 @@ support.
 
 ## Reading
 
-- **Prefill**: lokal's single-device paths (8,271 metal, 8,738 ladder-less
-  hybrid) sit below llama.cpp's 9,641 — its Metal backend is still the better
-  GPU-only prefill, and lokal-metal's number is itself the 2026-08-30 rewrite
-  that took this path from 1,461 tok/s using the same Metal 4 tensor-ops
-  matmul mechanism llama.cpp uses. What wins the column is **split prefill**:
-  the front layers of each chunk run on the Neural Engine while the GPU works
-  the back layers of the previous chunk, so one prompt keeps both engines
-  busy — 11,080 tok/s, 15% past llama.cpp, and the one result here a
-  GPU-only engine cannot copy. It is what `-b hybrid` does whenever the
-  ladder from `./run.sh export-ane-split` is present (~150 MB of disk per
-  front graph); `LOKAL_SPLIT_PREFILL=0` turns it off for A/B runs.
-- **Decode**: oMLX leads single-stream in every pass (262); lokal (236–239)
-  and llama.cpp (232) are close behind and effectively tied with each other.
-  Split prefill does not touch the decode path, so its decode differences
-  from the ladder-less hybrid are noise.
+- **Prefill**: lokal's GPU-only path (9,920 tok/s) now edges past llama.cpp
+  (9,803) — that path went 1,461 → 8,271 → 9,920 in a day, first from a
+  flash-attention rewrite plus Metal 4 tensor-ops matmuls (the same
+  mechanism llama.cpp's Metal backend uses), then from moving the k/v
+  projections onto tensor ops and letting independent prefill dispatches
+  run concurrently. The lead, though, comes from not being GPU-only:
+  `-b hybrid` pipelines each prompt across both engines — the front layers
+  of a chunk on the Neural Engine while the GPU works the back layers of
+  the previous chunk — for 11,896 tok/s, 21% past llama.cpp. Those two
+  results compound: the GPU work is one of the pipeline's two stages, so
+  the same-day GPU gain lifted the hybrid number from 11,080 to 11,896.
+- **Decode**: oMLX leads single-stream (261); lokal (231–237) and llama.cpp
+  (232) are tied behind it. Prefill work does not touch the decode path.
 - **Concurrency**: continuous batching — one weight read serving every
-  active request — puts every lokal configuration at or above llama.cpp
-  (359–382 vs 364), with oMLX last (335). Split prefill adds the most here
-  for the same reason it wins single-stream: a joining request is prefilled
-  across both engines instead of stalling the batch that is decoding.
+  active request — puts lokal's hybrid on top (380 vs llama.cpp's 366 and
+  oMLX's 335). A joining request is prefilled across both engines instead
+  of stalling the batch that is already decoding.
 
 ## Long context
 
