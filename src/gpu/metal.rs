@@ -285,6 +285,18 @@ impl MetalEngine {
                 .new_compute_pipeline_state_with_function(&f)
                 .map_err(|e| format!("kernel {name}: {e}").into())
         };
+        // Kernels that REFERENCE function constants (the lowmem LM_* window set)
+        // must be built through the specialization API even with no constant
+        // set: the empty set resolves is_function_constant_defined() to false
+        // and compiles exactly the unwindowed code this backend always ran.
+        let default_spec = |name: &str| -> crate::Result<ComputePipelineState> {
+            let f = lib
+                .get_function(name, Some(FunctionConstantValues::new()))
+                .map_err(|e| format!("kernel {name}: {e}"))?;
+            device
+                .new_compute_pipeline_state_with_function(&f)
+                .map_err(|e| format!("kernel {name}: {e}").into())
+        };
         // The GQA decode kernels are specialized per model: function constant 0
         // (GQA_CHUNK) is the q-head group width one threadgroup covers, fixed here
         // so the per-head loops in the kernel unroll flat.
@@ -325,8 +337,8 @@ impl MetalEngine {
             rope_qk_prefill: pipe("rope_qk_prefill")?,
             matmul_tb: pipe("matmul_tb")?,
             rope_qk_decode: pipe("rope_qk_decode")?,
-            attention: pipe("attention")?,
-            attention_prefill_flash: pipe("attention_prefill_flash")?,
+            attention: default_spec("attention")?,
+            attention_prefill_flash: default_spec("attention_prefill_flash")?,
             attention_decode_partial: gqa_pipe("attention_decode_partial")?,
             attention_decode_reduce: pipe("attention_decode_reduce")?,
             silu_mul: pipe("silu_mul")?,

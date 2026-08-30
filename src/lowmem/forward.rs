@@ -39,10 +39,9 @@ struct NormParams {
     eps: f32,
 }
 #[repr(C)]
-struct RopeQkPrefillParams {
+struct RopeParams {
     head_dim: u32,
-    n_q_heads: u32,
-    n_kv_heads: u32,
+    n_heads: u32,
     pos0: u32,
     theta: f32,
     n_rows: u32,
@@ -83,9 +82,10 @@ fn set_bytes<T>(enc: &ComputeCommandEncoderRef, idx: u64, v: &T) {
 
 pub(super) struct LowMemSession<'a> {
     e: &'a LowMemEngine,
-    max_seq: usize,
     chunk: usize,
-    k_cache: Vec<Buffer>, // per layer: f16 [max_seq (+ flash slack) × kv_dim]
+    /// Per layer: f16 [cap × kv_dim] — the sink region plus the ring. Sized by
+    /// the WINDOW, not the context: this is the bounded-KV promise (D5).
+    k_cache: Vec<Buffer>,
     v_cache: Vec<Buffer>,
     x: Buffer,
     xn: Buffer,
@@ -109,14 +109,15 @@ impl<'a> LowMemSession<'a> {
     pub fn new(e: &'a LowMemEngine, max_seq: usize) -> Self {
         let cfg = &e.cfg;
         let d = &e.device;
+        let cap = e.win.cap;
         let chunk = gpu::PREFILL_CHUNK.min(max_seq);
         let (h, kvd) = (cfg.hidden_size, cfg.kv_dim());
         Self {
             k_cache: (0..cfg.num_hidden_layers)
-                .map(|_| gpu::f16_empty_buffer(d, (max_seq + gpu::FLASH_C) * kvd))
+                .map(|_| gpu::f16_empty_buffer(d, cap * kvd))
                 .collect(),
             v_cache: (0..cfg.num_hidden_layers)
-                .map(|_| gpu::f16_empty_buffer(d, (max_seq + gpu::FLASH_C) * kvd))
+                .map(|_| gpu::f16_empty_buffer(d, cap * kvd))
                 .collect(),
             x: gpu::f32_buffer(d, chunk * h),
             xn: gpu::f32_buffer(d, chunk * h),
@@ -130,19 +131,36 @@ impl<'a> LowMemSession<'a> {
             scores: if cfg.head_dim() == gpu::FLASH_HEAD_DIM {
                 gpu::f32_buffer(d, 1) // flash path never reads it — stub binding
             } else {
-                gpu::f32_buffer(d, chunk * cfg.num_attention_heads * max_seq)
+                gpu::f32_buffer(d, chunk * cfg.num_attention_heads * cap)
             },
             partials: gpu::f32_buffer(
                 d,
-                cfg.num_attention_heads
-                    * max_seq.div_ceil(gpu::ATTN_SPLIT)
-                    * (cfg.head_dim() + 2),
+                cfg.num_attention_heads * (cap / gpu::ATTN_SPLIT) * (cfg.head_dim() + 2),
             ),
             logits: gpu::f32_buffer(d, cfg.vocab_size),
             e,
-            max_seq,
             chunk,
         }
+    }
+
+    /// Destination spans for writing positions [pos0, pos0+n) into the store:
+    /// (first chunk row, first slot, length). At most three — the sink part,
+    /// then the ring part split once at the wrap.
+    fn write_spans(&self, pos0: usize, n: usize) -> Vec<(usize, usize, usize)> {
+        let win = &self.e.win;
+        let end = pos0 + n;
+        let mut spans = Vec::with_capacity(3);
+        if pos0 < win.sink {
+            spans.push((0, pos0, win.sink.min(end) - pos0));
+        }
+        let mut p = pos0.max(win.sink);
+        while p < end {
+            let rel = (p - win.sink) % win.ring;
+            let len = (win.ring - rel).min(end - p);
+            spans.push((p - pos0, win.sink_pad + rel, len));
+            p += len;
+        }
+        spans
     }
 
     /// CPU-side embedding gather: one mmap row per token, converted straight
@@ -299,7 +317,8 @@ impl<'a> LowMemSession<'a> {
 
     /// The prefill body of one layer (also serves head_dims outside the fused
     /// decode's reach at n_rows == 1). Mirrors MetalSession::run_from's prefill
-    /// arm minus the tensor-ops staging.
+    /// arm minus the tensor-ops staging; K/V land in the sink+ring store, in at
+    /// most three contiguous spans, and RoPE runs with TRUE absolute positions.
     #[allow(clippy::too_many_arguments)]
     fn encode_layer_prefill(
         &self,
@@ -309,7 +328,6 @@ impl<'a> LowMemSession<'a> {
         l: usize,
         pos0: usize,
         n: usize,
-        kv_byte_off: u64,
     ) {
         let e = self.e;
         let cfg = &e.cfg;
@@ -321,32 +339,44 @@ impl<'a> LowMemSession<'a> {
         self.enc_matmul_paged(enc, pool, &lw.q, &self.xn, &self.q, n, 0, h);
         self.enc_matmul_paged(enc, pool, &lw.k, &self.xn, &self.kvs, n, 0, kvd);
         self.enc_matmul_paged(enc, pool, &lw.v, &self.xn, &self.kvs, n, v_base, kvd);
-        self.enc_f32_to_f16(enc, &self.kvs, 0, &self.k_cache[l], kv_byte_off, n * kvd);
-        self.enc_f32_to_f16(enc, &self.kvs, v_base, &self.v_cache[l], kv_byte_off, n * kvd);
+        // RoPE q as one launch, then per destination span: convert the fresh
+        // K/V rows into the store and rotate K there by its true positions.
         {
-            let p = RopeQkPrefillParams {
+            let p = RopeParams {
                 head_dim: hd as u32,
-                n_q_heads: cfg.num_attention_heads as u32,
-                n_kv_heads: cfg.num_key_value_heads as u32,
+                n_heads: cfg.num_attention_heads as u32,
                 pos0: pos0 as u32,
                 theta: cfg.rope_theta,
                 n_rows: n as u32,
             };
-            enc.set_compute_pipeline_state(&e.pipes.rope_qk_prefill);
+            enc.set_compute_pipeline_state(&e.pipes.rope);
             enc.set_buffer(0, Some(&self.q), 0);
-            enc.set_buffer(1, Some(&self.k_cache[l]), kv_byte_off);
-            set_bytes(enc, 2, &p);
-            gpu::dispatch_grid(
-                enc,
-                n * (cfg.num_attention_heads + cfg.num_key_value_heads) * hd / 2,
-            );
+            set_bytes(enc, 1, &p);
+            gpu::dispatch_grid(enc, n * cfg.num_attention_heads * hd / 2);
+        }
+        for &(row, slot, len) in &self.write_spans(pos0, n) {
+            let src_off = (row * kvd * 4) as u64;
+            let dst_off = (slot * kvd * 2) as u64;
+            self.enc_f32_to_f16(enc, &self.kvs, src_off, &self.k_cache[l], dst_off, len * kvd);
+            self.enc_f32_to_f16(enc, &self.kvs, v_base + src_off, &self.v_cache[l], dst_off, len * kvd);
+            let p = RopeParams {
+                head_dim: hd as u32,
+                n_heads: cfg.num_key_value_heads as u32,
+                pos0: (pos0 + row) as u32,
+                theta: cfg.rope_theta,
+                n_rows: len as u32,
+            };
+            enc.set_compute_pipeline_state(&e.pipes.rope_h);
+            enc.set_buffer(0, Some(&self.k_cache[l]), dst_off);
+            set_bytes(enc, 1, &p);
+            gpu::dispatch_grid(enc, len * cfg.num_key_value_heads * hd / 2);
         }
         let p = AttnParams {
             head_dim: hd as u32,
             n_heads: cfg.num_attention_heads as u32,
             n_kv_heads: cfg.num_key_value_heads as u32,
             pos0: pos0 as u32,
-            max_seq: self.max_seq as u32,
+            max_seq: e.win.cap as u32, // the fallback kernel's scores stride
             n_rows: n as u32,
         };
         if hd == gpu::FLASH_HEAD_DIM {
@@ -390,7 +420,9 @@ impl<'a> LowMemSession<'a> {
         self.enc_elem(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
     }
 
-    /// One decode step (n == 1): matvec-family kernels, flash-decoding attention.
+    /// One decode step (n == 1): matvec-family kernels, flash-decoding attention
+    /// over the WHOLE bounded store (every split dispatched; masks sort validity
+    /// — the split count is a constant, which is what makes decode cost flat).
     fn encode_layer_decode(
         &self,
         enc: &ComputeCommandEncoderRef,
@@ -398,11 +430,11 @@ impl<'a> LowMemSession<'a> {
         lw: &LayerWeights,
         l: usize,
         pos: usize,
-        kv_byte_off: u64,
     ) {
         let e = self.e;
         let cfg = &e.cfg;
         let hd = cfg.head_dim();
+        let kv_byte_off = (e.win.slot_of(pos) * cfg.kv_dim() * 2) as u64;
 
         self.enc_rmsnorm(enc, &self.x, 0, &lw.input_ln, &self.xn, 1);
         self.enc_matvec_paged(enc, pool, &e.pipes.matvec, &lw.q, &self.xn, &self.q, 0, 4);
@@ -423,7 +455,7 @@ impl<'a> LowMemSession<'a> {
             gpu::dispatch_grid(enc, (cfg.num_attention_heads + cfg.num_key_value_heads) * hd / 2);
         }
         {
-            let n_splits = (pos + 1).div_ceil(gpu::ATTN_SPLIT);
+            let n_splits = e.win.cap / gpu::ATTN_SPLIT;
             let p = AttnDecParams {
                 head_dim: hd as u32,
                 n_heads: cfg.num_attention_heads as u32,
@@ -481,9 +513,8 @@ impl<'a> LowMemSession<'a> {
     fn run(&mut self, ids: &[u32], pos0: usize, want_logits: bool) -> crate::Result<Vec<f32>> {
         let e = self.e;
         let cfg = &e.cfg;
-        let (h, hd, kvd) = (cfg.hidden_size, cfg.head_dim(), cfg.kv_dim());
+        let (h, hd) = (cfg.hidden_size, cfg.head_dim());
         let n = ids.len();
-        let kv_byte_off = (pos0 * kvd * 2) as u64;
         let fused_decode = n == 1 && hd <= gpu::DEC_TG && hd.is_multiple_of(4);
         // One session encodes at a time — concurrent serve sessions serialize
         // here and stay correct (documented D10 behavior).
@@ -498,9 +529,9 @@ impl<'a> LowMemSession<'a> {
             let cb = e.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
             if fused_decode {
-                self.encode_layer_decode(enc, &pool, lw, l, pos0, kv_byte_off);
+                self.encode_layer_decode(enc, &pool, lw, l, pos0);
             } else {
-                self.encode_layer_prefill(enc, &pool, lw, l, pos0, n, kv_byte_off);
+                self.encode_layer_prefill(enc, &pool, lw, l, pos0, n);
             }
             enc.end_encoding();
             cb.commit();
