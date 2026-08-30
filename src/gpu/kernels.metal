@@ -353,12 +353,18 @@ kernel void matmul(
 // own edge checking against the real extents. Tensors are built in-kernel from
 // plain buffer pointers, so the host side binds ordinary buffers.
 
+// Token-rows per tensor-ops matmul tile; injected by the Rust side (metal.rs
+// MM_TILE_ROWS) so kernel and dispatch stay in sync.
+#ifndef MM_TROWS
+#define MM_TROWS 32
+#endif
+
 kernel void matmul_t(
     device const half *w [[buffer(0)]],
     device const half *x [[buffer(1)]],
     device float *y [[buffer(2)]],
     constant MatmulParams &p [[buffer(3)]],
-    uint2 tgid [[threadgroup_position_in_grid]], // x = output tile (64), y = token tile (32)
+    uint2 tgid [[threadgroup_position_in_grid]], // x = output tile (64), y = token tile (MM_TROWS)
     uint2 tpos [[thread_position_in_threadgroup]])
 {
     (void)tpos;
@@ -371,13 +377,13 @@ kernel void matmul_t(
     // f32 accumulation lives in the cooperative destination tensor (registers);
     // store() writes the f32 result with edge checking against C's real extents.
     constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-        32, 64, static_cast<int>(dynamic_extent), false, true, false,
+        MM_TROWS, 64, static_cast<int>(dynamic_extent), false, true, false,
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
     mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
 
-    auto mA = tA.slice(0, (int)(tgid.y * 32));
+    auto mA = tA.slice(0, (int)(tgid.y * MM_TROWS));
     auto mB = tB.slice(0, (int)(tgid.x * 64));
-    auto mC = tC.slice((int)(tgid.x * 64), (int)(tgid.y * 32));
+    auto mC = tC.slice((int)(tgid.x * 64), (int)(tgid.y * MM_TROWS));
     auto cT = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
     op.run(mA, mB, cT);
     cT.store(mC);
@@ -402,24 +408,24 @@ kernel void matmul_th(
     auto tB = tensor((device half *)w, dextents<int32_t, 2>(p.in_dim, p.out_dim), array<int, 2>({1, (int)p.in_dim}));
 
     constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-        32, 64, static_cast<int>(dynamic_extent), false, true, false,
+        MM_TROWS, 64, static_cast<int>(dynamic_extent), false, true, false,
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
     mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
 
-    auto mA = tA.slice(0, (int)(tgid.y * 32));
+    auto mA = tA.slice(0, (int)(tgid.y * MM_TROWS));
     auto mB = tB.slice(0, (int)(tgid.x * 64));
     auto cT = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
     op.run(mA, mB, cT);
 
-    threadgroup float Cs[32 * 64];
-    auto tC = tensor((threadgroup float *)Cs, dextents<int32_t, 2>(64, 32), array<int, 2>({1, 64}));
+    threadgroup float Cs[MM_TROWS * 64];
+    auto tC = tensor((threadgroup float *)Cs, dextents<int32_t, 2>(64, MM_TROWS), array<int, 2>({1, 64}));
     cT.store(tC);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint idx = tid; idx < 32 * 64; idx += 128) {
+    for (uint idx = tid; idx < MM_TROWS * 64; idx += 128) {
         uint m = idx / 64;
         uint n = idx % 64;
-        uint gr = tgid.y * 32 + m;
+        uint gr = tgid.y * MM_TROWS + m;
         uint go = tgid.x * 64 + n;
         if (gr < p.n_rows && go < p.out_dim) {
             y[(ulong)gr * p.out_dim + go] = (half)(Cs[m * 64 + n] + (float)bias[go]);

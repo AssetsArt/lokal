@@ -173,9 +173,11 @@ const MAX_GQA_CHUNK: usize = 8;
 const FLASH_HEAD_DIM: usize = 64;
 /// Flash tile shape, injected into the shader source as FA_BR/FA_BC so the
 /// kernel layout and the dispatch geometry share one source of truth.
-const FLASH_BR: usize = 32;
+const FLASH_BR: usize = 96;
 const FLASH_BC: usize = 32;
 const FLASH_THREADS: usize = FLASH_BR / 8 * 32;
+/// Token-rows per tensor-ops matmul tile (MM_TROWS in the shader).
+const MM_TILE_ROWS: usize = 64;
 /// Max rows the logits buffer holds — the ceiling for one speculative verify batch.
 const SPEC_MAX: usize = 8;
 
@@ -250,7 +252,7 @@ impl MetalEngine {
         let lib = device
             .new_library_with_source(
                 &format!(
-                    "#define FA_BR {FLASH_BR}\n#define FA_BC {FLASH_BC}\n{}",
+                    "#define FA_BR {FLASH_BR}\n#define FA_BC {FLASH_BC}\n#define MM_TROWS {MM_TILE_ROWS}\n{}",
                     include_str!("kernels.metal")
                 ),
                 &CompileOptions::new(),
@@ -424,7 +426,7 @@ impl MetalEngine {
         enc.set_buffer(3, Some(&l.bias), 0);
         enc.set_bytes(4, size_of::<MatmulParams>() as u64, &p as *const _ as *const _);
         enc.dispatch_thread_groups(
-            MTLSize::new((l.out_dim as u64).div_ceil(64), (n_rows as u64).div_ceil(32), 1),
+            MTLSize::new((l.out_dim as u64).div_ceil(64), (n_rows as u64).div_ceil(MM_TILE_ROWS as u64), 1),
             MTLSize::new(128, 1, 1),
         );
     }
@@ -477,7 +479,7 @@ impl MetalEngine {
             enc.set_buffer(2, Some(y), y_off);
             enc.set_bytes(3, size_of::<MatmulParams>() as u64, &p as *const _ as *const _);
             enc.dispatch_thread_groups(
-                MTLSize::new((l.out_dim as u64).div_ceil(64), (n_rows as u64).div_ceil(32), 1),
+                MTLSize::new((l.out_dim as u64).div_ceil(64), (n_rows as u64).div_ceil(MM_TILE_ROWS as u64), 1),
                 MTLSize::new(128, 1, 1),
             );
 
