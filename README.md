@@ -33,39 +33,36 @@ with `hf auth login`. No config files, no daemon.
 
 ## Performance
 
-Measured on an M1 Pro with `-t 0` (SmolLM2-135M unless noted):
+Measured 2026-08-30 on an M1 Pro, 16 GB, `-t 0`, on a verified-quiet machine
+(SmolLM2-135M-Instruct, ~500-token prompt, unless noted):
 
 | workload | cpu | metal | ane (hybrid) |
 |---|---|---|---|
-| decode | ~49 tok/s | ~230–270 tok/s | = metal |
-| decode (Qwen2.5-0.5B) | ~27 tok/s | ~130 tok/s | — |
-| prefill (676-token prompt) | ~33 tok/s | ~890 tok/s | **~1,900 tok/s** |
+| prefill | ~33 tok/s | **6,243 tok/s** | 8,617 tok/s ¹ |
+| decode | ~49 tok/s | 246 tok/s | 234 tok/s |
+| prefill (Qwen2.5-0.5B) | — | 2,704 tok/s | ² |
+| decode (Qwen2.5-0.5B) | ~27 tok/s | ~113 tok/s | = metal |
 
-Decode speed comes from keeping f16 weights resident on the GPU. Prefill speed
-comes from batching the prompt into tiled matrix-matrix work — and the `ane`
-backend pushes prompt processing onto the Neural Engine, which is faster
-still, draws far less power, and leaves the GPU free to decode for other
-requests in serve mode.
+¹ serve-mode wall time 0.06 s: the prompt runs on the Neural Engine while the
+GPU stays free to decode. ² per-model ANE graphs; see ANE setup below.
 
-What that means end to end (676-token prompt, 200 tokens generated):
-
-| backend | first token after | decode | total |
-|---|---|---|---|
-| cpu | 18.4 s | ~27 tok/s | ~26 s |
-| metal | 0.76 s | ~213 tok/s | ~1.7 s |
-| ane | **0.35 s** | ~232 tok/s | **~1.2 s** |
-
-The `ane` backend doesn't change decode speed — it cuts time-to-first-token,
-which is the number you actually feel in a chat.
+Prefill took a 4–6x jump (2026-08-30) from a flash-attention kernel plus
+Metal 4 tensor-ops matmuls — the same mechanism llama.cpp's Metal backend
+uses; lokal's GPU-only prefill now runs at ~65% of llama.cpp's rate on the
+same machine, with the ANE hybrid ahead of both on time-to-first-token
+(0.06 s vs 0.08 s at ~500 tokens). Decode speed comes from f16 weights
+resident on the GPU, flash-decoding attention, and a GQA-aware kernel that
+reads each cached KV byte once per q-head group — which is also what keeps
+decode flat at long context (Qwen: 113 tok/s at 500 ctx, 53 at 32k).
 
 Serving is where the hybrid pays off most. Concurrent requests decode as one
 batch — a single read of the weights serves every active request — while the
 Neural Engine prefills newly arrived requests off-GPU:
 
-| 4 concurrent requests (451-token prompts) | metal | ane (hybrid) |
+| 4 concurrent requests (~500-token prompts) | metal | ane (hybrid) |
 |---|---|---|
-| single-request prefill | 0.49 s | **0.06 s** |
-| aggregate throughput | 168 tok/s | **365 tok/s** |
+| single-request prefill | 0.08 s | **0.06 s** |
+| aggregate throughput | 216 tok/s | **374 tok/s** |
 
 How lokal compares against other engines on the same machine and model, with
 reproduction steps, lives in [benchmarks/](benchmarks/).
