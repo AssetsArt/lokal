@@ -113,10 +113,21 @@ Architectures: `LlamaForCausalLM`, `Qwen2ForCausalLM`, `MistralForCausalLM`.
 
 ## Backends
 
-Pick with `-b cpu | metal | hybrid`. cpu and metal are verified to produce
-identical greedy output; hybrid matches them in practice too, though on very
-long prompts fp16 rounding can pick a different — equally sensible — token
+Pick with `-b cpu | metal | hybrid | lowmem`. cpu and metal are verified to
+produce identical greedy output; hybrid matches them in practice too, though on
+very long prompts fp16 rounding can pick a different — equally sensible — token
 at a near-tie.
+
+`-b lowmem` is disk-backed paged inference, optimized for models **larger than
+available RAM**: weights stay mmapped on disk and stream through a fixed pool
+page by page, the KV cache is a bounded sliding window (`--context-window`,
+default 2048, plus a few pinned "attention sink" tokens), and `--memory-budget`
+(default 4096 MB) caps the whole working set — the budget split prints at load.
+Prefill cost stays flat out to 32k instead of growing quadratically. The trade
+is honest: a model that fits its budget runs near metal speed; one that doesn't
+is disk-bound (a 29 GB model on a 16 GB machine decodes at SSD speed — fractions
+of a token per second, with ~100 tok/s prefill), and content older than the
+window is genuinely forgotten. See DESIGN.md for the physics.
 
 ### Hybrid setup (optional, once per model)
 
@@ -188,9 +199,12 @@ lokal path [-m <model>]   download if needed, then print the model's local direc
 
 -m, --model <repo|dir>   Hugging Face repo or local directory
     --draft <repo|dir>   smaller same-tokenizer model: speculative decoding (greedy)
--b, --backend <name>     cpu | metal | hybrid                      [cpu]
+-b, --backend <name>     cpu | metal | hybrid | lowmem             [cpu]
 -p, --prompt <text>      prompt text
 -n, --max-tokens <N>     generation budget                      [200]
+    --memory-budget <MB> lowmem: working-set budget            [4096]
+    --context-window <N> lowmem: attention window, tokens      [2048]
+    --attention-sink <N> lowmem: pinned initial tokens, 0=off     [4]
 -t, --temperature <T>    0 = greedy/deterministic               [0.7]
     --top-p <P>          nucleus sampling threshold             [0.9]
     --seed <N>           reproducible sampling
