@@ -37,6 +37,7 @@ struct Args {
     backend: String,
     serve: bool,
     path_only: bool,
+    graphs_path: bool,
     port: u16,
     max_concurrent: usize,
     opt: GenOptions,
@@ -48,6 +49,7 @@ Usage:
   lokal [options]           one-shot generation
   lokal serve [options]     HTTP server (POST /generate)
   lokal path [-m <model>]   download if needed, then print the model's local directory
+  lokal path --graphs       …print the model's Core ML graph directory instead (creating it)
 
 Options:
   -m, --model <repo|dir>   Hugging Face repo or local directory [HuggingFaceTB/SmolLM2-135M]
@@ -71,6 +73,7 @@ impl Args {
             backend: "cpu".into(),
             serve: false,
             path_only: false,
+            graphs_path: false,
             port: 8080,
             max_concurrent: 4,
             opt: GenOptions { prompt: "Once upon a time".into(), ..Default::default() },
@@ -81,6 +84,7 @@ impl Args {
             match flag.as_str() {
                 "serve" => a.serve = true,
                 "path" => a.path_only = true,
+                "--graphs" => a.graphs_path = true,
                 "-m" | "--model" => a.model = val()?,
                 "--draft" => a.draft = Some(val()?),
                 "-b" | "--backend" => a.backend = val()?,
@@ -115,9 +119,21 @@ fn run() -> Result<()> {
     let args = Args::parse()?;
 
     // Three ingredients: config, tokenizer, weights.
+    if args.graphs_path && !args.path_only {
+        return Err("--graphs only makes sense with `lokal path` (see --help)".into());
+    }
+
     let dir = hub::resolve_model(&args.model)?;
     if args.path_only {
-        println!("{}", dir.display());
+        if args.graphs_path {
+            // The one place scripts (run.sh) resolve the lokal-owned graph
+            // directory — same rule the ane backend applies at load time.
+            let loc = hub::graph_location(&dir);
+            std::fs::create_dir_all(&loc.dir)?;
+            println!("{}", loc.dir.display());
+        } else {
+            println!("{}", dir.display());
+        }
         return Ok(());
     }
     let cfg = config::ModelConfig::load(&dir.join("config.json"))?;

@@ -12,9 +12,14 @@ when you want to serve instead of chat.
 ```bash
 ./run.sh                              # SmolLM2-135M on the CPU
 ./run.sh gpu "Once upon a time"       # Metal GPU — ~4x faster decode
+./run.sh export-hybrid                # once per model — Core ML graphs, ~900 MB, minutes
+./run.sh hybrid "Once upon a time"    # Neural Engine + GPU together (needs export-hybrid above)
 ./run.sh chat "Why is the sky blue?"  # Q&A with an Instruct model
 ./run.sh serve                        # HTTP server on port 8080
 ```
+
+The hybrid graphs are built once and land in `~/.cache/lokal/coreml/<model>/`;
+every later run reuses them, and `export-hybrid` skips whatever is already there.
 
 Or drive the binary directly:
 
@@ -45,13 +50,13 @@ Measured 2026-08-30 on an M1 Pro, 16 GB, `-t 0`, on a verified-quiet machine
 | decode (Qwen2.5-0.5B) | ~27 tok/s | 119 tok/s | 120 tok/s |
 
 ¹ the hybrid row implies the split-prefill ladder is exported
-(`./run.sh export-ane-split`, once per model) — with it present, `-b hybrid`
+(`./run.sh export-hybrid`, once per model) — with it present, `-b hybrid`
 splits by default; without it hybrid prefill runs the plain ANE path. Best of 3 passes, as
 in [benchmarks/](benchmarks/) — a warm laptop reads 15–20% lower.
 ³ the Qwen rows were measured just before the RoPE-pair fusion and q-bias
 fold landed, which lift Qwen prefill ~8–9% at short lengths — they are a
 floor, not a ceiling.
-² the ladder is per model (`./run.sh export-ane-split
+² the ladder is per model (`./run.sh export-hybrid
 Qwen/Qwen2.5-0.5B-Instruct` — a different stride and split point than
 SmolLM2's, both measured). With it, Qwen's hybrid prefill beats its Metal
 path at every length — +34% at 2k, +48% at 4k, +55% at 7.7k (same-session
@@ -71,7 +76,7 @@ pipeline's stages, so the day's Metal work — which brought GPU-only prefill
 level with llama.cpp, 9,900 vs 9,880 — lifted the hybrid number with it.
 And the lead is a curve, not a point: measured across the 500–2,000-token
 band, hybrid beats llama.cpp at every length — from +4% at the tightest
-points to +20% — with the ladder `export-ane-split` ships; the full table
+points to +20% — with the ladder `export-hybrid` ships; the full table
 is in [benchmarks/](benchmarks/).
 
 Decode speed comes from f16 weights resident on the GPU, flash-decoding
@@ -116,10 +121,19 @@ at a near-tie.
 ### Hybrid setup (optional, once per model)
 
 ```bash
-./run.sh export-ane        # builds the plain prefill graphs (512 and 2048 tokens) — a few minutes
-./run.sh export-ane-split  # adds the split-prefill ladder — the fastest prefill (see below)
+./run.sh export-hybrid     # plain prefill graphs + the split-prefill ladder — minutes, ~900 MB
 ./run.sh hybrid "Once upon a time"
 ```
+
+The graphs land in a lokal-owned directory — `~/.cache/lokal/coreml/<model>/`
+(`XDG_CACHE_HOME` respected, `LOKAL_GRAPH_DIR` relocates it wholesale) — not in
+the Hugging Face cache, so `hf cache delete` and upstream revision bumps leave
+them alone. Graphs from older lokal versions that still sit next to the weights
+are moved over automatically on the next hybrid run. Each directory carries a
+`graphs.json` naming the model and snapshot revision it was built from: when
+the model moves on, lokal refuses the stale graphs (and says so) rather than
+run old weights; re-running `export-hybrid` rebuilds only what is missing or
+stale — `-f` forces a full rebuild.
 
 lokal routes each prompt by what is measured fastest today: tiny prompts
 (< 64 tokens) skip the ANE — the GPU wins there — short prompts run through
@@ -140,7 +154,8 @@ serve falls back to the plain path automatically. On a 16 GB machine, note
 that a hybrid process peaks around 4 GB on Qwen — running it beside other
 resident inference servers is what tips the OS into killing one of them.
 
-The old fixed-width windowed graph (`./run.sh export-ane-long`) is retired
+The old fixed-width windowed graph (built only by the legacy
+`./run.sh export-ane-long` alias) is retired
 from the default routing: it charges its full 8,192-position attention on
 every chunk, which was the right call when Metal prefill ran at 1,461 tok/s
 and is ~2x slower than Metal today. If it is on disk it stays idle (a

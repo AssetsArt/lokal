@@ -364,6 +364,185 @@ fn fetch_f32(out: &ProtocolObject<dyn MLFeatureProvider>, name: &str) -> crate::
     Ok(v)
 }
 
+/// The prefill-*.mlmodelc entries in a directory, empty if it doesn't exist.
+fn graph_files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut v = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let n = name.to_string_lossy();
+            if n.starts_with("prefill-") && n.ends_with(".mlmodelc") {
+                v.push(entry.path());
+            }
+        }
+    }
+    v
+}
+
+/// Graphs used to be written next to the weights, inside the HF snapshot
+/// directory — where an upstream revision bump orphans them and `hf cache
+/// delete` removes gigabytes it never created. Move anything found there into
+/// the lokal-owned graph dir, once. Move means `rename`, never copy: a copied
+/// .mlmodelc loses its ANE compile-cache entry (keyed on the file identity)
+/// and silently recompiles for minutes on the next load.
+fn migrate_graphs(model_dir: &Path, loc: &crate::hub::GraphLocation) {
+    let legacy = graph_files(model_dir);
+    if legacy.is_empty() || !graph_files(&loc.dir).is_empty() {
+        return;
+    }
+    if std::fs::create_dir_all(&loc.dir).is_err() {
+        return; // unwritable graph dir — the model-dir graphs still load in place
+    }
+    let mut moved = 0usize;
+    for src in &legacy {
+        let Some(name) = src.file_name() else { continue };
+        let dest = loc.dir.join(name);
+        if dest.exists() {
+            continue; // never clobber — rename-onto-existing differs across platforms
+        }
+        if let Err(e) = std::fs::rename(src, &dest) {
+            // Cross-device is the expected failure. Leave everything where it
+            // is (the model dir keeps working, D5) and say how to move it.
+            eprintln!(
+                "ANE: could not move graphs out of the model cache ({e}) — using them in place; \
+                 relocate manually with:  mv {}/prefill-*.mlmodelc {}/",
+                model_dir.display(),
+                loc.dir.display()
+            );
+            break;
+        }
+        moved += 1;
+    }
+    if moved > 0 {
+        eprintln!(
+            "ANE: moved {moved} prefill graph(s) out of the model cache into {}",
+            loc.dir.display()
+        );
+        write_graph_manifest(loc, model_dir);
+    }
+}
+
+/// graphs.json — which model, snapshot revision, and resolved directory the
+/// graphs in this dir were built from, so a later load can refuse graphs whose
+/// weights have moved on. Written via temp file + rename in the same dir: an
+/// export and a serve run may both write it.
+fn write_graph_manifest(loc: &crate::hub::GraphLocation, model_dir: &Path) {
+    let manifest = serde_json::json!({
+        "model": loc.model,
+        "resolved_dir": model_dir
+            .canonicalize()
+            .unwrap_or_else(|_| model_dir.to_path_buf())
+            .display()
+            .to_string(),
+        "revision": loc.revision,
+        "exported_at": iso8601_utc_now(),
+    });
+    let tmp = loc.dir.join(format!(".graphs.json.tmp{}", std::process::id()));
+    let ok = std::fs::write(&tmp, format!("{manifest:#}\n")).is_ok()
+        && std::fs::rename(&tmp, loc.dir.join("graphs.json")).is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(&tmp); // manifest is advisory — never fail a load over it
+    }
+}
+
+/// The manifest fields load-time enforcement reads; the rest is for humans.
+#[derive(serde::Deserialize)]
+struct GraphManifest {
+    revision: Option<String>,
+}
+
+/// Current UTC time as ISO 8601, from std only (civil-from-days per Howard
+/// Hinnant's algorithm — no chrono in the tree).
+fn iso8601_utc_now() -> String {
+    iso8601_utc(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    )
+}
+
+fn iso8601_utc(secs: u64) -> String {
+    let (days, rem) = (secs / 86400, secs % 86400);
+    let (hh, mi, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days as i64 + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mi:02}:{ss:02}Z")
+}
+
+/// Collect prefill graphs from one directory into the three families. The
+/// `seen` set makes the FIRST directory scanned win per file name (graph dir
+/// before model dir — D5).
+fn scan_graph_dir(
+    dir: &Path,
+    seen: &mut std::collections::HashSet<std::ffi::OsString>,
+    found: &mut Vec<(std::path::PathBuf, usize)>,
+    win: &mut Option<(std::path::PathBuf, usize, usize)>,
+    fronts: &mut Vec<(std::path::PathBuf, usize, usize, usize)>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let os_name = entry.file_name();
+        let name = os_name.to_string_lossy().into_owned();
+        let Some(spec) = name.strip_prefix("prefill-").and_then(|s| s.strip_suffix(".mlmodelc"))
+        else {
+            continue;
+        };
+        if !seen.insert(os_name) {
+            continue; // an earlier directory already provides this graph
+        }
+        // prefill-f<layers>-<s>w<p>: the layer-split front half.
+        if let Some((layers, rest)) = spec.strip_prefix('f').and_then(|r| r.split_once('-')) {
+            if let (Ok(a), Some((s, p))) = (layers.parse::<usize>(), rest.split_once('w')) {
+                if let (Ok(s), Ok(p)) = (s.parse::<usize>(), p.parse::<usize>()) {
+                    fronts.push((dir.join(&name), s, p, a));
+                }
+            }
+        } else if let Some((s, p)) = spec.split_once('w') {
+            if let (Ok(s), Ok(p)) = (s.parse::<usize>(), p.parse::<usize>()) {
+                if win.is_none() {
+                    *win = Some((dir.join(&name), s, p));
+                }
+            }
+        } else if let Ok(seq) = spec.parse::<usize>() {
+            found.push((dir.join(&name), seq));
+        }
+    }
+}
+
+/// No graphs anywhere: say exactly what was searched for which model and how
+/// to fix it. If OTHER models have graphs, list them — the classic mistake is
+/// exporting for `…-Instruct` and then running the base model.
+fn missing_graphs_error(loc: &crate::hub::GraphLocation, model_dir: &Path) -> String {
+    let mut msg = format!(
+        "the hybrid backend has no prefill graphs for {}\n  searched: {}  (lokal graph cache)\n            {}  (model directory)\n  build them once with:  ./run.sh export-hybrid {}",
+        loc.model,
+        loc.dir.display(),
+        model_dir.display(),
+        loc.model
+    );
+    let own = loc.dir.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let others: Vec<String> = std::fs::read_dir(crate::hub::graph_cache_base())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name() != own && !graph_files(&e.path()).is_empty())
+        .take(3)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    if !others.is_empty() {
+        msg.push_str(&format!("\n  graphs exist for: {}", others.join(", ")));
+    }
+    msg
+}
+
 pub struct AneEngine {
     metal: MetalEngine,
     graphs: Vec<CoreMlPrefill>, // sorted by seq, ascending — one fixed shape each
@@ -377,40 +556,66 @@ pub struct AneEngine {
 
 impl AneEngine {
     pub fn new(model: Model, model_dir: &Path) -> crate::Result<Self> {
-        // Collect every prefill graph next to the model: prefill-<seq>.mlmodelc
-        // (plain) and prefill-<s>w<p>.mlmodelc (windowed).
+        // Graphs live in the lokal-owned graph directory (hub::graph_location),
+        // with the model directory as the legacy fallback — graphs exported
+        // straight into a snapshot dir keep working forever, sitting next to
+        // the exact weights they were built from.
+        let loc = crate::hub::graph_location(model_dir);
+        migrate_graphs(model_dir, &loc);
+
+        // graphs.json says which snapshot the graphs were built from. On a
+        // mismatch the model moved on — silently running graphs built from
+        // different weights is the one failure worse than being slow, so
+        // refuse the whole directory and carry on without it. A local-dir
+        // model records no revision and is not enforced.
+        let mut refused_stale = false;
+        let graph_dir_current = match std::fs::read(loc.dir.join("graphs.json")) {
+            Err(_) => true, // no manifest — nothing recorded, nothing to enforce
+            Ok(bytes) => match serde_json::from_slice::<GraphManifest>(&bytes) {
+                Err(e) => {
+                    eprintln!(
+                        "ANE: {}/graphs.json is unreadable ({e}) — using the graphs anyway",
+                        loc.dir.display()
+                    );
+                    true
+                }
+                Ok(m) => match (m.revision, &loc.revision) {
+                    (Some(built), Some(now)) if built != *now => {
+                        eprintln!(
+                            "ANE: graphs in {} were built from revision {built}, but {} now \
+                             resolves to {now} — refusing them (re-export: ./run.sh export-hybrid {})",
+                            loc.dir.display(),
+                            loc.model,
+                            loc.model
+                        );
+                        refused_stale = true;
+                        false
+                    }
+                    _ => true,
+                },
+            },
+        };
+
+        // Collect every prefill graph: prefill-<seq>.mlmodelc (plain),
+        // prefill-<s>w<p>.mlmodelc (windowed), prefill-f<A>-<s>w<p>.mlmodelc
+        // (split front half). Graph dir first, model dir second — the graph
+        // dir wins per file name.
         let mut found = Vec::new();
         let mut win = None;
         let mut fronts = Vec::new();
-        for entry in std::fs::read_dir(model_dir)? {
-            let name = entry?.file_name().to_string_lossy().into_owned();
-            let Some(spec) = name.strip_prefix("prefill-").and_then(|s| s.strip_suffix(".mlmodelc"))
-            else {
-                continue;
-            };
-            // prefill-f<layers>-<s>w<p>: the layer-split front half.
-            if let Some((layers, rest)) = spec.strip_prefix('f').and_then(|r| r.split_once('-')) {
-                if let (Ok(a), Some((s, p))) = (layers.parse::<usize>(), rest.split_once('w')) {
-                    if let (Ok(s), Ok(p)) = (s.parse::<usize>(), p.parse::<usize>()) {
-                        fronts.push((model_dir.join(&name), s, p, a));
-                    }
-                }
-            } else if let Some((s, p)) = spec.split_once('w') {
-                if let (Ok(s), Ok(p)) = (s.parse::<usize>(), p.parse::<usize>()) {
-                    win = Some((model_dir.join(&name), s, p));
-                }
-            } else if let Ok(seq) = spec.parse::<usize>() {
-                found.push((model_dir.join(&name), seq));
-            }
+        let mut seen = std::collections::HashSet::new();
+        if graph_dir_current {
+            scan_graph_dir(&loc.dir, &mut seen, &mut found, &mut win, &mut fronts);
         }
+        scan_graph_dir(model_dir, &mut seen, &mut found, &mut win, &mut fronts);
         if found.is_empty() {
-            return Err(format!(
-                "the ane backend needs prefill-<seq>.mlmodelc graphs in the model directory — build them once with:\n  \
-                 uv run --python 3.12 --with torch --with coremltools --with safetensors --with numpy --with tokenizers \\\n    \
-                 tools/export_prefill.py {} --shapes 512,2048",
-                model_dir.display()
-            )
-            .into());
+            if refused_stale {
+                // The stale graphs were refused and nothing else exists: stay
+                // up — every prompt runs on Metal until a re-export.
+                eprintln!("ANE: no usable prefill graphs — running everything on Metal");
+            } else {
+                return Err(missing_graphs_error(&loc, model_dir).into());
+            }
         }
         found.sort_by_key(|&(_, seq)| seq);
         // First load on a machine sends each graph through ANECompilerService, which
@@ -901,5 +1106,16 @@ impl Session for AneSession<'_> {
             t.elapsed().as_secs_f64()
         );
         self.metal.prefill_from(&ids[ane_n..], ane_n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn iso8601_matches_known_epochs() {
+        assert_eq!(super::iso8601_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(super::iso8601_utc(1_000_000_000), "2001-09-09T01:46:40Z");
+        // A leap-year date past February.
+        assert_eq!(super::iso8601_utc(1_709_251_200), "2024-03-01T00:00:00Z");
     }
 }

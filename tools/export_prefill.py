@@ -31,8 +31,10 @@
 import argparse
 import gc
 import json
+import os
 import shutil
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -253,7 +255,7 @@ class WindowedNet(torch.nn.Module):
         return torch.stack(k_out), torch.stack(v_out)
 
 
-def export_front(args, cfg, weights, spec):
+def export_front(args, cfg, weights, spec, out, reuse_ok):
     """Export the layer-split FRONT half: a windowed chunk graph that runs layers
     0..A and returns both their K/V and the hidden state, so a second device can
     finish layers A..L for the same chunk. This is what makes GPU and ANE work on
@@ -277,6 +279,11 @@ def export_front(args, cfg, weights, spec):
     hd = cfg["hidden_size"] // cfg["num_attention_heads"]
     kvd = cfg["num_key_value_heads"] * hd
     H = cfg["hidden_size"]
+
+    dest = out / f"prefill-f{A}-{fs}w{fp}.mlmodelc"
+    if reuse_ok and dest.exists():
+        print(f"skip: {dest.name} (already built)", flush=True)
+        return dest
 
     t_export = time.time()
     fnet = WindowedNet(cfg, weights, fs, fp, n_front=A).eval()
@@ -375,7 +382,6 @@ def export_front(args, cfg, weights, spec):
     del fnet, got, k2, v2, x2
     gc.collect()
 
-    dest = args.model_dir / f"prefill-f{A}-{fs}w{fp}.mlmodelc"
     with tempfile.TemporaryDirectory() as tmp:
         mlmodel.save(str(Path(tmp) / f"prefill-f{A}-{fs}w{fp}.mlpackage"))
         if dest.exists():
@@ -407,17 +413,47 @@ def main():
                          "moves with the chunk size")
     ap.add_argument("--front-layers", type=int, default=0,
                     help="how many leading layers the --front graph runs (default: half)")
+    ap.add_argument("--out", type=Path, default=None,
+                    help="directory to write graphs and graphs.json into (default: the model "
+                         "dir, so a direct invocation behaves exactly as it always did)")
+    ap.add_argument("--model", default=None,
+                    help="model spec to record in graphs.json (what run.sh was invoked with; "
+                         "defaults to the model dir path)")
+    ap.add_argument("-f", "--force", action="store_true",
+                    help="rebuild every graph, even ones already built and revision-current")
     args = ap.parse_args()
     shapes = [] if args.shapes == "none" else sorted(int(s) for s in args.shapes.split(","))
+
+    out = args.out if args.out is not None else args.model_dir
+    out.mkdir(parents=True, exist_ok=True)
+    resolved_dir = args.model_dir.resolve()
+    revision = resolved_dir.name if resolved_dir.parent.name == "snapshots" else None
+    # A graph already on disk is reused only when graphs.json proves it was built
+    # from this same snapshot revision — a stale-revision graph is rebuilt, never
+    # skipped, because skipping it would keep wrong weights alive. -f rebuilds all.
+    try:
+        _recorded = json.loads((out / "graphs.json").read_text()).get("revision")
+        manifest_current = _recorded == revision
+    except (OSError, ValueError):
+        manifest_current = False
+    reuse_ok = manifest_current and not args.force
 
     import coremltools as ct
 
     cfg = json.loads((args.model_dir / "config.json").read_text())
     weights = load_file(args.model_dir / "model.safetensors")
-    net = PrefillNet(cfg, weights, shapes[-1]).eval() if shapes else None
+    net = None  # built lazily: an all-skip run must not pay for a torch weight copy
 
     done = []
     for seq in shapes:
+        dest = out / f"prefill-{seq}.mlmodelc"
+        if reuse_ok and dest.exists():
+            # Still counts as this run's graph: keeps the cleanup sweep off it.
+            done.append(dest)
+            print(f"skip: {dest.name} (already built)", flush=True)
+            continue
+        if net is None:
+            net = PrefillNet(cfg, weights, shapes[-1]).eval()
         print(f"tracing graph (S={seq}) ...", flush=True)
         traced = torch.jit.trace(net, torch.zeros(1, seq, dtype=torch.int32))
 
@@ -452,7 +488,6 @@ def main():
         # clutter the shared Hugging Face cache snapshot.
         with tempfile.TemporaryDirectory() as tmp:
             mlmodel.save(str(Path(tmp) / f"prefill-{seq}.mlpackage"))
-            dest = args.model_dir / f"prefill-{seq}.mlmodelc"
             if dest.exists():
                 shutil.rmtree(dest)
             shutil.copytree(mlmodel.get_compiled_model_path(), dest)
@@ -468,109 +503,114 @@ def main():
     if args.front != "none":
         for spec in args.front.split(","):
             front_widths.add(int(spec.split("x")[0]))
-            done.append(export_front(args, cfg, weights, spec))
+            done.append(export_front(args, cfg, weights, spec, out, reuse_ok))
 
     if args.window != "none":
         ws, wp = (int(v) for v in args.window.split("x"))
-        L = cfg["num_hidden_layers"]
-        kvd = cfg["num_key_value_heads"] * (cfg["hidden_size"] // cfg["num_attention_heads"])
-        wnet = WindowedNet(cfg, weights, ws, wp).eval()
-        del weights
-        gc.collect()
+        wdest = out / f"prefill-{ws}w{wp}.mlmodelc"
+        if reuse_ok and wdest.exists():
+            done.append(wdest)
+            print(f"skip: {wdest.name} (already built)", flush=True)
+        else:
+            L = cfg["num_hidden_layers"]
+            kvd = cfg["num_key_value_heads"] * (cfg["hidden_size"] // cfg["num_attention_heads"])
+            wnet = WindowedNet(cfg, weights, ws, wp).eval()
+            del weights
+            gc.collect()
 
-        hd = cfg["hidden_size"] // cfg["num_attention_heads"]
-        print(f"tracing windowed graph (S={ws}, P={wp}) ...", flush=True)
-        ex = (
-            torch.zeros(1, ws, dtype=torch.int32),
-            torch.zeros(ws, hd),
-            torch.zeros(ws, hd),
-            torch.zeros(L, wp, kvd),
-            torch.zeros(L, wp, kvd),
-            torch.zeros(1, wp),
-        )
-        with torch.no_grad():
-            traced = torch.jit.trace(wnet, ex)
-        print("converting ...", flush=True)
-        mlmodel = ct.convert(
-            traced,
-            inputs=[
-                ct.TensorType(name="ids", shape=(1, ws), dtype=np.int32),
-                ct.TensorType(name="cos", shape=(ws, hd), dtype=np.float16),
-                ct.TensorType(name="sin", shape=(ws, hd), dtype=np.float16),
-                ct.TensorType(name="k_past", shape=(L, wp, kvd), dtype=np.float16),
-                ct.TensorType(name="v_past", shape=(L, wp, kvd), dtype=np.float16),
-                ct.TensorType(name="past_valid", shape=(1, wp), dtype=np.float16),
-            ],
-            outputs=[ct.TensorType(name="k_cache", dtype=np.float32),
-                     ct.TensorType(name="v_cache", dtype=np.float32)],
-            compute_precision=ct.precision.FLOAT16,
-            compute_units=ct.ComputeUnit.CPU_AND_NE,
-            minimum_deployment_target=ct.target.macOS15,
-            convert_to="mlprogram",
-        )
-        del traced
-        gc.collect()
+            hd = cfg["hidden_size"] // cfg["num_attention_heads"]
+            print(f"tracing windowed graph (S={ws}, P={wp}) ...", flush=True)
+            ex = (
+                torch.zeros(1, ws, dtype=torch.int32),
+                torch.zeros(ws, hd),
+                torch.zeros(ws, hd),
+                torch.zeros(L, wp, kvd),
+                torch.zeros(L, wp, kvd),
+                torch.zeros(1, wp),
+            )
+            with torch.no_grad():
+                traced = torch.jit.trace(wnet, ex)
+            print("converting ...", flush=True)
+            mlmodel = ct.convert(
+                traced,
+                inputs=[
+                    ct.TensorType(name="ids", shape=(1, ws), dtype=np.int32),
+                    ct.TensorType(name="cos", shape=(ws, hd), dtype=np.float16),
+                    ct.TensorType(name="sin", shape=(ws, hd), dtype=np.float16),
+                    ct.TensorType(name="k_past", shape=(L, wp, kvd), dtype=np.float16),
+                    ct.TensorType(name="v_past", shape=(L, wp, kvd), dtype=np.float16),
+                    ct.TensorType(name="past_valid", shape=(1, wp), dtype=np.float16),
+                ],
+                outputs=[ct.TensorType(name="k_cache", dtype=np.float32),
+                         ct.TensorType(name="v_cache", dtype=np.float32)],
+                compute_precision=ct.precision.FLOAT16,
+                compute_units=ct.ComputeUnit.CPU_AND_NE,
+                minimum_deployment_target=ct.target.macOS15,
+                convert_to="mlprogram",
+            )
+            del traced
+            gc.collect()
 
-        # Two-chunk sanity on natural text (random ids overstate fp16 drift):
-        # chunk 1 through torch, then chunk 2 with that past, Core ML vs torch.
-        from tokenizers import Tokenizer
-        tok = Tokenizer.from_file(str(args.model_dir / "tokenizer.json"))
-        sent = ("The river was beautiful that morning and everyone stopped to look "
-                "at it for a while before walking on toward the harbor. ")
-        text_ids = np.array(tok.encode(sent * 200).ids[: 2 * ws], dtype=np.int32)
-        theta = cfg.get("rope_theta", 10000.0)
+            # Two-chunk sanity on natural text (random ids overstate fp16 drift):
+            # chunk 1 through torch, then chunk 2 with that past, Core ML vs torch.
+            from tokenizers import Tokenizer
+            tok = Tokenizer.from_file(str(args.model_dir / "tokenizer.json"))
+            sent = ("The river was beautiful that morning and everyone stopped to look "
+                    "at it for a while before walking on toward the harbor. ")
+            text_ids = np.array(tok.encode(sent * 200).ids[: 2 * ws], dtype=np.int32)
+            theta = cfg.get("rope_theta", 10000.0)
 
-        def rope_tables(pos0, n):
-            inv = 1.0 / (theta ** (np.arange(0, hd, 2, dtype=np.float64) / hd))
-            ang = np.outer(np.arange(pos0, pos0 + n, dtype=np.float64), inv)
-            emb = np.concatenate([ang, ang], axis=-1)
-            return np.cos(emb).astype(np.float32), np.sin(emb).astype(np.float32)
+            def rope_tables(pos0, n):
+                inv = 1.0 / (theta ** (np.arange(0, hd, 2, dtype=np.float64) / hd))
+                ang = np.outer(np.arange(pos0, pos0 + n, dtype=np.float64), inv)
+                emb = np.concatenate([ang, ang], axis=-1)
+                return np.cos(emb).astype(np.float32), np.sin(emb).astype(np.float32)
 
-        c1, s1 = rope_tables(0, ws)
-        c2, s2 = rope_tables(ws, ws)
-        with torch.no_grad():
-            z = torch.zeros(L, wp, kvd)
-            k1, v1 = wnet(torch.from_numpy(text_ids[:ws][None, :]),
-                          torch.from_numpy(c1), torch.from_numpy(s1),
-                          z, z, torch.zeros(1, wp))
-            kp = torch.zeros(L, wp, kvd)
-            vp = torch.zeros(L, wp, kvd)
-            kp[:, :ws] = k1
-            vp[:, :ws] = v1
-            valid = torch.zeros(1, wp)
-            valid[0, :ws] = 1.0
-            k2, v2 = wnet(torch.from_numpy(text_ids[ws:][None, :]),
-                          torch.from_numpy(c2), torch.from_numpy(s2), kp, vp, valid)
-        got = mlmodel.predict({
-            "ids": text_ids[ws:][None, :],
-            "cos": c2.astype(np.float16),
-            "sin": s2.astype(np.float16),
-            "k_past": kp.numpy().astype(np.float16),
-            "v_past": vp.numpy().astype(np.float16),
-            "past_valid": valid.numpy().astype(np.float16),
-        })
-        dk = np.abs(got["k_cache"] - k2.numpy()).max()
-        dv = np.abs(got["v_cache"] - v2.numpy()).max()
-        print(f"windowed S={ws} P={wp}: max abs diff Core ML vs torch fp32: K {dk:.4f}, V {dv:.4f}", flush=True)
-        del wnet, got, k1, v1, k2, v2, kp, vp
-        gc.collect()
+            c1, s1 = rope_tables(0, ws)
+            c2, s2 = rope_tables(ws, ws)
+            with torch.no_grad():
+                z = torch.zeros(L, wp, kvd)
+                k1, v1 = wnet(torch.from_numpy(text_ids[:ws][None, :]),
+                              torch.from_numpy(c1), torch.from_numpy(s1),
+                              z, z, torch.zeros(1, wp))
+                kp = torch.zeros(L, wp, kvd)
+                vp = torch.zeros(L, wp, kvd)
+                kp[:, :ws] = k1
+                vp[:, :ws] = v1
+                valid = torch.zeros(1, wp)
+                valid[0, :ws] = 1.0
+                k2, v2 = wnet(torch.from_numpy(text_ids[ws:][None, :]),
+                              torch.from_numpy(c2), torch.from_numpy(s2), kp, vp, valid)
+            got = mlmodel.predict({
+                "ids": text_ids[ws:][None, :],
+                "cos": c2.astype(np.float16),
+                "sin": s2.astype(np.float16),
+                "k_past": kp.numpy().astype(np.float16),
+                "v_past": vp.numpy().astype(np.float16),
+                "past_valid": valid.numpy().astype(np.float16),
+            })
+            dk = np.abs(got["k_cache"] - k2.numpy()).max()
+            dv = np.abs(got["v_cache"] - v2.numpy()).max()
+            print(f"windowed S={ws} P={wp}: max abs diff Core ML vs torch fp32: K {dk:.4f}, V {dv:.4f}", flush=True)
+            del wnet, got, k1, v1, k2, v2, kp, vp
+            gc.collect()
 
-        with tempfile.TemporaryDirectory() as tmp:
-            mlmodel.save(str(Path(tmp) / f"prefill-{ws}w{wp}.mlpackage"))
-            dest = args.model_dir / f"prefill-{ws}w{wp}.mlmodelc"
-            if dest.exists():
-                shutil.rmtree(dest)
-            shutil.copytree(mlmodel.get_compiled_model_path(), dest)
-        del mlmodel
-        gc.collect()
-        done.append(dest)
-        print(f"saved: {dest}", flush=True)
+            with tempfile.TemporaryDirectory() as tmp:
+                mlmodel.save(str(Path(tmp) / f"prefill-{ws}w{wp}.mlpackage"))
+                dest = wdest
+                if dest.exists():
+                    shutil.rmtree(dest)
+                shutil.copytree(mlmodel.get_compiled_model_path(), dest)
+            del mlmodel
+            gc.collect()
+            done.append(dest)
+            print(f"saved: {dest}", flush=True)
 
     # Remove stale graphs from older exports — but only of the kinds this run
     # actually rebuilt: a plain-only run must not delete the windowed graph and
     # a --shapes none windowed run must not delete the plain graphs (that
     # cross-delete once wiped a model's whole graph set).
-    for old in args.model_dir.glob("prefill-*.mlmodelc"):
+    for old in out.glob("prefill-*.mlmodelc"):
         spec = old.stem.removeprefix("prefill-")
         if spec.startswith("f") and "-" in spec:   # front-half split graph
             # Scoped to the chunk width: rebuilding the 128-wide family must not
@@ -584,6 +624,20 @@ def main():
             rebuilt_kind = bool(shapes)
         if rebuilt_kind and old not in done:
             shutil.rmtree(old)
+
+    # graphs.json: which model, revision, and resolved dir these graphs belong
+    # to — the Rust side refuses the directory when the revision moved on, and
+    # the skip logic above trusts it. Temp file + rename: an export and a serve
+    # run may both write it.
+    manifest = {
+        "model": args.model or str(args.model_dir),
+        "resolved_dir": str(resolved_dir),
+        "revision": revision,
+        "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    tmp = out / f".graphs.json.tmp{os.getpid()}"
+    tmp.write_text(json.dumps(manifest, indent=2) + "\n")
+    os.replace(tmp, out / "graphs.json")
     print(f"done: {len(done)} graph(s)")
 
 
