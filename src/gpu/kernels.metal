@@ -565,6 +565,50 @@ kernel void rmsnorm(
     }
 }
 
+// rmsnorm variant for the prefill path: same math, but the normalized row is
+// written twice — f32 for the residual pipeline, half for the tensor-ops
+// matmul operands (saves a separate conversion dispatch per use).
+kernel void rmsnorm_hf(
+    device const float *x [[buffer(0)]],
+    device const half *weight [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    device half *y_h [[buffer(3)]],
+    constant NormParams &p [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    device const float *xr = x + (ulong)row * p.dim;
+    device float *yr = y + (ulong)row * p.dim;
+    device half *yh = y_h + (ulong)row * p.dim;
+
+    threadgroup float partial[NORM_TG / 32];
+
+    float acc = 0.0f;
+    for (uint i = tid; i < p.dim; i += NORM_TG) {
+        acc += xr[i] * xr[i];
+    }
+    float sg = simd_sum(acc);
+    if (tid % 32 == 0) {
+        partial[tid / 32] = sg;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint j = 0; j < NORM_TG / 32; j++) {
+            total += partial[j];
+        }
+        partial[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float scale = rsqrt(partial[0] / (float)p.dim + p.eps);
+    for (uint i = tid; i < p.dim; i += NORM_TG) {
+        float v = xr[i] * scale * (float)weight[i];
+        yr[i] = v;
+        yh[i] = (half)v;
+    }
+}
+
 // ---------- RoPE (model.rs::rope) ----------
 // One thread rotates one dimension pair (i, i+half) of one head of one row —
 // fully independent work. Row r sits at real position pos0 + r
@@ -837,6 +881,7 @@ kernel void attention_prefill_flash(
     device const half *v_cache [[buffer(2)]],
     device float *out [[buffer(3)]],
     constant AttnParams &p [[buffer(4)]],
+    device half *out_h [[buffer(5)]], // half copy for o_proj's tensor-ops operand
     uint2 tg [[threadgroup_position_in_grid]], // x = query head, y = query row tile
     uint2 tpos [[thread_position_in_threadgroup]])
 {
@@ -997,7 +1042,9 @@ kernel void attention_prefill_flash(
         uint gr = r0 + r;
         if (gr < p.n_rows) {
             uint d = idx % FA_HD;
-            out[(ulong)gr * p.n_heads * FA_HD + head * FA_HD + d] = Os[r][d] / l_i[r];
+            float v = Os[r][d] / l_i[r];
+            out[(ulong)gr * p.n_heads * FA_HD + head * FA_HD + d] = v;
+            out_h[(ulong)gr * p.n_heads * FA_HD + head * FA_HD + d] = (half)v;
         }
     }
 }
@@ -1536,6 +1583,24 @@ kernel void silu_mul(
     }
     float g = gate[gid];
     gate[gid] = (g / (1.0f + exp(-g))) * up[gid];
+}
+
+// silu_mul variant for the prefill path: also emits the half copy that feeds
+// down_proj's tensor-ops matmul.
+kernel void silu_mul_hf(
+    device float *gate [[buffer(0)]],
+    device const float *up [[buffer(1)]],
+    device half *gate_h [[buffer(2)]],
+    constant ElemParams &p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= p.dim) {
+        return;
+    }
+    float g = gate[gid];
+    float v = (g / (1.0f + exp(-g))) * up[gid];
+    gate[gid] = v;
+    gate_h[gid] = (half)v;
 }
 
 // x += y  (residual connection)
