@@ -117,13 +117,46 @@ pinned public-domain corpus (auto-downloaded, sha256-checked), and
 `run_longctx.py` drives the full engine × size matrix one server at a time,
 with `summarize_longctx.py` building the tables.
 
-The long-context matrix is pending re-measurement: the lokal-only baseline
-taken on 2026-08-29/30 (2k–24k, in git history) predates the flash-prefill
-rewrite and split prefill, so those rows are obsolete as a comparison.
-Facts that survive from that pass: the windowed ANE graph covers the first
-8,192 positions of a long prompt (Metal takes the tail), and a machine pays
-a one-time ~250 s Apple ANE-compiler cost on the first load of that graph
-(cached afterwards).
+Long prompts are where routing assumptions go stale: a ~7.7k-token Qwen
+prompt through the old fixed-width windowed graph took 8.0 s (961 tok/s)
+while plain `-b metal` took 4.1 s — the graph charges its full 8,192-position
+attention on every chunk, which was right when Metal prefilled at 1,461
+tok/s and inverted when Metal got its 7x. The 2026-08-30 routing rework
+retires that graph from default routing (it cannot win at any length on
+this hardware; `LOKAL_WINDOWED_PREFILL=1` revives it for A/B) and gives
+Qwen its own split ladder — stride 512, 9 of 24 front layers (8 and 10
+both measured slower), rungs {0, 2048, 4096, 7168}.
+
+Measured same-session HTTP rows, Qwen2.5-0.5B-Instruct (single pass per
+point, machine state on every row; llama.cpp needed `--ctx 34816` — its
+`-c` is divided across `--parallel` slots, and the harness's shape-derived
+default starves a long prompt to a 400):
+
+| prompt tokens | `-b hybrid` | `-b metal` | llama.cpp | vs metal |
+|---|---|---|---|---|
+| ~494 | 4,063 | 3,854 | **4,630** | +5% |
+| ~2,067 | **4,392** | 3,161 | 4,323 | +37% |
+| ~4,039 | **3,825** | 2,593 | 3,766 | +48% |
+| ~7,692 | 2,836 | 1,831 | **2,960** | +55% |
+
+The split now also edges llama.cpp in the 2k–4k band; at 7.7k it lands 4%
+short of llama.cpp on a machine warm from a day of benchmarking (the
+integrator's cool-machine spot read 2,989 vs 2,966 before this lane's
+numbers were re-taken — treat the GOAL as within thermal noise, not won),
+and short Qwen prompts remain llama.cpp's (4,630 vs our plain-head 4,063 —
+the ladder does not engage below three chunks). SmolLM2's ladder gained
+long-band rungs {3072, 4608, 7168} for the same reason — at ~7.2k it used
+to drain to Metal after 2.3k tokens and win by only 1%; it now pipelines
+the whole prompt (+5%, byte-identical output to `-b metal`). The split is
+never slower than Metal at any measured length on either model — that
+property, not any single number, is what the routing guard enforces.
+
+A cost fact that survives from the earlier pass: each Core ML graph
+carries a full weight copy (~0.9 GB per graph on Qwen), so a hybrid
+process peaks around 4 GB there — the exit-137 sweep death on a 16 GB
+machine was the OS reclaiming memory with another engine's server
+resident, and retiring the windowed graph from default loading removes
+the biggest avoidable slice of that footprint.
 
 ## Long context: Qwen2.5-0.5B at 8k
 

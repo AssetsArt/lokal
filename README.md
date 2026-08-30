@@ -40,18 +40,21 @@ Measured 2026-08-30 on an M1 Pro, 16 GB, `-t 0`, on a verified-quiet machine
 |---|---|---|---|
 | prefill | ~33 tok/s | 9,900 tok/s | **11,986 tok/s** ¹ |
 | decode | ~49 tok/s | 231 tok/s | 237 tok/s |
-| prefill (Qwen2.5-0.5B) | ~5 tok/s | 4,000 tok/s | 4,660 tok/s ² |
+| prefill (Qwen2.5-0.5B) | ~5 tok/s | 3,802 tok/s | 4,660 tok/s ² |
+| prefill @~7.7k (Qwen2.5-0.5B) | — | 1,831 tok/s | **2,836 tok/s** ² |
 | decode (Qwen2.5-0.5B) | ~27 tok/s | 119 tok/s | 120 tok/s |
 
 ¹ the hybrid row implies the split-prefill ladder is exported
 (`./run.sh export-ane-split`, once per model) — with it present, `-b hybrid`
 splits by default; without it hybrid prefill runs the plain ANE path. Best of 3 passes, as
 in [benchmarks/](benchmarks/) — a warm laptop reads 15–20% lower.
-² Qwen has the plain and windowed ANE graphs exported but not the split
-ladder, so its hybrid row is ANE prefill without the two-device pipeline —
-the ladder is per model (`./run.sh export-ane-split Qwen/Qwen2.5-0.5B-Instruct`).
-Qwen is 3.7x the parameters of SmolLM2, which is most of the gap between
-the two blocks.
+² the ladder is per model (`./run.sh export-ane-split
+Qwen/Qwen2.5-0.5B-Instruct` — a different stride and split point than
+SmolLM2's, both measured). With it, Qwen's hybrid prefill beats its Metal
+path at every length — +34% at 2k, +48% at 4k, +55% at 7.7k (same-session
+HTTP pairs; the 7.7k row above) — where the old fixed-width windowed
+routing was 2x *slower* than Metal there. Qwen is 3.7x the parameters of
+SmolLM2, which is most of the gap between the two blocks.
 
 Prefill took a 4–6x jump (2026-08-30) from a flash-attention kernel plus
 Metal 4 tensor-ops matmuls — the same mechanism llama.cpp's Metal backend
@@ -111,30 +114,34 @@ at a near-tie.
 
 ```bash
 ./run.sh export-ane        # builds the plain prefill graphs (512 and 2048 tokens) — a few minutes
-./run.sh export-ane-long   # optional: adds the long-context windowed graph (slow; see note below)
-./run.sh export-ane-split  # optional: adds the split-prefill ladder — the fastest prefill (see below)
+./run.sh export-ane-split  # adds the split-prefill ladder — the fastest prefill (see below)
 ./run.sh hybrid "Once upon a time"
 ```
 
-lokal picks the graph that fits the prompt: tiny prompts (< 64 tokens) skip
-the ANE — the GPU is faster there — and, when the windowed graph is present,
-long prompts run in chunks through it, carrying the accumulated context and
-keeping everything up to 8k tokens on the ANE (beyond that, Metal takes the
-tail seamlessly). That is what makes long prompts fast: a 6,086-token prompt
-prefills in 3.3 s vs 14.1 s on Metal alone. Without the windowed graph the
-ANE still serves the first 2,048 tokens and Metal the rest.
+lokal routes each prompt by what is measured fastest today: tiny prompts
+(< 64 tokens) skip the ANE — the GPU wins there — short prompts run through
+a padded plain graph while that still beats Metal on the same rows, and
+everything longer goes through the split-prefill ladder when it is
+exported, or straight to Metal when it is not. A wrong choice is never
+kept: the hybrid backend is measured to be at least as fast as `-b metal`
+at every length, on both test models.
 
 With the split ladder exported, `-b hybrid` runs prefill as a two-device
 pipeline by default — the front layers of each prompt chunk on the Neural
 Engine while the GPU works the back layers of the previous one; that is the
 11,986 tok/s row above, and no flag is needed. `LOKAL_SPLIT_PREFILL=0`
 disables it for A/B runs. The ladder costs ~150 MB of disk per front graph
-(each rung carries its own weight copy), and a prompt the ladder cannot
-serve falls back to the plain path automatically.
+for SmolLM2 and ~500 MB for Qwen (each rung carries its own weight copy,
+including the model's full embedding table), and a prompt the ladder cannot
+serve falls back to the plain path automatically. On a 16 GB machine, note
+that a hybrid process peaks around 4 GB on Qwen — running it beside other
+resident inference servers is what tips the OS into killing one of them.
 
-The windowed graph is the expensive one — minutes to export, and the first
-load on each machine spends a few more minutes in Apple's ANE compiler
-(one-time; cached after that, with a notice printed while it runs).
+The old fixed-width windowed graph (`./run.sh export-ane-long`) is retired
+from the default routing: it charges its full 8,192-position attention on
+every chunk, which was the right call when Metal prefill ran at 1,461 tok/s
+and is ~2x slower than Metal today. If it is on disk it stays idle (a
+notice says so); `LOKAL_WINDOWED_PREFILL=1` loads it for A/B comparison.
 
 The export step needs [uv](https://docs.astral.sh/uv/) and runs offline.
 Placement is verified, not assumed: inspecting the compiled graph with the
