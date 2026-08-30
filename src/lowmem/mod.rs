@@ -184,7 +184,7 @@ impl LowMemEngine {
     /// materializes the full model in RAM.
     pub fn new(dir: &Path, cfg: ModelConfig, opts: &LowMemOpts) -> crate::Result<Self> {
         let t0 = Instant::now();
-        let manifest = WeightManifest::open(dir)?;
+        let mut manifest = WeightManifest::open(dir)?;
         eprintln!(
             "lowmem: manifest {} tensors | {:.1}M params (headers parsed in {:.2}s)",
             manifest.n_tensors(),
@@ -193,6 +193,7 @@ impl LowMemEngine {
         );
 
         let device = Device::system_default().ok_or("no Metal-capable GPU found")?;
+        manifest.make_gpu_views(&device);
         let queue = device.new_command_queue();
         let lib = device
             .new_library_with_source(&gpu::shader_source(cfg.kv_dim()), &CompileOptions::new())
@@ -249,7 +250,7 @@ impl LowMemEngine {
             matvec_swiglu: pipe("matvec_swiglu")?,
             matmul_pg: pipe("matmul_pg")?,
             f32_to_f16: pipe("f32_to_f16")?,
-            bf16_to_f16: pipe("bf16_to_f16_inplace")?,
+            bf16_to_f16: pipe("bf16_to_f16_copy")?,
             rope: pipe("rope")?,
             rope_h: pipe("rope_h")?,
             rope_qk_decode: pipe("rope_qk_decode")?,

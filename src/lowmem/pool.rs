@@ -89,6 +89,15 @@ struct Page {
     epoch: u64,
 }
 
+/// One GPU stage-in: convert `elems` bf16 values at `src_off` bytes into the
+/// checkpoint's mmap view straight into the f16 pool page `dst`.
+pub(super) struct PendingConvert {
+    pub src: Buffer,
+    pub src_off: usize,
+    pub dst: Buffer,
+    pub elems: usize,
+}
+
 /// make_resident's verdict when the budget is tight.
 pub(super) enum Admit {
     Ready,
@@ -113,10 +122,10 @@ pub(super) struct WeightPool {
     epoch: u64,
     /// Highest epoch whose command buffer has finished on the GPU.
     completed: u64,
-    /// bf16 pages land as RAW BITS (memcpy) and convert on the GPU: each entry
-    /// is a buffer awaiting a bf16_to_f16_inplace dispatch, which the session
-    /// encodes at the head of the same command buffer that first reads it.
-    pending_convert: Vec<(Buffer, usize)>,
+    /// bf16 pages stage GPU-side: each entry is a bf16_to_f16_copy dispatch
+    /// (mmap view → pool page) that the session encodes at the head of the
+    /// same command buffer that first reads the page. No CPU byte is moved.
+    pending_convert: Vec<PendingConvert>,
     /// Evicted pages park their buffers here by size instead of freeing them:
     /// a fresh MTLBuffer costs an allocation plus a zero-fill page fault for
     /// every byte written — in thrash mode that doubled the staging traffic.
@@ -145,9 +154,9 @@ impl WeightPool {
         }
     }
 
-    /// Buffers staged since the last call that still hold raw bf16 bits — the
-    /// caller encodes their conversion before any dispatch that reads them.
-    pub fn take_pending_converts(&mut self) -> Vec<(Buffer, usize)> {
+    /// Stage-ins queued since the last call — the caller encodes them before
+    /// any dispatch that reads the pages they fill.
+    pub fn take_pending_converts(&mut self) -> Vec<PendingConvert> {
         std::mem::take(&mut self.pending_convert)
     }
 
@@ -319,19 +328,32 @@ impl WeightPool {
                 false
             }
             Dtype::BF16 => {
-                // Raw bits only — the GPU converts in place before first use
-                // (bf16_to_f16_inplace). The CPU's share of a bf16 page is a
-                // copy, parallelized because a single core's ~10 GB/s memcpy is
-                // the whole thrash-mode budget (~1 GB restaged per token when
-                // the model exceeds the pool).
-                let out_b =
-                    unsafe { std::slice::from_raw_parts_mut(dp as *mut u8, src.len()) };
-                out_b
-                    .par_chunks_mut(1 << 20)
-                    .zip(src.par_chunks(1 << 20))
-                    .for_each(|(d, s)| d.copy_from_slice(s));
-                self.pending_convert.push((dst.clone(), rows * t.in_dim));
-                false
+                // The GPU stages the page itself, reading the checkpoint bytes
+                // through the mmap's no-copy view — zero CPU bytes moved. The
+                // CPU fallback (view missing or an unaligned span) converts in
+                // parallel like the F32 path.
+                if let Some((view, off)) = mf.gpu_span(&t.name, r0, r0 + rows)? {
+                    self.pending_convert.push(PendingConvert {
+                        src: view.clone(),
+                        src_off: off,
+                        dst: dst.clone(),
+                        elems: rows * t.in_dim,
+                    });
+                    false
+                } else {
+                    out.par_chunks_mut(t.in_dim)
+                        .zip(src.par_chunks(t.in_dim * 2))
+                        .map(|(d, s)| {
+                            let mut c = false;
+                            for (o, b) in d.iter_mut().zip(s.chunks_exact(2)) {
+                                let v = half::bf16::from_le_bytes([b[0], b[1]]).to_f32();
+                                c |= v.abs() > f16::MAX.to_f32();
+                                *o = f16::from_f32(v).to_bits();
+                            }
+                            c
+                        })
+                        .reduce(|| false, |a, b| a | b)
+                }
             }
             Dtype::F32 => out
                 .par_chunks_mut(t.in_dim)

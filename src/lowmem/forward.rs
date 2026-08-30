@@ -10,7 +10,7 @@
 //!     chunk touches at most `chunk` scattered rows, which never justifies
 //!     keeping a vocab × hidden table resident.
 
-use super::pool::{Admit, PagedTensor, WeightPool};
+use super::pool::{Admit, PagedTensor, PendingConvert, WeightPool};
 use super::{LayerWeights, LowMemEngine};
 use crate::engine::Session;
 use crate::gpu::metal as gpu;
@@ -282,16 +282,20 @@ impl<'a> LowMemSession<'a> {
         }
     }
 
-    /// Convert freshly staged bf16 pages to f16 in place — encoded at the HEAD
-    /// of the command buffer that first reads them (serial encoder = ordered).
-    fn enc_pending_converts(&self, enc: &ComputeCommandEncoderRef, conv: &[(Buffer, usize)]) {
-        for (buf, elems) in conv {
-            let d = *elems as u32;
+    /// GPU stage-ins: convert bf16 spans straight from the checkpoint's mmap
+    /// view into their f16 pool pages — encoded at the HEAD of the command
+    /// buffer that first reads them (serial encoder = ordered). The buffer
+    /// binds at a 4-byte-aligned offset; the sub-offset rides in p.y.
+    fn enc_pending_converts(&self, enc: &ComputeCommandEncoderRef, conv: &[PendingConvert]) {
+        for c in conv {
+            let base = (c.src_off & !3) as u64;
+            let p: [u32; 2] = [c.elems as u32, ((c.src_off & 3) >> 1) as u32];
             enc.set_compute_pipeline_state(&self.e.pipes.bf16_to_f16);
-            enc.set_buffer(0, Some(buf), 0);
-            set_bytes(enc, 1, &d);
-            enc.set_buffer(2, Some(&self.e.clip_flag), 0);
-            gpu::dispatch_grid(enc, *elems);
+            enc.set_buffer(0, Some(&c.src), base);
+            enc.set_buffer(1, Some(&c.dst), 0);
+            set_bytes(enc, 2, &p);
+            enc.set_buffer(3, Some(&self.e.clip_flag), 0);
+            gpu::dispatch_grid(enc, c.elems);
         }
     }
 

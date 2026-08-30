@@ -6,6 +6,7 @@
 //! which is what lets a model larger than RAM open at all.
 
 use memmap2::{Advice, Mmap};
+use metal::{Buffer, Device, MTLResourceOptions};
 use safetensors::{Dtype, SafeTensors};
 use std::collections::HashMap;
 use std::path::Path;
@@ -21,11 +22,24 @@ pub(crate) struct TensorMeta {
 }
 
 pub(crate) struct WeightManifest {
+    /// No-copy MTLBuffers wrapping each shard's mmap, so kernels read weight
+    /// bytes straight from the page cache — the pattern llama.cpp ships for
+    /// larger-than-RAM models on Apple silicon: file-backed pages stay
+    /// reclaimable, fault in on first GPU touch, and never exist twice.
+    /// (Human-directed exception to the spec's original never-hand-mmap-to-
+    /// Metal rule, recorded on the task.) Declared before `shards` so the
+    /// buffers drop before the mappings they alias.
+    views: Vec<Buffer>,
     shards: Vec<Mmap>,
     tensors: HashMap<String, TensorMeta>,
     /// Total parameter count, summed from the headers — no data was read for it.
     pub n_params: usize,
 }
+
+// The views alias plain readonly mmaps; Metal buffer handles are documented
+// thread-safe (same justification as the engines).
+unsafe impl Send for WeightManifest {}
+unsafe impl Sync for WeightManifest {}
 
 impl WeightManifest {
     pub fn open(dir: &Path) -> crate::Result<Self> {
@@ -56,7 +70,45 @@ impl WeightManifest {
             shards.push(mmap);
         }
         let n_params = tensors.values().map(|m| m.shape.iter().product::<usize>()).sum();
-        Ok(Self { shards, tensors, n_params })
+        Ok(Self { views: Vec::new(), shards, tensors, n_params })
+    }
+
+    /// Create the GPU views (once, at engine build). mmap bases are page
+    /// aligned; the length rounds up to the page the mapping already spans.
+    pub fn make_gpu_views(&mut self, device: &Device) {
+        const PAGE: usize = 16384;
+        self.views = self
+            .shards
+            .iter()
+            .map(|m| {
+                device.new_buffer_with_bytes_no_copy(
+                    m.as_ptr() as *const _,
+                    m.len().next_multiple_of(PAGE) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                )
+            })
+            .collect();
+    }
+
+    /// GPU view + absolute byte offset for rows r0..r1 of a 2-D tensor, or
+    /// None when views are absent or the span can't be read as ushorts.
+    pub fn gpu_span(
+        &self,
+        name: &str,
+        r0: usize,
+        r1: usize,
+    ) -> crate::Result<Option<(&Buffer, usize)>> {
+        let m = self.meta(name)?;
+        let n_rows = m.shape.first().copied().unwrap_or(0);
+        if m.shape.len() != 2 || r1 > n_rows || r0 >= r1 {
+            return Err(format!("gpu_span({name}, {r0}..{r1}): tensor has shape {:?}", m.shape).into());
+        }
+        let off = m.offset + r0 * (m.len / n_rows);
+        Ok(match self.views.get(m.shard) {
+            Some(b) if off % 2 == 0 => Some((b, off)),
+            _ => None,
+        })
     }
 
     pub fn n_tensors(&self) -> usize {
