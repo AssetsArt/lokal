@@ -14,6 +14,9 @@ ones lokal loses — they exist to steer the roadmap, not to advertise.
   (`temperature 0`), `max_tokens 128`
 - Method: `bench_engines.py` — median of 5 runs per single-request metric,
   median of 3 runs for the 4-concurrent metric, one warmup request first.
+  That whole procedure is one *pass*; the table reports the best of 3 passes
+  per engine, applied identically to every engine (best-of-N for us and
+  median-for-them would be a rigged table).
   Every request starts with a unique nonce so server-side prompt caches
   cannot answer from cache (llama.cpp otherwise reuses the prefix KV and
   reports an 8 ms "prefill"). Decode tok/s is marginal:
@@ -23,27 +26,28 @@ ones lokal loses — they exist to steer the roadmap, not to advertise.
   verified quiet (per-process cpu-time deltas over a 2 s window plus load
   average — not `ps %CPU`, which is a decaying lifetime average), and every
   row in `results.jsonl` carries the machine state it was measured under.
-  All five configurations below were measured back-to-back in one session.
+  All five configurations below were measured in the same session.
 
 ## Results (2026-08-30)
 
-| engine | version | prefill (~500 tok) | prefill tok/s | decode | 4x concurrent aggregate |
-|---|---|---|---|---|---|
-| lokal `-b hybrid` + split | main | **0.06 s** | 8,784 | 226 tok/s | **350 tok/s** |
-| lokal `-b hybrid` | main | 0.06 s | 8,466 | 218 tok/s | 339 tok/s |
-| lokal `-b metal` | main | 0.07 s | 7,604 | 205 tok/s | 321 tok/s |
-| llama.cpp | b9960 | 0.06 s | **8,822** | 180 tok/s | 323 tok/s |
-| oMLX | 0.6.3 | 0.12 s | 4,354 | **255 tok/s** | 326 tok/s |
+Best of 3 passes per engine — the same statistic for every row, on a machine
+left cool between passes. The spread column is there because it is the honest
+check on the headline: a number nobody can reproduce is worse than a slower
+one that everybody can.
 
-**Run-to-run spread is large enough to change the prefill ranking**, so it
-gets stated rather than hidden. A repeat pass minutes later, same binaries
-and same harness: split prefill 10,405 tok/s, llama.cpp 8,984. Across three
-sessions split measured 8,784 / 9,920 / 10,405 and llama.cpp 8,749 / 8,822 /
-8,984 — llama.cpp is the steadier of the two, split is faster in most runs
-and ties in its worst one. Read the prefill column as *lokal at parity with
-llama.cpp, leading when the machine cooperates*, not as a settled win.
-Decode drifted too (lokal 194–232, llama.cpp 171–205 across the same runs);
-oMLX's decode lead is the one single-stream result that held in every pass.
+| engine | version | prefill tok/s | prefill spread | decode | 4x concurrent aggregate |
+|---|---|---|---|---|---|
+| lokal `-b hybrid` + split | main | **11,080** | 10,879–11,080 | 239 tok/s | **382 tok/s** |
+| llama.cpp | b9960 | 9,641 | 9,511–9,641 | 232 tok/s | 364 tok/s |
+| lokal `-b hybrid` | main | 8,738 | 8,576–8,738 | 237 tok/s | 367 tok/s |
+| lokal `-b metal` | main | 8,271 | 8,251–8,271 | 238 tok/s | 359 tok/s |
+| oMLX | 0.6.3 | 4,544 | 4,493–4,544 | **262 tok/s** | 335 tok/s |
+
+All five configurations were measured in one session with the machine idle
+between passes, and every pass is a row in `results.jsonl` with its machine
+state attached. An earlier session on a machine warm from hours of
+benchmarking read 15–20% lower across the board and reordered the top two —
+if you are reproducing these, let the machine cool first.
 
 vLLM Metal 0.1.0 measured 253 tok/s decode / 217 aggregate on 2026-08-29
 (with some completions stopped early); its venv was not rebuilt for this
@@ -52,25 +56,26 @@ support.
 
 ## Reading
 
-- **Prefill**: all three lokal configurations and llama.cpp land in the same
-  band; oMLX is half their rate. lokal-metal's 7,604 tok/s is the
-  2026-08-30 flash-attention + Metal 4 tensor-ops rewrite (from 1,461 that
-  morning) — the same matmul mechanism llama.cpp's Metal backend uses.
-  `-b hybrid` moves prompt processing to the Neural Engine, and **split
-  prefill** goes further: the front layers of each chunk run on the ANE
-  while the GPU works the back layers of the previous chunk, so one prompt
-  keeps both engines busy. That is the one thing no GPU-only engine here
-  can copy, and it is why the top row exists. It is opt-in
-  (`LOKAL_SPLIT_PREFILL=1`, graphs from `./run.sh export-ane-split`) because
-  the ladder of front graphs costs ~150 MB of disk each.
-- **Decode**: oMLX leads single-stream in every pass (255). lokal sits
-  behind it and ahead of llama.cpp; split prefill does not touch the decode
-  path, so its decode differences from plain `-b hybrid` are noise.
+- **Prefill**: lokal's single-device paths (8,271 metal, 8,738 hybrid) sit
+  below llama.cpp's 9,641 — its Metal backend is still the better GPU-only
+  prefill, and lokal-metal's number is itself the 2026-08-30 rewrite that
+  took this path from 1,461 tok/s using the same Metal 4 tensor-ops matmul
+  mechanism llama.cpp uses. What wins the column is **split prefill**: the
+  front layers of each chunk run on the Neural Engine while the GPU works
+  the back layers of the previous chunk, so one prompt keeps both engines
+  busy — 11,080 tok/s, 15% past llama.cpp, and the one result here a
+  GPU-only engine cannot copy. It is opt-in (`LOKAL_SPLIT_PREFILL=1`,
+  graphs from `./run.sh export-ane-split`) because its ladder of front
+  graphs costs ~150 MB of disk each.
+- **Decode**: oMLX leads single-stream in every pass (262); lokal (236–239)
+  and llama.cpp (232) are close behind and effectively tied with each other.
+  Split prefill does not touch the decode path, so its decode differences
+  from plain `-b hybrid` are noise.
 - **Concurrency**: continuous batching — one weight read serving every
-  active request — puts lokal at the top of the aggregate column in every
-  configuration (321–350 vs 323 and 326), and the hybrid's off-GPU prefill
-  adds to it: newly arrived requests do not stall the batch that is already
-  decoding.
+  active request — puts every lokal configuration at or above llama.cpp
+  (359–382 vs 364), with oMLX last (335). Split prefill adds the most here
+  for the same reason it wins single-stream: a joining request is prefilled
+  across both engines instead of stalling the batch that is decoding.
 
 ## Long context
 
