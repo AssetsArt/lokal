@@ -383,6 +383,50 @@ kernel void matmul_t(
     cT.store(mC);
 }
 
+// Tensor-ops matmul with a half destination — the prefill k/v projections, whose
+// output IS the KV cache. Same operands as matmul_t (the rmsnorm half copy is
+// already staged when the projections run); the f32 accumulator is staged through
+// threadgroup memory so bias-add and the half rounding happen in one step, exactly
+// like matmul_h's epilogue (a direct half store would double-round biased layers).
+kernel void matmul_th(
+    device const half *w [[buffer(0)]],
+    device const half *x [[buffer(1)]],
+    device half *y [[buffer(2)]],
+    device const half *bias [[buffer(3)]],
+    constant MatmulParams &p [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]], // x = output tile (64), y = token tile (32)
+    uint2 tpos [[thread_position_in_threadgroup]])
+{
+    uint tid = tpos.x;
+    auto tA = tensor((device half *)x, dextents<int32_t, 2>(p.in_dim, p.n_rows), array<int, 2>({1, (int)p.in_dim}));
+    auto tB = tensor((device half *)w, dextents<int32_t, 2>(p.in_dim, p.out_dim), array<int, 2>({1, (int)p.in_dim}));
+
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        32, 64, static_cast<int>(dynamic_extent), false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
+
+    auto mA = tA.slice(0, (int)(tgid.y * 32));
+    auto mB = tB.slice(0, (int)(tgid.x * 64));
+    auto cT = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
+    op.run(mA, mB, cT);
+
+    threadgroup float Cs[32 * 64];
+    auto tC = tensor((threadgroup float *)Cs, dextents<int32_t, 2>(64, 32), array<int, 2>({1, 64}));
+    cT.store(tC);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tid; idx < 32 * 64; idx += 128) {
+        uint m = idx / 64;
+        uint n = idx % 64;
+        uint gr = tgid.y * 32 + m;
+        uint go = tgid.x * 64 + n;
+        if (gr < p.n_rows && go < p.out_dim) {
+            y[(ulong)gr * p.out_dim + go] = (half)(Cs[m * 64 + n] + (float)bias[go]);
+        }
+    }
+}
+
 // f32 activations -> half staging for the tensor-ops matmul operands.
 kernel void f32_to_f16(
     device const float *x [[buffer(0)]],

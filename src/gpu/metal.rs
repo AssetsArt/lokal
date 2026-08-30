@@ -137,6 +137,7 @@ struct Pipelines {
     matvec_h: ComputePipelineState,
     matmul: ComputePipelineState,
     matmul_t: ComputePipelineState,
+    matmul_th: ComputePipelineState,
     f32_to_f16: ComputePipelineState,
     bias_add: ComputePipelineState,
     matmul_h: ComputePipelineState,
@@ -278,6 +279,7 @@ impl MetalEngine {
             matvec_h: pipe("matvec_h")?,
             matmul: pipe("matmul")?,
             matmul_t: pipe("matmul_t")?,
+            matmul_th: pipe("matmul_th")?,
             f32_to_f16: pipe("f32_to_f16")?,
             bias_add: pipe("bias_add")?,
             matmul_h: pipe("matmul_h")?,
@@ -384,6 +386,9 @@ impl MetalEngine {
     }
 
     /// enc_linear writing f16 — the k/v projections, whose output IS the KV cache.
+    /// With a staged half input (the rmsnorm half copy) and multiple rows, the
+    /// tensor-ops kernel takes it; single rows and the batched decode path keep
+    /// the matvec/simdgroup kernels.
     #[allow(clippy::too_many_arguments)]
     fn enc_linear_kv(
         &self,
@@ -393,8 +398,23 @@ impl MetalEngine {
         y: &Buffer,
         y_off: u64,
         n_rows: usize,
+        xh: Option<&Buffer>,
     ) {
-        self.enc_linear_with(&self.pipes.matvec_h, &self.pipes.matmul_h, enc, l, x, 0, y, y_off, n_rows, None, false);
+        let (Some(xh), true) = (xh, n_rows > 1) else {
+            self.enc_linear_with(&self.pipes.matvec_h, &self.pipes.matmul_h, enc, l, x, 0, y, y_off, n_rows, None, false);
+            return;
+        };
+        let p = MatmulParams { in_dim: l.in_dim, out_dim: l.out_dim, n_rows: n_rows as u32 };
+        enc.set_compute_pipeline_state(&self.pipes.matmul_th);
+        enc.set_buffer(0, Some(&l.w), 0);
+        enc.set_buffer(1, Some(xh), 0);
+        enc.set_buffer(2, Some(y), y_off);
+        enc.set_buffer(3, Some(&l.bias), 0);
+        enc.set_bytes(4, size_of::<MatmulParams>() as u64, &p as *const _ as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new((l.out_dim as u64).div_ceil(64), (n_rows as u64).div_ceil(32), 1),
+            MTLSize::new(128, 1, 1),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -989,8 +1009,8 @@ impl MetalSession<'_> {
             // Attention half.
             e.enc_rmsnorm_hf(enc, &self.x, &blk.input_layernorm, &self.xn, &self.xh, n);
             e.enc_linear(enc, &blk.q_proj, &self.xn, 0, &self.q, 0, n, Some(&self.xh), false);
-            e.enc_linear_kv(enc, &blk.k_proj, &self.xn, &self.k_cache[l], kv_byte_off, n);
-            e.enc_linear_kv(enc, &blk.v_proj, &self.xn, &self.v_cache[l], kv_byte_off, n);
+            e.enc_linear_kv(enc, &blk.k_proj, &self.xn, &self.k_cache[l], kv_byte_off, n, Some(&self.xh));
+            e.enc_linear_kv(enc, &blk.v_proj, &self.xn, &self.v_cache[l], kv_byte_off, n, Some(&self.xh));
             e.enc_rope(enc, &self.q, 0, cfg.num_attention_heads, pos0, n, false);
             e.enc_rope(enc, &self.k_cache[l], kv_byte_off, cfg.num_key_value_heads, pos0, n, true);
             e.enc_attention(enc, &self.q, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.scores, &self.att, pos0, n, self.max_seq, &self.xh);
