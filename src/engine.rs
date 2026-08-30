@@ -95,6 +95,24 @@ pub fn create(
     }
 }
 
+/// Everything -b lowmem accepts from the CLI (None = that knob's default).
+/// Lives here rather than in src/lowmem/ so non-macOS builds still parse and
+/// reject the flags with a clear message.
+#[derive(Default, Clone, Copy)]
+pub struct LowMemOpts {
+    pub memory_budget_mb: Option<usize>,
+    pub context_window: Option<usize>,
+    pub attention_sink: Option<usize>,
+}
+
+impl LowMemOpts {
+    pub fn any_set(&self) -> bool {
+        self.memory_budget_mb.is_some()
+            || self.context_window.is_some()
+            || self.attention_sink.is_some()
+    }
+}
+
 /// The lowmem backend is created from the model DIRECTORY, not a loaded Model —
 /// the whole point of that backend is never materializing the full model in RAM,
 /// so it cannot come through `create`'s Model parameter. main.rs branches here
@@ -102,12 +120,13 @@ pub fn create(
 pub fn create_lowmem(
     model_dir: &std::path::Path,
     cfg: ModelConfig,
+    opts: &LowMemOpts,
 ) -> crate::Result<Box<dyn Engine>> {
     #[cfg(target_os = "macos")]
-    return Ok(Box::new(crate::lowmem::LowMemEngine::new(model_dir, cfg)?));
+    return Ok(Box::new(crate::lowmem::LowMemEngine::new(model_dir, cfg, opts)?));
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (model_dir, cfg);
+        let _ = (model_dir, cfg, opts);
         Err("the lowmem backend needs Metal — macOS only".into())
     }
 }

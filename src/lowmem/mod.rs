@@ -25,9 +25,59 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
 
-/// Pool size until --memory-budget lands (D9's closed-form arithmetic replaces
-/// this: pool = budget − KV − activations − fixed overhead, default budget 4096).
-const POOL_MB_DEFAULT: usize = 3072;
+pub use crate::engine::LowMemOpts;
+
+/// Default total working-set budget in MB (D9).
+const BUDGET_MB_DEFAULT: usize = 4096;
+/// Fixed runtime overhead estimate: binary, tokenizer, Metal runtime, shader
+/// library, session bookkeeping — everything that is neither weights, KV, nor
+/// activation scratch. Estimated from measured phys_footprint minus the
+/// accounted parts on this machine's runs; deliberately round.
+const OVERHEAD_MB: usize = 256;
+
+/// D9's closed-form budget split. Pure arithmetic so the refuse-to-start path
+/// is testable without a GPU.
+struct MemoryPlan {
+    kv_bytes: usize,
+    act_bytes: usize,
+    pool_bytes: usize,
+}
+
+fn memory_plan(cfg: &ModelConfig, win: &WindowCfg, budget_mb: usize) -> crate::Result<MemoryPlan> {
+    let (h, hd, kvd) = (cfg.hidden_size, cfg.head_dim(), cfg.kv_dim());
+    let chunk = gpu::PREFILL_CHUNK;
+    // KV store: K and V, f16, cap slots per layer — closed-form in the window.
+    let kv_bytes = cfg.num_hidden_layers * win.cap * kvd * 2 * 2;
+    // One session's activation scratch, mirroring LowMemSession::new.
+    let scores = if hd == gpu::FLASH_HEAD_DIM {
+        4
+    } else {
+        chunk * cfg.num_attention_heads * win.cap * 4
+    };
+    let act_bytes = 5 * chunk * h * 4                    // x, xn, q, att, xb
+        + 2 * chunk * cfg.intermediate_size * 4          // gate, up
+        + 2 * chunk * kvd * 4                            // kvs staging
+        + chunk * h * 2                                  // xh
+        + scores
+        + cfg.num_attention_heads * (win.cap / gpu::ATTN_SPLIT) * (hd + 2) * 4
+        + cfg.vocab_size * 4;                            // logits
+    let fixed = kv_bytes + act_bytes + (OVERHEAD_MB << 20);
+    let budget = budget_mb << 20;
+    let floor = 4 * PAGE_BYTES;
+    if budget < fixed + floor {
+        return Err(format!(
+            "--memory-budget {budget_mb} MB cannot hold the working set: KV {} MB (window {} × {} layers) + activations {} MB + runtime overhead {} MB leaves less than the {} MB weight-pool floor — raise the budget or shrink --context-window",
+            kv_bytes >> 20,
+            win.w,
+            cfg.num_hidden_layers,
+            act_bytes >> 20,
+            OVERHEAD_MB,
+            floor >> 20,
+        )
+        .into());
+    }
+    Ok(MemoryPlan { kv_bytes, act_bytes, pool_bytes: budget - fixed })
+}
 
 /// Sliding-window attention geometry. The KV store per layer is a SINK region
 /// (positions 0..sink pinned forever, StreamingLLM-style) followed by a RING of
@@ -127,7 +177,7 @@ unsafe impl Sync for LowMemEngine {}
 impl LowMemEngine {
     /// Built from the model DIRECTORY, not a loaded Model — nothing here ever
     /// materializes the full model in RAM.
-    pub fn new(dir: &Path, cfg: ModelConfig) -> crate::Result<Self> {
+    pub fn new(dir: &Path, cfg: ModelConfig, opts: &LowMemOpts) -> crate::Result<Self> {
         let t0 = Instant::now();
         let manifest = WeightManifest::open(dir)?;
         eprintln!(
@@ -151,11 +201,10 @@ impl LowMemEngine {
         let env_usize = |k: &str, d: usize| {
             std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
         };
-        // Debug overrides until the --context-window / --attention-sink flags
-        // land with the CLI phase.
+        // Flags first, env second (debug), defaults last.
         let win = WindowCfg::new(
-            env_usize("LOKAL_LOWMEM_WINDOW", 2048),
-            env_usize("LOKAL_LOWMEM_SINK", 4),
+            opts.context_window.unwrap_or_else(|| env_usize("LOKAL_LOWMEM_WINDOW", 2048)),
+            opts.attention_sink.unwrap_or_else(|| env_usize("LOKAL_LOWMEM_SINK", 4)),
         )?;
 
         let gqa_chunk =
@@ -263,22 +312,28 @@ impl LowMemEngine {
             .unwrap_or(1);
         let zero_bias = gpu::f16_buffer(&device, &vec![0.0; max_rows]);
 
-        // Debug override until --memory-budget lands; the budget arithmetic
-        // (D9) replaces this as the public knob.
-        let pool_mb = std::env::var("LOKAL_LOWMEM_POOL_MB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(POOL_MB_DEFAULT);
-        let pool = WeightPool::new(&device, pool_mb << 20);
-        let kv_mb = cfg.num_hidden_layers * win.cap * cfg.kv_dim() * 2 * 2 >> 20;
+        // The budget split (D9). LOKAL_LOWMEM_POOL_MB stays as a debug override
+        // that pins the pool directly, bypassing the arithmetic.
+        let budget_mb = opts.memory_budget_mb.unwrap_or(BUDGET_MB_DEFAULT);
+        let plan = memory_plan(&cfg, &win, budget_mb)?;
+        let pool_bytes = match std::env::var("LOKAL_LOWMEM_POOL_MB") {
+            Ok(v) => v.parse::<usize>().map(|mb| mb << 20).unwrap_or(plan.pool_bytes),
+            Err(_) => plan.pool_bytes,
+        };
+        let pool = WeightPool::new(&device, pool_bytes);
+        // The one-line budget arithmetic, printed at load (D9).
         eprintln!(
-            "lowmem: {} — weight pool {} MB (pages ≤ {} MB) | window {} +{} sink, KV ring {} MB total",
+            "lowmem: {} — budget {} MB = weights {} MB (paged, ≤{} MB pages) + KV {} MB (window {} +{} sink × {} layers) + activations {} MB + overhead {} MB",
             device.name(),
-            pool_mb,
+            budget_mb,
+            pool_bytes >> 20,
             PAGE_BYTES >> 20,
+            plan.kv_bytes >> 20,
             win.w,
             win.sink,
-            kv_mb,
+            cfg.num_hidden_layers,
+            plan.act_bytes >> 20,
+            OVERHEAD_MB,
         );
 
         Ok(Self {
@@ -311,4 +366,44 @@ impl Engine for LowMemEngine {
     }
     // batcher() stays None: serve mode falls back to per-request sessions. The
     // pool lock in run() makes concurrent sessions correct, merely slow.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::EosIds;
+
+    fn qwen05b_cfg() -> ModelConfig {
+        ModelConfig {
+            architectures: vec!["Qwen2ForCausalLM".into()],
+            hidden_size: 896,
+            intermediate_size: 4864,
+            num_hidden_layers: 24,
+            num_attention_heads: 14,
+            num_key_value_heads: 2,
+            vocab_size: 151936,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1e6,
+            max_position_embeddings: 32768,
+            eos_token_id: EosIds::default(),
+        }
+    }
+
+    /// D9's refuse-to-start path: an impossible budget errors with the
+    /// arithmetic in the message, and a feasible one splits exactly.
+    #[test]
+    fn budget_arithmetic_refuses_impossible_budgets() {
+        let cfg = qwen05b_cfg();
+        let win = WindowCfg::new(2048, 4).unwrap();
+        let err = match memory_plan(&cfg, &win, 300) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a 300 MB budget must be refused"),
+        };
+        assert!(err.contains("--memory-budget 300"), "{err}");
+        assert!(err.contains("weight-pool floor"), "{err}");
+        let plan = memory_plan(&cfg, &win, 4096).unwrap();
+        let total = plan.kv_bytes + plan.act_bytes + (OVERHEAD_MB << 20) + plan.pool_bytes;
+        assert_eq!(total, 4096 << 20);
+        assert!(plan.pool_bytes >= 4 * PAGE_BYTES);
+    }
 }

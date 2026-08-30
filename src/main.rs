@@ -42,6 +42,7 @@ struct Args {
     graphs_path: bool,
     port: u16,
     max_concurrent: usize,
+    lowmem: engine::LowMemOpts,
     opt: GenOptions,
 }
 
@@ -56,7 +57,13 @@ Usage:
 Options:
   -m, --model <repo|dir>   Hugging Face repo or local directory [HuggingFaceTB/SmolLM2-135M]
       --draft <repo|dir>   smaller same-tokenizer model for speculative decoding (greedy only)
-  -b, --backend <name>     cpu, metal (Apple GPU), hybrid (Neural Engine + GPU together) [cpu]
+  -b, --backend <name>     cpu, metal (Apple GPU), hybrid (Neural Engine + GPU together),
+                           lowmem (disk-backed paged inference — optimized for models larger
+                           than available RAM; uses a bounded attention window and may reduce
+                           long-context quality) [cpu]
+      --memory-budget <MB> lowmem only: total working-set budget [4096]
+      --context-window <N> lowmem only: sliding attention window in tokens [2048]
+      --attention-sink <N> lowmem only: pinned initial tokens, 0 disables [4]
   -p, --prompt <text>      prompt text [\"Once upon a time\"]
   -n, --max-tokens <N>     maximum number of tokens to generate [200]
   -t, --temperature <T>    0 = greedy (fully deterministic), higher = more adventurous [0.7]
@@ -78,6 +85,7 @@ impl Args {
             graphs_path: false,
             port: 8080,
             max_concurrent: 4,
+            lowmem: engine::LowMemOpts::default(),
             opt: GenOptions { prompt: "Once upon a time".into(), ..Default::default() },
         };
         let mut it = std::env::args().skip(1);
@@ -98,6 +106,9 @@ impl Args {
                 "--chat" => a.opt.chat = true,
                 "--port" => a.port = val()?.parse()?,
                 "--max-concurrent" => a.max_concurrent = val()?.parse()?,
+                "--memory-budget" => a.lowmem.memory_budget_mb = Some(val()?.parse()?),
+                "--context-window" => a.lowmem.context_window = Some(val()?.parse()?),
+                "--attention-sink" => a.lowmem.attention_sink = Some(val()?.parse()?),
                 "-h" | "--help" => {
                     println!("{USAGE}");
                     std::process::exit(0);
@@ -145,7 +156,12 @@ fn run() -> Result<()> {
     // to the GPU). lowmem builds itself from the model directory — it must never
     // go through Model::load's full-RAM materialization (see src/lowmem/).
     let engine = if args.backend == "lowmem" {
-        engine::create_lowmem(&dir, cfg.clone())?
+        engine::create_lowmem(&dir, cfg.clone(), &args.lowmem)?
+    } else if args.lowmem.any_set() {
+        return Err(
+            "--memory-budget, --context-window, and --attention-sink apply to -b lowmem only"
+                .into(),
+        );
     } else {
         let t0 = Instant::now();
         let model = model::Model::load(&dir, cfg.clone())?;
