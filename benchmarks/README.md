@@ -79,17 +79,33 @@ cost on the first load of that graph (cached afterwards).
 
 ## Reproduction
 
+One engine, one row — the server is started and stopped for you:
+
 ```bash
-# classic table, one engine at a time (server lifecycle included):
-python3 benchmarks/run_longctx.py --engines lokal-ane-http --sizes 500 --runs 5
+python3 benchmarks/bench_engines.py --engine lokal-ane
+python3 benchmarks/bench_engines.py --engine llamacpp
+python3 benchmarks/bench_engines.py --engine omlx --out benchmarks/results.jsonl
+```
 
-# or against an already-running server:
-python3 benchmarks/bench_engines.py --api openai --url http://127.0.0.1:8081/v1 \
-    --model <name> --runs 5 --concurrency 4
+`--engine` takes any key from `engines.py`: `lokal-metal`, `lokal-ane`,
+`lokal-metal-cli`, `lokal-ane-cli`, `llamacpp`, `omlx`. Add `--model qwen` to
+run the same engine on Qwen2.5-0.5B-Instruct instead of the default
+SmolLM2-135M-Instruct, and `--prompt-tokens N` for a long prompt. Sweeping
+sizes or engines is the same registry through the other driver:
 
-# long-context matrix (when re-measuring):
+```bash
 python3 benchmarks/run_longctx.py --engines lokal-ane-cli,llamacpp,omlx \
     --sizes 2000,6000,10000,16000,24000,32000
 ```
+
+To measure a server you are running yourself, skip `--engine` and describe it:
+
+```bash
+python3 benchmarks/bench_engines.py --api openai --url http://127.0.0.1:8081/v1 \
+    --model-name <name> --runs 5 --concurrency 4
+```
+
+llama.cpp needs a GGUF and oMLX needs an MLX copy of the model; the paths are
+at the top of `engines.py` and a missing one is reported by name.
 
 Raw per-run output with machine-state stamps: [results.jsonl](results.jsonl).

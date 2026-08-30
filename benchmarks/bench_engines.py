@@ -21,12 +21,16 @@
 # reuses the KV of a repeated prefix, for example) cannot answer from cache — the
 # benchmark measures compute, not caching.
 #
-# Usage (server must already be running):
+# Usage — one engine, server started and stopped for you (engines.py knows the
+# flags; --model picks the family, default smol):
+#   python3 benchmarks/bench_engines.py --engine lokal-ane
+#   python3 benchmarks/bench_engines.py --engine llamacpp --model qwen --prompt-tokens 2000
+#   python3 benchmarks/bench_engines.py --engine lokal-ane-cli --model qwen --prompt-tokens 16000
+#
+# Or point it at a server you are running yourself:
 #   python3 benchmarks/bench_engines.py --api lokal  --url http://127.0.0.1:8080 --name "lokal (metal)"
 #   python3 benchmarks/bench_engines.py --api openai --url http://127.0.0.1:8081/v1 \
-#       --model SmolLM2-135M-Instruct --name "llama.cpp" --out benchmarks/results.jsonl
-#   python3 benchmarks/bench_engines.py --api cli --bin ./target/release/lokal \
-#       --model Qwen/Qwen2.5-0.5B-Instruct --backend ane --prompt-tokens 16000
+#       --model-name SmolLM2-135M-Instruct --name "llama.cpp" --out benchmarks/results.jsonl
 #
 # --api lokal  → POST {url}/generate            (lokal's native endpoint)
 # --api openai → POST {url}/chat/completions    (llama.cpp, oMLX, vLLM, ...)
@@ -42,9 +46,15 @@ import os
 import re
 import statistics
 import subprocess
+import sys
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+
+# The shared engine registry lives beside this file; make it importable no
+# matter which directory the benchmark is started from.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import engines  # noqa: E402
 
 SENTENCE = (
     "The quick brown fox jumps over the lazy dog while the river runs "
@@ -136,7 +146,7 @@ def call(args, max_tokens):
         url = f"{args.url}/generate"
     else:
         body = {
-            "model": args.model,
+            "model": args.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": 0,
@@ -162,7 +172,7 @@ def call_cli(args, prompt, max_tokens):
     """One run of the lokal binary. Its stderr carries the engine's own timings,
     which is the only honest prefill number here — process wall would include
     model load and Core ML graph compilation."""
-    cmd = [args.bin, "-b", args.backend, "-m", args.model, "--chat",
+    cmd = [args.bin, "-b", args.backend, "-m", args.model_name, "--chat",
            "-t", "0", "-n", str(max_tokens), "-p", prompt]
     t0 = time.time()
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
@@ -296,9 +306,15 @@ def machine_state(own, ambient=(), window=2.0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--api", choices=["lokal", "openai", "cli"], required=True)
+    ap.add_argument("--engine", default="",
+                    help=f"start and stop a known server for me: {', '.join(sorted(engines.ENGINES))}")
+    ap.add_argument("--model", default=engines.DEFAULT_MODEL,
+                    help=f"model family for --engine: {', '.join(engines.MODELS)}")
+    ap.add_argument("--api", choices=["lokal", "openai", "cli"],
+                    help="talk to a server I am running myself (instead of --engine)")
     ap.add_argument("--url", default="", help="server base url (lokal/openai apis)")
-    ap.add_argument("--model", default="", help="model name for the openai api, repo/dir for the cli")
+    ap.add_argument("--model-name", default="",
+                    help="model name for the openai api, repo/dir for the cli")
     ap.add_argument("--name", default="", help="label to print")
     ap.add_argument("--out", default="", help="append the JSON result line to this file")
     ap.add_argument("--bearer", default="", help="Authorization: Bearer token, if the server wants one")
@@ -324,7 +340,29 @@ def main():
     ap.add_argument("--max-foreign-cpu", type=float, default=150.0,
                     help="refuse to measure when other processes are burning more "
                          "than this much cpu (percent of one core, summed)")
+    ap.add_argument("--ctx", type=int, default=0,
+                    help="--engine only: server KV context (default: prompt + slack)")
+    ap.add_argument("--logdir", default="/tmp", help="--engine only: where the server log goes")
     args = ap.parse_args()
+    if bool(args.engine) == bool(args.api):
+        raise SystemExit("pass either --engine <name> (managed server) or --api <kind> (your own)")
+
+    server = None
+    if args.engine:
+        ctx = args.ctx or max(8192, round((args.prompt_tokens or 512) * 1.2) + 1024)
+        cmd, ready, flags = engines.resolve(args.engine, args.model, ctx, args.concurrency or 1)
+        for k, v in flags.items():
+            setattr(args, k.replace("-", "_"), v)
+        args.name = args.name or args.engine
+        server = engines.start(cmd, ready, os.path.join(args.logdir, f"{args.engine}.server.log"))
+
+    try:
+        run(args)
+    finally:
+        engines.stop(server)
+
+
+def run(args):
     name = args.name or args.api
     args.prompt_body = build_prompt(args)
     conc = 0 if (args.no_concurrent or args.api == "cli") else args.concurrency
