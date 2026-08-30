@@ -176,6 +176,7 @@ live in [DESIGN.md](DESIGN.md).
 - [ ] Quantized weights (int8/int4) for larger models on modest RAM
 - [x] Continuous batching — one weight read serves every active request
 - [x] `simdgroup_matrix` (MMA) matmul on Metal
+- [x] Flash-attention prefill + Metal 4 tensor-ops matmul — 3.9x prefill at ~500 tok, 6x at 2k
 - [ ] CUDA (NVIDIA) and Vulkan (AMD/portable) backends
 - [x] Multi-size ANE prefill graphs (512/2048) with automatic routing per prompt length
 - [x] Windowed ANE prefill — long prompts chunk through the ANE with fed-back KV (8k coverage)

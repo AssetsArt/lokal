@@ -24,7 +24,7 @@ ones lokal loses — they exist to steer the roadmap, not to advertise.
 
 | engine | version | prefill (~500 tok) | prefill tok/s | decode | 4x concurrent aggregate |
 |---|---|---|---|---|---|
-| lokal `-b metal` | main | 0.34 s | 1,461 | 246 tok/s | 216 tok/s |
+| lokal `-b metal` | main | 0.08 s ³ | 6,243 ³ | 246 tok/s | 216 tok/s |
 | lokal `-b ane` | main | **0.06 s** | 8,617 | 234 tok/s | **374 tok/s** |
 | llama.cpp | b9960 | **0.06 s** | **8,792** | 172 tok/s ² | 314 tok/s |
 | oMLX | 0.6.3 | 0.12 s | 4,328 | **255 tok/s** | 322 tok/s |
@@ -44,6 +44,13 @@ not rebuilt for the re-measurement).
 flags were `-c 8192 --parallel 4`, and the earlier run's flags were not
 recorded — treat the single-stream decode delta as configuration noise,
 not an engine change.
+
+³ Prefill re-measured after the flash-attention + tensor-ops rewrite
+(commits 29e14bb..cea6644), quiet-verified against the same-day llama.cpp
+server (9,660 tok/s warm at ~500 tokens — lokal is at 65%); the morning
+rows in results.jsonl predate the rewrite (0.34 s / 1,461). Decode and
+concurrency cells are the morning measurements — those paths are
+untouched by the rewrite.
 
 Raw per-run output: [results.jsonl](results.jsonl).
 
