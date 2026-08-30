@@ -20,14 +20,14 @@ ones lokal loses — they exist to steer the roadmap, not to advertise.
 - decode tok/s is marginal: `(tokens_128 − 1) / (wall_128 − wall_1)`, which
   cancels prompt processing out of the number
 
-## Results (2026-08-29)
+## Results (2026-08-30)
 
-| engine | version | prefill (~460 tok) | decode | 4x concurrent aggregate |
+| engine | version | prefill (~500 tok) | decode | 4x concurrent aggregate |
 |---|---|---|---|---|
-| lokal `-b metal` | main | 0.49 s | 240 tok/s | 168 tok/s |
-| lokal `-b ane` | main | **0.06 s** | 232 tok/s | **365 tok/s** |
-| llama.cpp | b9960 | **0.06 s** | 215 tok/s | 355 tok/s |
-| oMLX | 0.6.3rc3 | 0.12 s | **262 tok/s** | 332 tok/s |
+| lokal `-b metal` | main | 0.34 s | 246 tok/s | 216 tok/s |
+| lokal `-b ane` | main | **0.06 s** | 234 tok/s | **374 tok/s** |
+| llama.cpp | b9960 | **0.06 s** | 172 tok/s ² | 314 tok/s |
+| oMLX | 0.6.3 | 0.12 s | **255 tok/s** | 322 tok/s |
 | vLLM Metal | 0.1.0 | 0.08 s | 253 tok/s ¹ | 217 tok/s ¹ |
 | SGLang | — | n/a: no macOS support | | |
 
@@ -37,7 +37,13 @@ aggregated 78 (metal) / 115 (ane) — those runs are kept in results.jsonl.
 
 ¹ vLLM Metal stopped some completions early (123 of 128 single, 369 of 512
 concurrent tokens generated); its tok/s are computed from the tokens it
-actually produced.
+actually produced. Row carried over from the 2026-08-29 run (its venv was
+not rebuilt for the re-measurement).
+
+² Same b9960 binary measured 215 tok/s on 2026-08-29; this run's server
+flags were `-c 8192 --parallel 4`, and the earlier run's flags were not
+recorded — treat the single-stream decode delta as configuration noise,
+not an engine change.
 
 Raw per-run output: [results.jsonl](results.jsonl).
 
@@ -46,14 +52,15 @@ Raw per-run output: [results.jsonl](results.jsonl).
 - **Prefill**: lokal's ANE path ties llama.cpp for the lead (0.06 s), and it
   is the only engine here doing prompt processing off-GPU — under concurrent
   load the GPU keeps decoding while prefill runs elsewhere.
-- **Decode**: after the flash-decoding + kernel-fusion pass, lokal sits with
-  the leaders (241 vs llama.cpp's 215 and oMLX's 262) — the pass is
-  described in DESIGN.md, Metal backend decision 4.
+- **Decode**: lokal sits with the leaders (246 metal / 234 ane vs oMLX's
+  255) — the flash-decoding + fusion pass and the GQA-aware partial kernel
+  are described in DESIGN.md, Metal backend decision 4.
 - **Concurrency**: with continuous batching (one weight read serves every
   active request) plus ANE prefill off-GPU, lokal's hybrid leads the field
-  (365 vs llama.cpp's 355 and oMLX's 332). The metal-only number is
-  admission-bound: each join prefills ~0.5 s on the same GPU — chunked
-  prefill scheduling is the known fix.
+  (374 vs oMLX's 322 and llama.cpp's 314). The metal-only aggregate rose
+  168 → 216 with the GQA batched kernel and per-admission scratch reuse,
+  but stays admission-bound: each join prefills ~0.5 s on the same GPU —
+  chunked prefill scheduling is the known fix.
 
 ## Long-context baseline (2026-08-29)
 
