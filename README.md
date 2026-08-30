@@ -41,13 +41,16 @@ Measured 2026-08-30 on an M1 Pro, 16 GB, `-t 0`, on a verified-quiet machine
 | prefill | ~33 tok/s | 9,900 tok/s | **11,986 tok/s** ¹ |
 | decode | ~49 tok/s | 231 tok/s | 237 tok/s |
 | prefill (Qwen2.5-0.5B) | ~5 tok/s | 3,802 tok/s | 4,660 tok/s ² |
-| prefill @~7.7k (Qwen2.5-0.5B) | — | 1,831 tok/s | **2,836 tok/s** ² |
+| prefill @~7.7k (Qwen2.5-0.5B) | — | 1,831 tok/s | **2,836 tok/s** ² ³ |
 | decode (Qwen2.5-0.5B) | ~27 tok/s | 119 tok/s | 120 tok/s |
 
 ¹ the hybrid row implies the split-prefill ladder is exported
 (`./run.sh export-ane-split`, once per model) — with it present, `-b hybrid`
 splits by default; without it hybrid prefill runs the plain ANE path. Best of 3 passes, as
 in [benchmarks/](benchmarks/) — a warm laptop reads 15–20% lower.
+³ the Qwen rows were measured just before the RoPE-pair fusion and q-bias
+fold landed, which lift Qwen prefill ~8–9% at short lengths — they are a
+floor, not a ceiling.
 ² the ladder is per model (`./run.sh export-ane-split
 Qwen/Qwen2.5-0.5B-Instruct` — a different stride and split point than
 SmolLM2's, both measured). With it, Qwen's hybrid prefill beats its Metal
