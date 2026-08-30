@@ -353,6 +353,9 @@ def main():
         cmd, ready, flags = engines.resolve(args.engine, args.model, ctx, args.concurrency or 1)
         for k, v in flags.items():
             setattr(args, k.replace("-", "_"), v)
+        # The lokal server was started with -m, so its client flags carry no
+        # model name; record which checkpoint it was anyway.
+        args.model_name = args.model_name or engines.MODELS[args.model]["hf"]
         args.name = args.name or args.engine
         server = engines.start(cmd, ready, os.path.join(args.logdir, f"{args.engine}.server.log"))
 
@@ -413,6 +416,8 @@ def run(args):
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "tag": args.tag,
         "api": args.api,
+        "model": args.model,
+        "model_name": args.model_name,
         "prompt_target_tokens": args.prompt_tokens,
         "prompt_chars": len(args.prompt_body),
         "prompt_tokens": ptok,

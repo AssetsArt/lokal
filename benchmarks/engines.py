@@ -24,7 +24,9 @@ LOKAL = os.path.join(REPO, "target/release/lokal")
 
 # Each model needs its weights in three packagings, one per engine family. The
 # GGUF and MLX copies are downloaded separately (see README); a missing file is
-# reported when that engine is asked for, not at import.
+# reported when that engine is asked for, not at import. max_ctx is the
+# architecture's own limit — the long-context driver checks prompt sizes against
+# it rather than letting every engine fail its own way past the ceiling.
 MODELS = {
     "smol": {
         "hf": "HuggingFaceTB/SmolLM2-135M-Instruct",
@@ -33,12 +35,14 @@ MODELS = {
             "snapshots/9e6855bc4be717fca1ef21360a1db4b29d5c559a/SmolLM2-135M-Instruct-F16.gguf"),
         "omlx": "SmolLM2-135M-Instruct",
         "openai": "smollm2-135m-instruct",
+        "max_ctx": 8192,
     },
     "qwen": {
         "hf": "Qwen/Qwen2.5-0.5B-Instruct",
         "gguf": os.path.expanduser("~/.cache/gguf/qwen2.5-0.5b-instruct-fp16.gguf"),
         "omlx": "Qwen2.5-0.5B-Instruct-bf16",
         "openai": "qwen2.5-0.5b-instruct",
+        "max_ctx": 32768,
     },
 }
 DEFAULT_MODEL = "smol"

@@ -36,8 +36,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--engines", required=True,
                     help="comma-separated engine keys from engines.py")
-    ap.add_argument("--model", default="qwen",
-                    help="model family (engines.py MODELS): the long-context matrix is qwen")
+    ap.add_argument("--model", default=engines.DEFAULT_MODEL,
+                    help=f"model family, same names as bench_engines.py: "
+                         f"{', '.join(engines.MODELS)} (long sizes need qwen)")
     ap.add_argument("--sizes", required=True, help="comma-separated --prompt-tokens values")
     ap.add_argument("--out", default=os.path.join(HERE, "results.jsonl"))
     ap.add_argument("--tag", default="longctx-baseline")
@@ -53,6 +54,19 @@ def main():
     args = ap.parse_args()
 
     sizes = [int(s) for s in args.sizes.split(",")]
+    # Catch a mismatched model before burning a sweep on it: SmolLM2 stops at
+    # 8k, so asking it for 16k rows produces a column of failures that look
+    # like engine bugs rather than the wrong --model.
+    max_ctx = engines.MODELS[args.model]["max_ctx"]
+    too_long = [n for n in sizes if n + args.warmup * 0 + 512 > max_ctx]
+    if too_long:
+        raise SystemExit(
+            f"--model {args.model} tops out at {max_ctx} tokens; "
+            f"{', '.join(str(n) for n in too_long)} would not fit with room to "
+            f"generate. Use --model qwen (32k) for those sizes."
+        )
+    print(f"model: {args.model} ({engines.MODELS[args.model]['hf']}), "
+          f"sizes {sizes}", flush=True)
     for key in args.engines.split(","):
         cmd, ready, _ = engines.resolve(key, args.model, args.ctx, args.parallel)
         print(f"\n=== {key}", flush=True)

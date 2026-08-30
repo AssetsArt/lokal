@@ -106,10 +106,13 @@ LOKAL_SPLIT_PREFILL=0 python3 benchmarks/bench_engines.py --engine lokal-hybrid
 
 `--engine` takes any key from `engines.py`: `lokal-metal`, `lokal-hybrid`,
 `lokal-metal-cli`, `lokal-hybrid-cli`, `llamacpp`, `omlx` (the old
-`lokal-ane*` spellings still resolve). Add `--model qwen` to
-run the same engine on Qwen2.5-0.5B-Instruct instead of the default
-SmolLM2-135M-Instruct, and `--prompt-tokens N` for a long prompt. Sweeping
-sizes or engines is the same registry through the other driver:
+`lokal-ane*` spellings still resolve). Both drivers take the same
+`--model smol|qwen` with the same default, so a single row and a sweep
+compare like with like; every result line records which model produced it.
+SmolLM2 stops at 8k tokens, so long sizes need `--model qwen` — the sweep
+says so and stops rather than handing you a column of failures. Add
+`--prompt-tokens N` for a long prompt on a single row. Sweeping sizes or
+engines is the same registry through the other driver:
 
 ```bash
 python3 benchmarks/run_longctx.py --engines lokal-hybrid-cli,llamacpp,omlx \
