@@ -18,6 +18,8 @@ mod engine;
 mod generate;
 mod gpu;
 mod hub;
+#[cfg(target_os = "macos")]
+mod lowmem;
 mod math;
 mod model;
 mod sampler;
@@ -139,22 +141,27 @@ fn run() -> Result<()> {
     let cfg = config::ModelConfig::load(&dir.join("config.json"))?;
     let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))?;
 
-    let t0 = Instant::now();
-    let model = model::Model::load(&dir, cfg.clone())?;
-    eprintln!(
-        "{} | {} layers | hidden {} | {} q heads / {} kv | vocab {} | {:.1}M params (loaded in {:.1}s)",
-        args.model,
-        cfg.num_hidden_layers,
-        cfg.hidden_size,
-        cfg.num_attention_heads,
-        cfg.num_key_value_heads,
-        cfg.vocab_size,
-        model.n_params as f64 / 1e6,
-        t0.elapsed().as_secs_f64(),
-    );
-
-    // Wrap the model in the selected backend (cpu uses it directly, metal uploads to the GPU).
-    let engine = engine::create(&args.backend, model, &dir)?;
+    // Wrap the model in the selected backend (cpu uses it directly, metal uploads
+    // to the GPU). lowmem builds itself from the model directory — it must never
+    // go through Model::load's full-RAM materialization (see src/lowmem/).
+    let engine = if args.backend == "lowmem" {
+        engine::create_lowmem(&dir, cfg.clone())?
+    } else {
+        let t0 = Instant::now();
+        let model = model::Model::load(&dir, cfg.clone())?;
+        eprintln!(
+            "{} | {} layers | hidden {} | {} q heads / {} kv | vocab {} | {:.1}M params (loaded in {:.1}s)",
+            args.model,
+            cfg.num_hidden_layers,
+            cfg.hidden_size,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.vocab_size,
+            model.n_params as f64 / 1e6,
+            t0.elapsed().as_secs_f64(),
+        );
+        engine::create(&args.backend, model, &dir)?
+    };
     eprintln!("backend: {}", engine.name());
 
     // Optional draft model for speculative decoding. It must share the target's
@@ -174,7 +181,11 @@ fn run() -> Result<()> {
                 .into());
             }
             let dmodel = model::Model::load(&ddir, dcfg)?;
-            let dbackend = if args.backend == "hybrid" || args.backend == "ane" { "metal" } else { &args.backend };
+            // A draft model is small: composite/paged backends hand it plain metal.
+            let dbackend = match args.backend.as_str() {
+                "hybrid" | "ane" | "lowmem" => "metal",
+                b => b,
+            };
             let dengine = engine::create(dbackend, dmodel, &ddir)?;
             eprintln!("draft: {name} ({})", dengine.name());
             Some(dengine)

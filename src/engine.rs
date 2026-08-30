@@ -89,9 +89,26 @@ pub fn create(
         "hybrid" | "ane" => Ok(Box::new(crate::ane::AneEngine::new(model, model_dir)?)),
         other => Err(format!(
             "unknown backend \"{other}\" — available: cpu{}",
-            if cfg!(target_os = "macos") { ", metal, hybrid" } else { "" }
+            if cfg!(target_os = "macos") { ", metal, hybrid, lowmem" } else { "" }
         )
         .into()),
+    }
+}
+
+/// The lowmem backend is created from the model DIRECTORY, not a loaded Model —
+/// the whole point of that backend is never materializing the full model in RAM,
+/// so it cannot come through `create`'s Model parameter. main.rs branches here
+/// before calling Model::load.
+pub fn create_lowmem(
+    model_dir: &std::path::Path,
+    cfg: ModelConfig,
+) -> crate::Result<Box<dyn Engine>> {
+    #[cfg(target_os = "macos")]
+    return Ok(Box::new(crate::lowmem::LowMemEngine::new(model_dir, cfg)?));
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (model_dir, cfg);
+        Err("the lowmem backend needs Metal — macOS only".into())
     }
 }
 
