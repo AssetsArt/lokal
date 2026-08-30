@@ -433,6 +433,49 @@ kernel void matmul_th(
     }
 }
 
+// matmul_t with the bias folded into the store epilogue — Qwen's q projection.
+// Value-identical to matmul_t followed by bias_add (the f32 accumulator is
+// stored, then bias added in f32, same operations in the same precision), but
+// one dispatch and one barrier cheaper per biased layer.
+kernel void matmul_tb(
+    device const half *w [[buffer(0)]],
+    device const half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    device const half *bias [[buffer(3)]],
+    constant MatmulParams &p [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint2 tpos [[thread_position_in_threadgroup]])
+{
+    uint tid = tpos.x;
+    auto tA = tensor((device half *)x, dextents<int32_t, 2>(p.in_dim, p.n_rows), array<int, 2>({1, (int)p.in_dim}));
+    auto tB = tensor((device half *)w, dextents<int32_t, 2>(p.in_dim, p.out_dim), array<int, 2>({1, (int)p.in_dim}));
+
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        MM_TROWS, 64, static_cast<int>(dynamic_extent), false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
+
+    auto mA = tA.slice(0, (int)(tgid.y * MM_TROWS));
+    auto mB = tB.slice(0, (int)(tgid.x * 64));
+    auto cT = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
+    op.run(mA, mB, cT);
+
+    threadgroup float Cs[MM_TROWS * 64];
+    auto tC = tensor((threadgroup float *)Cs, dextents<int32_t, 2>(64, MM_TROWS), array<int, 2>({1, 64}));
+    cT.store(tC);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint idx = tid; idx < MM_TROWS * 64; idx += 128) {
+        uint m = idx / 64;
+        uint n = idx % 64;
+        uint gr = tgid.y * MM_TROWS + m;
+        uint go = tgid.x * 64 + n;
+        if (gr < p.n_rows && go < p.out_dim) {
+            y[(ulong)gr * p.out_dim + go] = Cs[m * 64 + n] + (float)bias[go];
+        }
+    }
+}
+
 // f32 activations -> half staging for the tensor-ops matmul operands.
 kernel void f32_to_f16(
     device const float *x [[buffer(0)]],
@@ -695,6 +738,58 @@ kernel void rope(
     float b = head[i + half_dim];
     head[i] = a * c - b * s;
     head[i + half_dim] = a * s + b * c;
+}
+
+// Both prefill rotations in one launch: q (f32) and the freshly written k rows
+// (f16, in the KV cache). The per-element math is identical to rope/rope_h —
+// the fusion only removes a dispatch and a pipeline switch per layer, which the
+// qwen-level-gap profile measured at ~11 ms per 512-token chunk for the pair.
+struct RopeQkPrefillParams {
+    uint head_dim;
+    uint n_q_heads;
+    uint n_kv_heads;
+    uint pos0;
+    float theta;
+    uint n_rows;
+};
+
+kernel void rope_qk_prefill(
+    device float *q [[buffer(0)]],
+    device half *k [[buffer(1)]],
+    constant RopeQkPrefillParams &p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint half_dim = p.head_dim / 2;
+    uint q_per_row = p.n_q_heads * half_dim;
+    uint k_per_row = p.n_kv_heads * half_dim;
+    uint q_total = p.n_rows * q_per_row;
+    bool is_q = gid < q_total;
+    uint idx = is_q ? gid : gid - q_total;
+    uint per_row = is_q ? q_per_row : k_per_row;
+    if (!is_q && idx >= p.n_rows * k_per_row) {
+        return;
+    }
+    uint row = idx / per_row;
+    uint h = (idx % per_row) / half_dim;
+    uint i = idx % half_dim;
+
+    float freq = pow(p.theta, -2.0f * (float)i / (float)p.head_dim);
+    float angle = (float)(p.pos0 + row) * freq;
+    float c;
+    float s = sincos(angle, c);
+    if (is_q) {
+        device float *head = q + (ulong)row * p.n_q_heads * p.head_dim + h * p.head_dim;
+        float a = head[i];
+        float b = head[i + half_dim];
+        head[i] = a * c - b * s;
+        head[i + half_dim] = a * s + b * c;
+    } else {
+        device half *head = k + (ulong)row * p.n_kv_heads * p.head_dim + h * p.head_dim;
+        float a = head[i];
+        float b = head[i + half_dim];
+        head[i] = (half)(a * c - b * s);
+        head[i + half_dim] = (half)(a * s + b * c);
+    }
 }
 
 // Same rotation on an f16 buffer — prefill's freshly written k rows in the KV cache.

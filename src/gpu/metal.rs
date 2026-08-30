@@ -106,6 +106,15 @@ struct RopeQkParams {
     theta: f32,
 }
 #[repr(C)]
+struct RopeQkPrefillParams {
+    head_dim: u32,
+    n_q_heads: u32,
+    n_kv_heads: u32,
+    pos0: u32,
+    theta: f32,
+    n_rows: u32,
+}
+#[repr(C)]
 struct AttnParams {
     head_dim: u32,
     n_heads: u32,
@@ -146,6 +155,8 @@ struct Pipelines {
     silu_mul_hf: ComputePipelineState,
     rope: ComputePipelineState,
     rope_h: ComputePipelineState,
+    rope_qk_prefill: ComputePipelineState,
+    matmul_tb: ComputePipelineState,
     rope_qk_decode: ComputePipelineState,
     attention: ComputePipelineState,
     attention_prefill_flash: ComputePipelineState,
@@ -301,6 +312,8 @@ impl MetalEngine {
             silu_mul_hf: pipe("silu_mul_hf")?,
             rope: pipe("rope")?,
             rope_h: pipe("rope_h")?,
+            rope_qk_prefill: pipe("rope_qk_prefill")?,
+            matmul_tb: pipe("matmul_tb")?,
             rope_qk_decode: pipe("rope_qk_decode")?,
             attention: pipe("attention")?,
             attention_prefill_flash: pipe("attention_prefill_flash")?,
@@ -473,6 +486,21 @@ impl MetalEngine {
                 }
             }
 
+            // Biased layers take matmul_tb (bias folded into the store epilogue,
+            // value-identical to matmul_t + bias_add); the rest stay on matmul_t.
+            if l.has_bias {
+                enc.set_compute_pipeline_state(&self.pipes.matmul_tb);
+                enc.set_buffer(0, Some(&l.w), 0);
+                enc.set_buffer(1, Some(xh), 0);
+                enc.set_buffer(2, Some(y), y_off);
+                enc.set_buffer(3, Some(&l.bias), 0);
+                enc.set_bytes(4, size_of::<MatmulParams>() as u64, &p as *const _ as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new((l.out_dim as u64).div_ceil(64), (n_rows as u64).div_ceil(MM_TILE_ROWS as u64), 1),
+                    MTLSize::new(128, 1, 1),
+                );
+                return;
+            }
             enc.set_compute_pipeline_state(&self.pipes.matmul_t);
             enc.set_buffer(0, Some(&l.w), 0);
             enc.set_buffer(1, Some(xh), 0);
@@ -483,16 +511,6 @@ impl MetalEngine {
                 MTLSize::new(128, 1, 1),
             );
 
-            if l.has_bias {
-                if conc {
-                    enc.memory_barrier_with_resources(&[y]); // bias_add reads y back
-                }
-                enc.set_compute_pipeline_state(&self.pipes.bias_add);
-                enc.set_buffer(0, Some(y), y_off);
-                enc.set_buffer(1, Some(&l.bias), 0);
-                enc.set_bytes(2, size_of::<MatmulParams>() as u64, &p as *const _ as *const _);
-                dispatch_grid(enc, n_rows * l.out_dim as usize);
-            }
         } else {
             let p = MatmulParams { in_dim: l.in_dim, out_dim: l.out_dim, n_rows: n_rows as u32 };
             enc.set_compute_pipeline_state(matmul);
@@ -1050,11 +1068,29 @@ impl MetalSession<'_> {
             e.enc_linear_kv(enc, &blk.k_proj, &self.xn, &self.k_cache[l], kv_byte_off, n, Some(&self.xh));
             e.enc_linear_kv(enc, &blk.v_proj, &self.xn, &self.v_cache[l], kv_byte_off, n, Some(&self.xh));
             bar!(&self.q, &self.k_cache[l], &self.v_cache[l]);
-            e.enc_rope(enc, &self.q, 0, cfg.num_attention_heads, pos0, n, false);
-            e.enc_rope(enc, &self.k_cache[l], kv_byte_off, cfg.num_key_value_heads, pos0, n, true);
-            bar!(&self.q, &self.k_cache[l]);
-            e.enc_attention(enc, &self.q, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.scores, &self.att, pos0, n, self.max_seq, &self.xh);
-            bar!(&self.att, &self.xh);
+            {
+                // One fused launch rotates q (f32) and the fresh k cache rows (f16);
+                // per-element math identical to the separate rope/rope_h dispatches.
+                let hd = cfg.head_dim();
+                let rp = RopeQkPrefillParams {
+                    head_dim: hd as u32,
+                    n_q_heads: cfg.num_attention_heads as u32,
+                    n_kv_heads: cfg.num_key_value_heads as u32,
+                    pos0: pos0 as u32,
+                    theta: cfg.rope_theta,
+                    n_rows: n as u32,
+                };
+                enc.set_compute_pipeline_state(&e.pipes.rope_qk_prefill);
+                enc.set_buffer(0, Some(&self.q), 0);
+                enc.set_buffer(1, Some(&self.k_cache[l]), kv_byte_off);
+                enc.set_bytes(2, size_of::<RopeQkPrefillParams>() as u64, &rp as *const _ as *const _);
+                dispatch_grid(enc, n * (cfg.num_attention_heads + cfg.num_key_value_heads) * hd / 2);
+                bar!(&self.q, &self.k_cache[l]);
+            }
+            {
+                e.enc_attention(enc, &self.q, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.scores, &self.att, pos0, n, self.max_seq, &self.xh);
+                bar!(&self.att, &self.xh);
+            }
             e.enc_linear(enc, &blk.o_proj, &self.att, 0, &self.xb, 0, n, Some(&self.xh), e.cfg.head_dim() != FLASH_HEAD_DIM, conc);
             bar!(&self.xb);
             e.enc_elementwise(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
