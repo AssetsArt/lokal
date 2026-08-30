@@ -10,8 +10,7 @@
 //!     chunk touches at most `chunk` scattered rows, which never justifies
 //!     keeping a vocab × hidden table resident.
 
-use super::pool::PagedTensor;
-use super::pool::WeightPool;
+use super::pool::{Admit, PagedTensor, WeightPool};
 use super::{LayerWeights, LowMemEngine};
 use crate::engine::Session;
 use crate::gpu::metal as gpu;
@@ -473,7 +472,12 @@ impl<'a> LowMemSession<'a> {
         self.enc_matvec_paged(enc, pool, &e.pipes.matvec_acc, &lw.down, &self.gate, &self.x, 0, 4);
     }
 
-    /// Process `n` tokens at positions pos0.. — one command buffer per layer.
+    /// Process `n` tokens at positions pos0.. — one command buffer per layer,
+    /// committed WITHOUT waiting (D4): while the GPU runs layer N, the CPU
+    /// stages layer N+1's pages and encodes its dispatches. Metal's hazard
+    /// tracking orders the dependent buffers across command buffers; the pool's
+    /// epoch stamps keep eviction away from in-flight pages. The one wait is at
+    /// the end of the forward (or when the budget forces one out early).
     fn run(&mut self, ids: &[u32], pos0: usize, want_logits: bool) -> crate::Result<Vec<f32>> {
         let e = self.e;
         let cfg = &e.cfg;
@@ -484,12 +488,13 @@ impl<'a> LowMemSession<'a> {
         // One session encodes at a time — concurrent serve sessions serialize
         // here and stay correct (documented D10 behavior).
         let mut pool = e.pool.lock().map_err(|_| "lowmem pool lock poisoned")?;
+        let mut inflight: Vec<(metal::CommandBuffer, u64)> = Vec::new();
 
         self.embed_gather(ids)?;
 
         for (l, lw) in e.layers.iter().enumerate() {
             let pages = layer_pages(lw);
-            pool.make_resident(&e.manifest, &pages)?;
+            let ep = admit(&mut pool, &e.manifest, &pages, &mut inflight)?;
             let cb = e.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
             if fused_decode {
@@ -499,52 +504,114 @@ impl<'a> LowMemSession<'a> {
             }
             enc.end_encoding();
             cb.commit();
-            cb.wait_until_completed();
             pool.unpin_all();
+            retire(&mut pool, &mut inflight, cb, ep, e.sync);
+        }
+
+        if want_logits {
+            // Final norm on the last row, then the lm_head in page groups small
+            // enough to pin — the vocab × hidden matrix never sits resident whole.
+            let lm = &e.lm_head;
+            let group = (pool.budget_bytes() / 2 / super::pool::PAGE_BYTES).max(1);
+            let mut blk = 0;
+            let mut first = true;
+            while blk < lm.n_pages {
+                let hi = (blk + group).min(lm.n_pages);
+                let pages: Vec<_> = (blk..hi).map(|b| (lm, b)).collect();
+                let ep = admit(&mut pool, &e.manifest, &pages, &mut inflight)?;
+                let cb = e.queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                if first {
+                    self.enc_rmsnorm(enc, &self.x, ((n - 1) * h * 4) as u64, &e.final_norm, &self.xn, 1);
+                    first = false;
+                }
+                for b in blk..hi {
+                    let (r0, rows) = lm.block_rows(b);
+                    let p = MatvecParams { in_dim: lm.in_dim as u32, out_dim: rows as u32 };
+                    enc.set_compute_pipeline_state(&e.pipes.matvec);
+                    enc.set_buffer(0, Some(pool.get(lm, b)), 0);
+                    enc.set_buffer(1, Some(&e.zero_bias), 0);
+                    enc.set_buffer(2, Some(&self.xn), 0);
+                    enc.set_buffer(3, Some(&self.logits), (r0 * 4) as u64);
+                    set_bytes(enc, 4, &p);
+                    gpu::dispatch_simdgroup_rows(enc, rows as u32);
+                }
+                enc.end_encoding();
+                cb.commit();
+                pool.unpin_all();
+                retire(&mut pool, &mut inflight, cb, ep, e.sync);
+                blk = hi;
+            }
+        }
+
+        // Drain before the pool lock drops: queue order makes the last command
+        // buffer's completion cover them all, and a clean pool (every epoch
+        // completed) is what lets another session evict freely.
+        if let Some((cb, _)) = inflight.last() {
+            cb.wait_until_completed();
+        }
+        for (_, ep) in inflight.drain(..) {
+            pool.mark_completed(ep);
         }
 
         if !want_logits {
             return Ok(Vec::new());
         }
-
-        // Final norm on the last row, then the lm_head in page groups small
-        // enough to pin — the ~vocab × hidden matrix never sits resident whole.
-        let lm = &e.lm_head;
-        let group = (pool.budget_bytes() / 2 / super::pool::PAGE_BYTES).max(1);
-        let mut blk = 0;
-        let mut first = true;
-        while blk < lm.n_pages {
-            let hi = (blk + group).min(lm.n_pages);
-            let pages: Vec<_> = (blk..hi).map(|b| (lm, b)).collect();
-            pool.make_resident(&e.manifest, &pages)?;
-            let cb = e.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            if first {
-                self.enc_rmsnorm(enc, &self.x, ((n - 1) * h * 4) as u64, &e.final_norm, &self.xn, 1);
-                first = false;
-            }
-            for b in blk..hi {
-                let (r0, rows) = lm.block_rows(b);
-                let p = MatvecParams { in_dim: lm.in_dim as u32, out_dim: rows as u32 };
-                enc.set_compute_pipeline_state(&e.pipes.matvec);
-                enc.set_buffer(0, Some(pool.get(lm, b)), 0);
-                enc.set_buffer(1, Some(&e.zero_bias), 0);
-                enc.set_buffer(2, Some(&self.xn), 0);
-                enc.set_buffer(3, Some(&self.logits), (r0 * 4) as u64);
-                set_bytes(enc, 4, &p);
-                gpu::dispatch_simdgroup_rows(enc, rows as u32);
-            }
-            enc.end_encoding();
-            cb.commit();
-            cb.wait_until_completed();
-            pool.unpin_all();
-            blk = hi;
-        }
-
         let logits = unsafe {
             std::slice::from_raw_parts(self.logits.contents() as *const f32, cfg.vocab_size)
         };
         Ok(logits.to_vec())
+    }
+}
+
+/// Get an epoch and make `pages` resident under it, waiting out the oldest
+/// in-flight command buffer whenever every eviction candidate is still on the
+/// GPU. Returns the epoch the caller's command buffer must retire under.
+fn admit(
+    pool: &mut WeightPool,
+    mf: &super::manifest::WeightManifest,
+    pages: &[(&PagedTensor, usize)],
+    inflight: &mut Vec<(metal::CommandBuffer, u64)>,
+) -> crate::Result<u64> {
+    let ep = pool.begin_cb();
+    loop {
+        match pool.make_resident(mf, pages, ep)? {
+            Admit::Ready => return Ok(ep),
+            Admit::NeedWait => {
+                if inflight.is_empty() {
+                    return Err("lowmem: pool wait requested with nothing in flight (bug)".into());
+                }
+                let (cb, cbep) = inflight.remove(0);
+                cb.wait_until_completed();
+                pool.mark_completed(cbep);
+            }
+        }
+    }
+}
+
+/// Book-keep a just-committed command buffer: in sync mode wait it out on the
+/// spot; otherwise push it in flight and opportunistically retire any that
+/// already finished (queue order — the front finishes first).
+fn retire(
+    pool: &mut WeightPool,
+    inflight: &mut Vec<(metal::CommandBuffer, u64)>,
+    cb: &metal::CommandBufferRef,
+    ep: u64,
+    sync: bool,
+) {
+    if sync {
+        cb.wait_until_completed();
+        pool.mark_completed(ep);
+        return;
+    }
+    inflight.push((cb.to_owned(), ep));
+    while inflight
+        .first()
+        .map(|(c, _)| c.status() == metal::MTLCommandBufferStatus::Completed)
+        .unwrap_or(false)
+    {
+        let (_, done) = inflight.remove(0);
+        pool.mark_completed(done);
     }
 }
 

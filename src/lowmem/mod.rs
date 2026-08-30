@@ -77,6 +77,9 @@ pub struct LowMemEngine {
     pool: Mutex<WeightPool>,
     /// Decode-attention dispatch geometry, precomputed from the config.
     gqa: (u64, [u64; 4]),
+    /// LOKAL_LOWMEM_SYNC=1: wait out every command buffer before the next —
+    /// the bisect mode for anything that smells like an eviction race.
+    sync: bool,
 }
 
 // Same justification as MetalEngine: Apple documents these Metal objects as
@@ -215,6 +218,7 @@ impl LowMemEngine {
 
         Ok(Self {
             gqa: gpu::gqa_decode_dims(&cfg),
+            sync: std::env::var("LOKAL_LOWMEM_SYNC").is_ok_and(|v| v == "1"),
             cfg,
             manifest,
             device,

@@ -17,6 +17,7 @@
 use super::manifest::WeightManifest;
 use half::{bf16, f16};
 use metal::{Buffer, Device, MTLResourceOptions};
+use rayon::prelude::*;
 use safetensors::Dtype;
 use std::collections::HashMap;
 
@@ -81,7 +82,25 @@ struct Page {
     buf: Buffer,
     bytes: usize,
     last_used: u64,
+    /// Referenced by the command buffer currently being encoded.
     pinned: bool,
+    /// The last command-buffer epoch that referenced this page — eviction
+    /// refuses it until that epoch is marked completed.
+    epoch: u64,
+}
+
+/// make_resident's verdict when the budget is tight.
+pub(super) enum Admit {
+    Ready,
+    /// Every eviction candidate is still referenced by an in-flight command
+    /// buffer — wait one out, mark it completed, and retry.
+    NeedWait,
+}
+
+enum Evict {
+    Done,
+    AllInFlight,
+    Exhausted,
 }
 
 pub(super) struct WeightPool {
@@ -90,6 +109,10 @@ pub(super) struct WeightPool {
     used: usize,
     pages: HashMap<(u32, u32), Page>,
     clock: u64,
+    /// Next command-buffer epoch to hand out (engine-global, monotonic).
+    epoch: u64,
+    /// Highest epoch whose command buffer has finished on the GPU.
+    completed: u64,
     /// f32→f16 clips past 65504 — flag an overflowing checkpoint once, at the
     /// first page that actually clips (cheaper than a full scan at open).
     overflow_warned: bool,
@@ -103,6 +126,8 @@ impl WeightPool {
             used: 0,
             pages: HashMap::new(),
             clock: 0,
+            epoch: 0,
+            completed: 0,
             overflow_warned: false,
         }
     }
@@ -111,19 +136,36 @@ impl WeightPool {
         self.budget
     }
 
-    /// Make every (tensor, block) page resident and pin it for the command
-    /// buffer about to be encoded. Pinning happens in two passes so a staging
-    /// miss can never evict a page this same call just resolved.
+    /// A new command buffer's epoch. The caller stamps its pages with it via
+    /// make_resident and reports completion through mark_completed.
+    pub fn begin_cb(&mut self) -> u64 {
+        self.epoch += 1;
+        self.epoch
+    }
+
+    /// The command buffer for `epoch` finished on the GPU — its pages become
+    /// eviction candidates. Command buffers on one queue complete in commit
+    /// order, so marking the newest also covers everything older.
+    pub fn mark_completed(&mut self, epoch: u64) {
+        self.completed = self.completed.max(epoch);
+    }
+
+    /// Make every (tensor, block) page resident, pin it, and stamp it with the
+    /// command buffer's epoch. Pinning happens in two passes so a staging miss
+    /// can never evict a page this same call just resolved. NeedWait means the
+    /// only eviction candidates belong to in-flight command buffers.
     pub fn make_resident(
         &mut self,
         mf: &WeightManifest,
         pages: &[(&PagedTensor, usize)],
-    ) -> crate::Result<()> {
+        epoch: u64,
+    ) -> crate::Result<Admit> {
         for (t, b) in pages {
             if let Some(p) = self.pages.get_mut(&(t.id, *b as u32)) {
                 self.clock += 1;
                 p.last_used = self.clock;
                 p.pinned = true;
+                p.epoch = epoch;
             }
         }
         for (t, b) in pages {
@@ -133,12 +175,17 @@ impl WeightPool {
             }
             let need = t.block_bytes(*b);
             while self.used + need > self.budget {
-                self.evict_lru().map_err(|_| {
-                    format!(
-                        "weight pool exhausted: one encode set needs more than the {} MB budget — raise the memory budget",
-                        self.budget >> 20
-                    )
-                })?;
+                match self.evict_lru() {
+                    Evict::Done => {}
+                    Evict::AllInFlight => return Ok(Admit::NeedWait),
+                    Evict::Exhausted => {
+                        return Err(format!(
+                            "weight pool exhausted: one encode set needs more than the {} MB budget — raise the memory budget",
+                            self.budget >> 20
+                        )
+                        .into())
+                    }
+                }
             }
             let buf = self
                 .device
@@ -148,34 +195,48 @@ impl WeightPool {
             self.used += need;
             self.pages.insert(
                 key,
-                Page { buf, bytes: need, last_used: self.clock, pinned: true },
+                Page { buf, bytes: need, last_used: self.clock, pinned: true, epoch },
             );
         }
-        Ok(())
+        Ok(Admit::Ready)
     }
 
     pub fn get(&self, t: &PagedTensor, block: usize) -> &Buffer {
         &self.pages[&(t.id, block as u32)].buf
     }
 
-    /// The encoded command buffer completed — every page is evictable again.
+    /// The command buffer for the current encode is committed — pages stay
+    /// protected by their epoch until mark_completed says the GPU is done.
     pub fn unpin_all(&mut self) {
         for p in self.pages.values_mut() {
             p.pinned = false;
         }
     }
 
-    fn evict_lru(&mut self) -> Result<(), ()> {
-        let key = self
-            .pages
-            .iter()
-            .filter(|(_, p)| !p.pinned)
-            .min_by_key(|(_, p)| p.last_used)
-            .map(|(k, _)| *k)
-            .ok_or(())?;
-        let p = self.pages.remove(&key).unwrap();
-        self.used -= p.bytes;
-        Ok(())
+    fn evict_lru(&mut self) -> Evict {
+        let mut best: Option<(&(u32, u32), &Page)> = None;
+        let mut in_flight_only = false;
+        for (k, p) in &self.pages {
+            if p.pinned {
+                continue;
+            }
+            if p.epoch > self.completed {
+                in_flight_only = true;
+                continue;
+            }
+            if best.map(|(_, b)| p.last_used < b.last_used).unwrap_or(true) {
+                best = Some((k, p));
+            }
+        }
+        match best.map(|(k, _)| *k) {
+            Some(key) => {
+                let p = self.pages.remove(&key).unwrap();
+                self.used -= p.bytes;
+                Evict::Done
+            }
+            None if in_flight_only => Evict::AllInFlight,
+            None => Evict::Exhausted,
+        }
     }
 
     /// Read the block's rows from the mmap and convert into the buffer — the
@@ -192,27 +253,44 @@ impl WeightPool {
         let dp = dst.contents() as *mut u16;
         // The mmap slice can be unaligned (safetensors headers are arbitrary
         // lengths), so conversion walks byte pairs/quads — never typed pointers.
-        let mut clipped = false;
-        match dtype {
-            Dtype::F16 => unsafe {
-                std::ptr::copy_nonoverlapping(src.as_ptr(), dp as *mut u8, src.len());
-            },
-            Dtype::BF16 => {
-                for (i, b) in src.chunks_exact(2).enumerate() {
-                    let v = bf16::from_le_bytes([b[0], b[1]]).to_f32();
-                    clipped |= v.abs() > f16::MAX.to_f32();
-                    unsafe { *dp.add(i) = f16::from_f32(v).to_bits() };
+        // Rows convert in parallel: staging is the disk-side "CPU load" bar of
+        // the overlap diagram, and a serial convert would cap it at ~2 GB/s.
+        let out = unsafe { std::slice::from_raw_parts_mut(dp, rows * t.in_dim) };
+        let clipped = match dtype {
+            Dtype::F16 => {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), dp as *mut u8, src.len());
                 }
+                false
             }
-            Dtype::F32 => {
-                for (i, b) in src.chunks_exact(4).enumerate() {
-                    let v = f32::from_le_bytes(b.try_into().unwrap());
-                    clipped |= v.abs() > f16::MAX.to_f32();
-                    unsafe { *dp.add(i) = f16::from_f32(v).to_bits() };
-                }
-            }
+            Dtype::BF16 => out
+                .par_chunks_mut(t.in_dim)
+                .zip(src.par_chunks(t.in_dim * 2))
+                .map(|(d, s)| {
+                    let mut c = false;
+                    for (o, b) in d.iter_mut().zip(s.chunks_exact(2)) {
+                        let v = bf16::from_le_bytes([b[0], b[1]]).to_f32();
+                        c |= v.abs() > f16::MAX.to_f32();
+                        *o = f16::from_f32(v).to_bits();
+                    }
+                    c
+                })
+                .reduce(|| false, |a, b| a | b),
+            Dtype::F32 => out
+                .par_chunks_mut(t.in_dim)
+                .zip(src.par_chunks(t.in_dim * 4))
+                .map(|(d, s)| {
+                    let mut c = false;
+                    for (o, b) in d.iter_mut().zip(s.chunks_exact(4)) {
+                        let v = f32::from_le_bytes(b.try_into().unwrap());
+                        c |= v.abs() > f16::MAX.to_f32();
+                        *o = f16::from_f32(v).to_bits();
+                    }
+                    c
+                })
+                .reduce(|| false, |a, b| a | b),
             other => return Err(format!("unsupported dtype {other:?} in {}", t.name).into()),
-        }
+        };
         if clipped && !self.overflow_warned {
             self.overflow_warned = true;
             eprintln!(
