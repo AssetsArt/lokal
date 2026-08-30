@@ -38,14 +38,14 @@ Measured 2026-08-30 on an M1 Pro, 16 GB, `-t 0`, on a verified-quiet machine
 
 | workload | cpu | metal | hybrid |
 |---|---|---|---|
-| prefill | ~33 tok/s | 7,604 tok/s | **8,784 tok/s** ¹ |
-| decode | ~49 tok/s | 205 tok/s | 226 tok/s |
+| prefill | ~33 tok/s | 8,271 tok/s | **11,080 tok/s** ¹ |
+| decode | ~49 tok/s | 238 tok/s | 239 tok/s |
 | prefill (Qwen2.5-0.5B) | — | 2,704 tok/s | ² |
 | decode (Qwen2.5-0.5B) | ~27 tok/s | ~113 tok/s | = metal |
 
 ¹ with split prefill on (`LOKAL_SPLIT_PREFILL=1`, needs the extra graphs from
-`./run.sh export-ane-split`); plain hybrid does 8,466. Prefill varies ±15%
-run to run on this machine — see [benchmarks/](benchmarks/) for the spread.
+`./run.sh export-ane-split`); plain hybrid does 8,738. Best of 3 passes, as
+in [benchmarks/](benchmarks/) — a warm laptop reads 15–20% lower.
 ² per-model ANE graphs; see setup below.
 
 Prefill took a 4–6x jump (2026-08-30) from a flash-attention kernel plus
@@ -53,8 +53,9 @@ Metal 4 tensor-ops matmuls — the same mechanism llama.cpp's Metal backend
 uses — and then went past every engine on this machine by using two of them
 at once: **split prefill** puts the front layers of each prompt chunk on the
 Neural Engine while the GPU works the back layers of the previous chunk, so
-one prompt keeps both busy — which puts lokal level with llama.cpp's
-GPU-only prefill on this machine, ahead of it in most runs.
+one prompt keeps both busy. That is what passes llama.cpp on this machine
+(11,080 vs 9,641 tok/s, same session): its Metal backend is still the
+faster GPU-only prefill — lokal wins the column by not being GPU-only.
 
 Decode speed comes from f16 weights resident on the GPU, flash-decoding
 attention, and a GQA-aware kernel that
@@ -67,8 +68,8 @@ Neural Engine prefills newly arrived requests off-GPU:
 
 | 4 concurrent requests (~500-token prompts) | metal | hybrid + split |
 |---|---|---|
-| single-request prefill | 0.07 s | **0.06 s** |
-| aggregate throughput | 321 tok/s | **350 tok/s** |
+| single-request prefill | 0.06 s | **0.05 s** |
+| aggregate throughput | 359 tok/s | **382 tok/s** |
 
 How lokal compares against other engines on the same machine and model, with
 reproduction steps, lives in [benchmarks/](benchmarks/).
