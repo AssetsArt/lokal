@@ -568,7 +568,7 @@ impl MetalEngine {
             enc.set_bytes(4, size_of::<AttnParams>() as u64, &p as *const _ as *const _);
             enc.set_buffer(5, Some(out_h), 0);
             enc.dispatch_thread_groups(
-                MTLSize::new(self.cfg.num_attention_heads as u64, n_rows.div_ceil(16) as u64, 1),
+                MTLSize::new(self.cfg.num_attention_heads as u64, n_rows.div_ceil(32) as u64, 1),
                 MTLSize::new(128, 1, 1),
             );
             return;

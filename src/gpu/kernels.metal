@@ -870,8 +870,8 @@ kernel void attention(
 // Specialized to head_dim 64 (every target model); other head sizes take the
 // kernel above via the Rust-side gate in enc_attention.
 
-#define FA_BR 16       // query rows per threadgroup
-#define FA_BC 64       // cached positions per K/V tile
+#define FA_BR 32       // query rows per threadgroup (8 per simdgroup)
+#define FA_BC 32       // cached positions per K/V tile
 #define FA_HD 64       // the specialized head_dim
 #define FA_THREADS 128 // 4 simdgroups
 
@@ -887,165 +887,155 @@ kernel void attention_prefill_flash(
 {
     uint tid = tpos.x;
     uint sgid = tid / 32;
+    uint lane = tid % 32;
     uint head = tg.x;
-    uint r0 = tg.y * FA_BR; // this tile's first chunk row
+    uint r0 = tg.y * FA_BR;
     uint kvd = p.n_kv_heads * FA_HD;
     uint kv_off = (head / (p.n_heads / p.n_kv_heads)) * FA_HD;
     float scale = rsqrt((float)FA_HD);
 
-    // Operands are staged half (K/V arrive half; Q and P are rounded to half), the
-    // simdgroup accumulators and the running m/l/O state are all f32 — mixed-precision
-    // MMA halves the staging traffic and doubles the matrix rate without touching
-    // the accumulation precision.
-    threadgroup half Qh[FA_BR][FA_HD];
-    threadgroup half Kh[FA_BC][FA_HD];
-    threadgroup half Vh[FA_BC][FA_HD];
-    threadgroup float Ss[FA_BR][FA_BC]; // raw QK^T accumulators
-    threadgroup half Ph[FA_BR][FA_BC];  // P = exp(S*scale - m), rounded for the P·V MMA
-    threadgroup float Os[FA_BR][FA_HD]; // running output accumulator
-    threadgroup float m_i[FA_BR];       // running row max
-    threadgroup float l_i[FA_BR];       // running row sum
-    threadgroup float corr[FA_BR];      // this tile's rescale factor per row
-    threadgroup float mrow[FA_BR];      // this tile's new max, broadcast
-    threadgroup float red[FA_BR][8];    // 8-lane per-row reduction scratch
+    // FA-2 shape: each simdgroup OWNS 8 query rows for the whole walk — Q lives in
+    // registers (8 half 8x8 blocks), the O accumulators live in registers (8 f32
+    // blocks), the online-softmax rescale is a diagonal-matrix multiply, and the
+    // softmax itself is simd-shuffle math with no threadgroup barriers. The only
+    // cross-simdgroup coupling is the shared K/V tile staging (2 barriers/tile).
+    //
+    // One 15.9 KB shared block (2 threadgroups per core), aliased by phase:
+    //   [0,4K)      Kh — K tile, half [FA_BC][64]
+    //   [4K,8K)     Vh — V tile, half [FA_BC][64]
+    //   [8K,14K)    Qh staging (half, whole tile, start only) THEN per-sg scratch:
+    //                 Sg f32 [8][FA_BC] at +sgid*1KB, Pg half [8][FA_BC] at +4K+sgid*512B
+    //   [14K,15.5K) per-sg D/m/l: 96 floats each — D diag 8x8 [0,64), m [64,72), l [72,80)
+    threadgroup float SH[3968];
+    threadgroup half *Kh = (threadgroup half *)SH;
+    threadgroup half *Vh = (threadgroup half *)(SH + 1024);
+    threadgroup half *Qh = (threadgroup half *)(SH + 2048);
+    threadgroup float *Sg = (SH + 2048) + sgid * 256;             // 8 x FA_BC f32
+    threadgroup half *Pg = (threadgroup half *)(SH + 3072) + sgid * 256; // 8 x FA_BC half
+    threadgroup float *Dm = SH + 3584 + sgid * 96;
+    threadgroup float *m_i = Dm + 64;
+    threadgroup float *l_i = Dm + 72;
 
-    // Stage the query tile (RoPE'd f32 → half); zero-fill rows past the chunk —
-    // dead rows stay all-zero through every phase and are never written out.
+    // Stage the whole Q tile as half once, then park this simdgroup's 8 rows in
+    // registers for the entire walk.
     for (uint idx = tid; idx < FA_BR * FA_HD; idx += FA_THREADS) {
         uint r = idx / FA_HD;
-        uint d = idx % FA_HD;
         uint gr = r0 + r;
-        Qh[r][d] = (gr < p.n_rows) ? (half)q[(ulong)gr * p.n_heads * FA_HD + head * FA_HD + d] : 0.0h;
-        Os[r][d] = 0.0f;
+        Qh[idx] = (gr < p.n_rows) ? (half)q[(ulong)gr * p.n_heads * FA_HD + head * FA_HD + (idx % FA_HD)] : 0.0h;
     }
-    if (tid < FA_BR) {
-        m_i[tid] = -INFINITY;
-        l_i[tid] = 0.0f;
+    if (lane < 8) {
+        m_i[lane] = -INFINITY;
+        l_i[lane] = 0.0f;
+    }
+    for (uint i = lane; i < 64; i += 32) {
+        Dm[i] = 0.0f; // off-diagonals stay zero forever; only the diagonal is rewritten
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_half8x8 qm[8];
+    for (uint kk = 0; kk < 8; kk++) {
+        simdgroup_load(qm[kk], Qh + (sgid * 8) * FA_HD + kk * 8, FA_HD);
+    }
+    simdgroup_float8x8 mc[8];
+    for (uint j = 0; j < 8; j++) {
+        mc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup); // Qh region becomes Sg/Pg scratch
 
-    // Positions this tile can see (exclusive): the last real row's own position + 1.
     uint t_hi = p.pos0 + min(r0 + FA_BR, p.n_rows);
+    // This lane's fixed softmax slot: 4 lanes per row, 8 columns each.
+    uint srow = lane / 4;
+    uint scol0 = (lane % 4) * 8;
+    uint gr_s = r0 + sgid * 8 + srow;
+    uint q_pos = p.pos0 + gr_s;
 
     for (uint t0 = 0; t0 < t_hi; t0 += FA_BC) {
-        // Stage the K and V tiles (already half — a straight copy), zero-filled
-        // past the walk's end.
         for (uint idx = tid; idx < FA_BC * FA_HD; idx += FA_THREADS) {
             uint c = idx / FA_HD;
             uint d = idx % FA_HD;
             uint t = t0 + c;
             bool ok = t < t_hi;
-            Kh[c][d] = ok ? k_cache[(ulong)t * kvd + kv_off + d] : 0.0h;
-            Vh[c][d] = ok ? v_cache[(ulong)t * kvd + kv_off + d] : 0.0h;
+            Kh[c * FA_HD + d] = ok ? k_cache[(ulong)t * kvd + kv_off + d] : 0.0h;
+            Vh[c * FA_HD + d] = ok ? v_cache[(ulong)t * kvd + kv_off + d] : 0.0h;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // S = Q·K^T: 16×64 as 2×8 blocks of 8×8 — each simdgroup owns two block
-        // columns, both block rows (K loaded transposed, like matmul's W).
-        for (uint m = 0; m < 2; m++) {
-            for (uint bc = 0; bc < 2; bc++) {
-                uint c0 = (sgid * 2 + bc) * 8;
-                simdgroup_float8x8 C = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                for (uint kk = 0; kk < FA_HD; kk += 8) {
-                    simdgroup_half8x8 A;
-                    simdgroup_load(A, &Qh[m * 8][kk], FA_HD);
-                    simdgroup_half8x8 B;
-                    simdgroup_load(B, &Kh[c0][kk], FA_HD, ulong2(0), true);
-                    simdgroup_multiply_accumulate(C, A, B, C);
-                }
-                simdgroup_store(C, &Ss[m * 8][c0], FA_BC);
+        // S = Q·K^T for this simdgroup's 8 rows (4 column blocks of 8).
+        for (uint c = 0; c < FA_BC / 8; c++) {
+            simdgroup_float8x8 sc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint kk = 0; kk < 8; kk++) {
+                simdgroup_half8x8 B;
+                simdgroup_load(B, Kh + (c * 8) * FA_HD + kk * 8, FA_HD, ulong2(0), true);
+                simdgroup_multiply_accumulate(sc, qm[kk], B, sc);
             }
+            simdgroup_store(sc, Sg + c * 8, FA_BC);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Online softmax, 8 lanes per row (128 threads = 16 rows × 8): tile max,
-        // running max/sum update, P written to Ph for the P·V multiply. exp() is
-        // never fed an infinity (fast-math hazard) — masked lanes go through
-        // ternaries instead.
-        {
-            uint r = tid / 8;
-            uint lane8 = tid % 8;
-            uint gr = r0 + r;
-            uint q_pos = p.pos0 + gr;
-            float pmax = -INFINITY;
-            for (uint j = lane8 * 8; j < lane8 * 8 + 8; j++) {
-                if (gr < p.n_rows && t0 + j <= q_pos && t0 + j < t_hi) {
-                    pmax = max(pmax, Ss[r][j] * scale);
-                }
+        // Online softmax, simdgroup-local: this lane owns row srow, cols scol0..+8.
+        float lmax = -INFINITY;
+        bool row_live = gr_s < p.n_rows;
+        for (uint j = 0; j < 8; j++) {
+            uint t = t0 + scol0 + j;
+            if (row_live && t <= q_pos && t < t_hi) {
+                lmax = max(lmax, Sg[srow * FA_BC + scol0 + j] * scale);
             }
-            red[r][lane8] = pmax;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < FA_BR) {
-            float tmax = -INFINITY;
-            for (uint j = 0; j < 8; j++) {
-                tmax = max(tmax, red[tid][j]);
-            }
-            // A tile fully above this row's diagonal leaves tmax at -inf; m_new
-            // then keeps the previous max (never -inf again after tile 0).
-            float m_new = max(m_i[tid], tmax);
-            corr[tid] = (m_i[tid] == -INFINITY) ? 0.0f : exp(m_i[tid] - m_new);
-            mrow[tid] = m_new;
-            m_i[tid] = m_new;
+        lmax = max(lmax, simd_shuffle_xor(lmax, 1));
+        lmax = max(lmax, simd_shuffle_xor(lmax, 2)); // row max across the 4 lanes
+        float m_old = m_i[srow];
+        float m_new = max(m_old, lmax);
+        float corr = (m_old == -INFINITY) ? 0.0f : exp(m_old - m_new);
+        float lsum = 0.0f;
+        for (uint j = 0; j < 8; j++) {
+            uint t = t0 + scol0 + j;
+            bool valid = row_live && t <= q_pos && t < t_hi;
+            float pv = valid ? exp(Sg[srow * FA_BC + scol0 + j] * scale - m_new) : 0.0f;
+            Pg[srow * FA_BC + scol0 + j] = (half)pv;
+            lsum += pv;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        {
-            uint r = tid / 8;
-            uint lane8 = tid % 8;
-            uint gr = r0 + r;
-            uint q_pos = p.pos0 + gr;
-            float psum = 0.0f;
-            for (uint j = lane8 * 8; j < lane8 * 8 + 8; j++) {
-                bool valid = gr < p.n_rows && t0 + j <= q_pos && t0 + j < t_hi;
-                float pv = valid ? exp(Ss[r][j] * scale - mrow[r]) : 0.0f;
-                Ph[r][j] = (half)pv;
-                psum += pv;
-            }
-            red[r][lane8] = psum;
+        lsum += simd_shuffle_xor(lsum, 1);
+        lsum += simd_shuffle_xor(lsum, 2);
+        if (lane % 4 == 0) {
+            m_i[srow] = m_new;
+            l_i[srow] = l_i[srow] * corr + lsum;
+            Dm[srow * 8 + srow] = corr; // diagonal rescale matrix
         }
-        // Rescale O rows to the new max in the same barrier window (disjoint memory).
-        for (uint idx = tid; idx < FA_BR * FA_HD; idx += FA_THREADS) {
-            Os[idx / FA_HD][idx % FA_HD] *= corr[idx / FA_HD];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < FA_BR) {
-            float sum = 0.0f;
-            for (uint j = 0; j < 8; j++) {
-                sum += red[tid][j];
-            }
-            l_i[tid] = l_i[tid] * corr[tid] + sum;
-        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        // O += P·V: 16×64 as 2×8 blocks; each simdgroup owns two block columns —
-        // load the rescaled O block, multiply-accumulate over the tile, store back.
-        for (uint m = 0; m < 2; m++) {
-            for (uint bc = 0; bc < 2; bc++) {
-                uint d0 = (sgid * 2 + bc) * 8;
-                simdgroup_float8x8 C;
-                simdgroup_load(C, &Os[m * 8][d0], FA_HD);
-                for (uint cc = 0; cc < FA_BC; cc += 8) {
-                    simdgroup_half8x8 A;
-                    simdgroup_load(A, &Ph[m * 8][cc], FA_BC);
-                    simdgroup_half8x8 B;
-                    simdgroup_load(B, &Vh[cc][d0], FA_HD);
-                    simdgroup_multiply_accumulate(C, A, B, C);
-                }
-                simdgroup_store(C, &Os[m * 8][d0], FA_HD);
+        // O = D·O (per-row rescale on the matrix units), then O += P·V.
+        simdgroup_float8x8 Dblk;
+        simdgroup_load(Dblk, Dm, 8);
+        for (uint j = 0; j < 8; j++) {
+            simdgroup_float8x8 t;
+            simdgroup_multiply(t, Dblk, mc[j]);
+            for (uint c = 0; c < FA_BC / 8; c++) {
+                simdgroup_half8x8 A;
+                simdgroup_load(A, Pg + c * 8, FA_BC);
+                simdgroup_half8x8 B;
+                simdgroup_load(B, Vh + (c * 8) * FA_HD + j * 8, FA_HD);
+                simdgroup_multiply_accumulate(t, A, B, t);
             }
+            mc[j] = t;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup); // K/V restage next tile
     }
 
-    // Normalize and write: one store per output element for the whole walk.
-    for (uint idx = tid; idx < FA_BR * FA_HD; idx += FA_THREADS) {
-        uint r = idx / FA_HD;
-        uint gr = r0 + r;
-        if (gr < p.n_rows) {
-            uint d = idx % FA_HD;
-            float v = Os[r][d] / l_i[r];
-            out[(ulong)gr * p.n_heads * FA_HD + head * FA_HD + d] = v;
-            out_h[(ulong)gr * p.n_heads * FA_HD + head * FA_HD + d] = (half)v;
+    // Normalize and write, four column blocks at a time through the Sg scratch.
+    for (uint hp = 0; hp < 2; hp++) {
+        for (uint j = 0; j < 4; j++) {
+            simdgroup_store(mc[hp * 4 + j], Sg + j * 8, FA_BC);
         }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (gr_s < p.n_rows) {
+            float l = l_i[srow];
+            for (uint j = 0; j < 8; j++) {
+                uint d = hp * 32 + scol0 + j;
+                float v = Sg[srow * FA_BC + scol0 + j] / l;
+                out[(ulong)gr_s * p.n_heads * FA_HD + head * FA_HD + d] = v;
+                out_h[(ulong)gr_s * p.n_heads * FA_HD + head * FA_HD + d] = (half)v;
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
