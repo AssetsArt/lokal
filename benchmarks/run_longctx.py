@@ -67,7 +67,25 @@ def main():
         )
     print(f"model: {args.model} ({engines.MODELS[args.model]['hf']}), "
           f"sizes {sizes}", flush=True)
+    # lokal has two transports and they do not measure the same thing: the CLI
+    # path pays a cold process per request (no warmup can help — the warmup is a
+    # different process), which measured ~18% below the same build through the
+    # server on an identical prompt. Comparing a CLI row against another engine's
+    # warm server is therefore a rigged row, so sizes that the server can hold
+    # are moved onto it automatically; the CLI is for prompts past the pooled
+    # slot cap, where it is the only way to measure at all.
+    SERVE_CAP = 8192
     for key in args.engines.split(","):
+        if key.endswith("-cli") and all(n + 512 <= SERVE_CAP for n in sizes):
+            served = key[: -len("-cli")]
+            print(f"  note: {key} -> {served}; every size fits the server, and the "
+                  f"CLI's cold process would read ~18% low against warm servers",
+                  flush=True)
+            key = served
+        elif key.endswith("-cli"):
+            print(f"  note: {key} keeps the CLI path (a size exceeds the {SERVE_CAP}-token "
+                  f"server cap); its rows are cold-process and read low against warm servers",
+                  flush=True)
         cmd, ready, _ = engines.resolve(key, args.model, args.ctx, args.parallel)
         print(f"\n=== {key}", flush=True)
         proc = None
