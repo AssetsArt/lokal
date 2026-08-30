@@ -83,7 +83,7 @@ session, each lokal/llama.cpp pair back to back, one
 `bench_engines.py --prompt-tokens` row per point — median of 5 requests —
 with the machine state recorded on every row; llama.cpp was re-measured at
 582 and 794 and agreed with its first pass within noise). lokal is
-`-b hybrid` with the ladder `run.sh export-ane-split` ships, no env vars:
+`-b hybrid` with the ladder `run.sh export-hybrid` ships, no env vars:
 
 | prompt tokens (lokal · llama.cpp) | lokal `-b hybrid` | llama.cpp | edge |
 |---|---|---|---|
@@ -194,7 +194,7 @@ python3 benchmarks/bench_engines.py --engine lokal-hybrid
 python3 benchmarks/bench_engines.py --engine llamacpp
 python3 benchmarks/bench_engines.py --engine omlx --out benchmarks/results.jsonl
 
-# lokal-hybrid splits by default once ./run.sh export-ane-split has run;
+# lokal-hybrid splits by default once ./run.sh export-hybrid has run;
 # the ladder-less hybrid row, for A/B against it:
 LOKAL_SPLIT_PREFILL=0 python3 benchmarks/bench_engines.py --engine lokal-hybrid
 ```
