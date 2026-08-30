@@ -1101,12 +1101,20 @@ kernel void attention_prefill_flash(
 
     for (uint t0 = 0; t0 < t_hi; t0 += FA_C) {
         // Phase 1 — S = Q·K^T: simdgroup sgid owns FA_C/8/FA_NSG score columns.
+        // K blocks load in pairs so the compiler batches the device reads ahead
+        // of the two MMAs (the issue pattern llama.cpp's fa kernel relies on).
         for (uint c = sgid * (FA_C / 8 / FA_NSG); c < (sgid + 1) * (FA_C / 8 / FA_NSG); c++) {
             simdgroup_float8x8 sc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-            for (uint kk = 0; kk < FA_HD / 8; kk++) {
-                simdgroup_half8x8 B;
-                simdgroup_load(B, kb + (ulong)(t0 + c * 8) * kvd + kk * 8, kvd, ulong2(0), true);
-                simdgroup_multiply_accumulate(sc, qm[kk], B, sc);
+#pragma unroll(4)
+            for (uint kk = 0; kk < FA_HD / 8; kk += 2) {
+                simdgroup_half8x8 B0;
+                simdgroup_half8x8 B1;
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_load(B0, kb + (ulong)(t0 + c * 8) * kvd + kk * 8, kvd, ulong2(0), true);
+                simdgroup_load(B1, kb + (ulong)(t0 + c * 8) * kvd + kk * 8 + 8, kvd, ulong2(0), true);
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_multiply_accumulate(sc, qm[kk], B0, sc);
+                simdgroup_multiply_accumulate(sc, qm[kk + 1], B1, sc);
             }
             simdgroup_store(sc, S + c * 8, FA_C);
         }
@@ -1171,12 +1179,20 @@ kernel void attention_prefill_flash(
         for (uint jb = sgid * (FA_HD / 8 / FA_NSG); jb < (sgid + 1) * (FA_HD / 8 / FA_NSG); jb++) {
             simdgroup_float8x8 acc;
             simdgroup_load(acc, O + jb * 8, FA_HD);
-            for (uint c = 0; c < FA_C / 8; c++) {
-                simdgroup_half8x8 A;
-                simdgroup_load(A, P + c * 8, FA_C);
-                simdgroup_half8x8 B;
-                simdgroup_load(B, vb + (ulong)(t0 + c * 8) * kvd + jb * 8, kvd);
-                simdgroup_multiply_accumulate(acc, A, B, acc);
+#pragma unroll(4)
+            for (uint c = 0; c < FA_C / 8; c += 2) {
+                simdgroup_half8x8 A0;
+                simdgroup_half8x8 A1;
+                simdgroup_half8x8 B0;
+                simdgroup_half8x8 B1;
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_load(A0, P + c * 8, FA_C);
+                simdgroup_load(B0, vb + (ulong)(t0 + c * 8) * kvd + jb * 8, kvd);
+                simdgroup_load(A1, P + c * 8 + 8, FA_C);
+                simdgroup_load(B1, vb + (ulong)(t0 + c * 8 + 8) * kvd + jb * 8, kvd);
+                simdgroup_barrier(mem_flags::mem_none);
+                simdgroup_multiply_accumulate(acc, A0, B0, acc);
+                simdgroup_multiply_accumulate(acc, A1, B1, acc);
             }
             simdgroup_store(acc, O + jb * 8, FA_HD);
         }
