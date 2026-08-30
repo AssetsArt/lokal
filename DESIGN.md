@@ -423,12 +423,33 @@ Roughly ordered by leverage:
      ~250 ms of shader compilation, which a server amortizes and a
      one-shot CLI run does not.
 
-   **Measured and rejected:** porting the flash kernel's QK^T and P.V to
-   tensor ops costs 39% at 2k — the online softmax between the two matmuls
-   breaks the cooperative-tensor dataflow, and the register-resident FA-2
-   kernel stays. The 8,192-position ANE window remains the long-prompt head
-   start; wider windows stay priced out by the superlinear first-load ANE
-   compile (99 s at 6,144, 250 s at 8,192, 21+ min at 16,384).
+   **Measured and rejected**, so nobody spends the day again:
+
+   - Porting the flash kernel's QK^T and P.V to tensor ops costs 39% at 2k —
+     the online softmax between the two matmuls breaks the
+     cooperative-tensor dataflow.
+   - The GQA redundancy that the decode kernel eliminates is NOT the prefill
+     gap, though the per-head-layer numbers make it look like it. Two
+     independent falsifications: variants that remove it moved SmolLM2 (9:3)
+     *more* than Qwen (14:2), the opposite of what the hypothesis predicts,
+     and llama.cpp's own flash-attention carries the same per-query-head
+     redundancy — one threadgroup per query head, leaning on L2 to
+     deduplicate the K/V reads.
+   - Six structurally different attention kernels — the incumbent staged
+     96-row tiling, direct-load variants at 96/32/16 rows, and a faithful
+     reimplementation of llama.cpp's own kernel shape — land within ±3% of
+     each other at 8k. The architecture axis is exhausted.
+   - What the remaining ~16% actually is: with llama.cpp's flash attention
+     switched off, our kernel beats their fallback by 16%; switched on, they
+     lead by about the same. Their edge survives replicating their kernel's
+     shape, so it lives below it — fully template-specialized per-head-dim
+     kernels compiled offline into a metallib, against our single kernel
+     compiled from source at startup. That is a toolchain difference, not a
+     tiling one, and closing it means changing how lokal ships shaders.
+
+   The 8,192-position ANE window remains the long-prompt head start; wider
+   windows stay priced out by the superlinear first-load ANE compile (99 s
+   at 6,144, 250 s at 8,192, 21+ min at 16,384).
 5. The rest: an OpenAI-compatible API (`/v1/chat/completions`) and SSE
    streaming in serve mode; a hybrid scheduler that picks the backend
    automatically; CUDA/Vulkan backends on the same Engine/Session seam.
