@@ -150,11 +150,18 @@ class WindowedNet(torch.nn.Module):
     99 s at 6,144 → 250 s at 8,192 → 21+ min (unfinished, killed) at 16,384.
     """
 
-    def __init__(self, cfg, weights, s, p):
+    def __init__(self, cfg, weights, s, p, n_front=None):
         super().__init__()
         self.s = s
         self.p = p
         self.n_layers = cfg["num_hidden_layers"]
+        # Layer-split variant: with n_front set, the graph runs only layers
+        # 0..n_front and additionally returns the hidden state, so the remaining
+        # layers can continue on another device (see src/ane.rs, split prefill).
+        # k_past/v_past then carry only the front layers. n_front=None keeps the
+        # full-model graph byte-for-byte as it was.
+        self.n_front = self.n_layers if n_front is None else n_front
+        self.emit_x = self.n_front < self.n_layers
         self.n_heads = cfg["num_attention_heads"]
         self.n_kv = cfg["num_key_value_heads"]
         self.hd = cfg["hidden_size"] // self.n_heads
@@ -187,7 +194,7 @@ class WindowedNet(torch.nn.Module):
         x = F.embedding(ids.to(torch.long), self.model_embed_tokens_weight)
         k_out, v_out = [], []
         rep = self.n_heads // kv
-        for li in range(self.n_layers):
+        for li in range(self.n_front):
             xn = rmsnorm(x, self.w(li, "input_layernorm.weight"), self.eps)
             q = F.linear(xn, self.w(li, "self_attn.q_proj.weight"), self.opt_bias(li, "q_proj"))
             k = F.linear(xn, self.w(li, "self_attn.k_proj.weight"), self.opt_bias(li, "k_proj"))
@@ -233,7 +240,129 @@ class WindowedNet(torch.nn.Module):
             gate = F.linear(xn, self.w(li, "mlp.gate_proj.weight"))
             up = F.linear(xn, self.w(li, "mlp.up_proj.weight"))
             x = x + F.linear(F.silu(gate) * up, self.w(li, "mlp.down_proj.weight"))
+        if self.emit_x:
+            return torch.stack(k_out), torch.stack(v_out), x
         return torch.stack(k_out), torch.stack(v_out)
+
+
+def export_front(args, cfg, weights, spec):
+    """Export the layer-split FRONT half: a windowed chunk graph that runs layers
+    0..A and returns both their K/V and the hidden state, so a second device can
+    finish layers A..L for the same chunk. This is what makes GPU and ANE work on
+    the prompt at the same time — the ANE runs chunk c's front half while Metal
+    runs chunk c-1's back half (src/ane.rs, LOKAL_SPLIT_PREFILL).
+
+    Export and first-load cost are first-class numbers here, not footnotes: every
+    new graph shape is a fresh ANECCompilerService pass on each machine, and that
+    pass is silent and slow (99 s at width 6,144, 250 s at 8,192). Both are timed
+    and printed."""
+    import time
+
+    import coremltools as ct
+
+    fs, fp = (int(v) for v in spec.split("x"))
+    L = cfg["num_hidden_layers"]
+    A = args.front_layers or L // 2
+    if not 0 < A < L:
+        raise SystemExit(f"--front-layers must be in 1..{L - 1} (got {A})")
+    hd = cfg["hidden_size"] // cfg["num_attention_heads"]
+    kvd = cfg["num_key_value_heads"] * hd
+    H = cfg["hidden_size"]
+
+    t_export = time.time()
+    fnet = WindowedNet(cfg, weights, fs, fp, n_front=A).eval()
+    print(f"tracing front graph (S={fs}, P={fp}, layers 0..{A} of {L}) ...", flush=True)
+    ex = (
+        torch.zeros(1, fs, dtype=torch.int32),
+        torch.zeros(fs, hd),
+        torch.zeros(fs, hd),
+        torch.zeros(A, fp, kvd),
+        torch.zeros(A, fp, kvd),
+        torch.zeros(1, fp),
+    )
+    with torch.no_grad():
+        traced = torch.jit.trace(fnet, ex)
+    print("converting ...", flush=True)
+    mlmodel = ct.convert(
+        traced,
+        inputs=[
+            ct.TensorType(name="ids", shape=(1, fs), dtype=np.int32),
+            ct.TensorType(name="cos", shape=(fs, hd), dtype=np.float16),
+            ct.TensorType(name="sin", shape=(fs, hd), dtype=np.float16),
+            ct.TensorType(name="k_past", shape=(A, fp, kvd), dtype=np.float16),
+            ct.TensorType(name="v_past", shape=(A, fp, kvd), dtype=np.float16),
+            ct.TensorType(name="past_valid", shape=(1, fp), dtype=np.float16),
+        ],
+        outputs=[ct.TensorType(name="k_cache", dtype=np.float32),
+                 ct.TensorType(name="v_cache", dtype=np.float32),
+                 ct.TensorType(name="x_out", dtype=np.float32)],
+        compute_precision=ct.precision.FLOAT16,
+        compute_units=ct.ComputeUnit.CPU_AND_NE,
+        minimum_deployment_target=ct.target.macOS15,
+        convert_to="mlprogram",
+    )
+    del traced
+    gc.collect()
+
+    # Two-chunk sanity on natural text, same method as the windowed graph: chunk 1
+    # through torch to build the past, then chunk 2 Core ML (fp16) vs torch (f32).
+    from tokenizers import Tokenizer
+    tok = Tokenizer.from_file(str(args.model_dir / "tokenizer.json"))
+    sent = ("The river was beautiful that morning and everyone stopped to look "
+            "at it for a while before walking on toward the harbor. ")
+    text_ids = np.array(tok.encode(sent * 200).ids[: 2 * fs], dtype=np.int32)
+    theta = cfg.get("rope_theta", 10000.0)
+
+    def rope_tables(pos0, n):
+        inv = 1.0 / (theta ** (np.arange(0, hd, 2, dtype=np.float64) / hd))
+        ang = np.outer(np.arange(pos0, pos0 + n, dtype=np.float64), inv)
+        emb = np.concatenate([ang, ang], axis=-1)
+        return np.cos(emb).astype(np.float32), np.sin(emb).astype(np.float32)
+
+    c1, s1 = rope_tables(0, fs)
+    c2, s2 = rope_tables(fs, fs)
+    with torch.no_grad():
+        z = torch.zeros(A, fp, kvd)
+        k1, v1, _ = fnet(torch.from_numpy(text_ids[:fs][None, :]),
+                         torch.from_numpy(c1), torch.from_numpy(s1),
+                         z, z, torch.zeros(1, fp))
+        kp, vp = torch.zeros(A, fp, kvd), torch.zeros(A, fp, kvd)
+        kp[:, :fs], vp[:, :fs] = k1, v1
+        valid = torch.zeros(1, fp)
+        valid[0, :fs] = 1.0
+        k2, v2, x2 = fnet(torch.from_numpy(text_ids[fs:][None, :]),
+                          torch.from_numpy(c2), torch.from_numpy(s2), kp, vp, valid)
+    got = mlmodel.predict({
+        "ids": text_ids[fs:][None, :],
+        "cos": c2.astype(np.float16),
+        "sin": s2.astype(np.float16),
+        "k_past": kp.numpy().astype(np.float16),
+        "v_past": vp.numpy().astype(np.float16),
+        "past_valid": valid.numpy().astype(np.float16),
+    })
+    dk = np.abs(got["k_cache"] - k2.numpy()).max()
+    dv = np.abs(got["v_cache"] - v2.numpy()).max()
+    dx = np.abs(got["x_out"] - x2.numpy()).max()
+    xr = float(np.abs(x2.numpy()).max())
+    print(f"front S={fs} P={fp} layers 0..{A}: max abs diff Core ML vs torch fp32: "
+          f"K {dk:.4f}, V {dv:.4f}, x {dx:.4f} (|x|max {xr:.2f})", flush=True)
+    del fnet, got, k1, v1, k2, v2, x2, kp, vp
+    gc.collect()
+
+    dest = args.model_dir / f"prefill-f{A}-{fs}w{fp}.mlmodelc"
+    with tempfile.TemporaryDirectory() as tmp:
+        mlmodel.save(str(Path(tmp) / f"prefill-f{A}-{fs}w{fp}.mlpackage"))
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(mlmodel.get_compiled_model_path(), dest)
+    del mlmodel
+    gc.collect()
+    export_s = time.time() - t_export
+    print(f"saved: {dest}", flush=True)
+    print(f"EXPORT COST front-{A}-{fs}w{fp}: {export_s:.1f}s "
+          f"(trace+convert+check+save; the per-machine ANECompilerService pass is "
+          f"separate and shows up on the first Rust load)", flush=True)
+    return dest
 
 
 def main():
@@ -243,6 +372,12 @@ def main():
                     help="sequence lengths to export, comma-separated (one graph each), 'none' to skip")
     ap.add_argument("--window", default="1024x7168",
                     help="windowed graph as SxP (chunk x past), 'none' to skip")
+    ap.add_argument("--front", default="none",
+                    help="layer-split front-half graphs as SxP[,SxP...] (chunk x past); pairs with "
+                         "--front-layers. Runs layers 0..front_layers and also returns the "
+                         "hidden state so another device finishes the rest (split prefill)")
+    ap.add_argument("--front-layers", type=int, default=0,
+                    help="how many leading layers the --front graph runs (default: half)")
     args = ap.parse_args()
     shapes = [] if args.shapes == "none" else sorted(int(s) for s in args.shapes.split(","))
 
@@ -299,6 +434,10 @@ def main():
 
     del net
     gc.collect()
+
+    if args.front != "none":
+        for spec in args.front.split(","):
+            done.append(export_front(args, cfg, weights, spec))
 
     if args.window != "none":
         ws, wp = (int(v) for v in args.window.split("x"))
@@ -401,8 +540,13 @@ def main():
     # a --shapes none windowed run must not delete the plain graphs (that
     # cross-delete once wiped a model's whole graph set).
     for old in args.model_dir.glob("prefill-*.mlmodelc"):
-        is_windowed = "w" in old.stem.removeprefix("prefill-")
-        rebuilt_kind = (args.window != "none") if is_windowed else bool(shapes)
+        spec = old.stem.removeprefix("prefill-")
+        if spec.startswith("f") and "-" in spec:   # front-half split graph
+            rebuilt_kind = args.front != "none"
+        elif "w" in spec:                          # windowed graph
+            rebuilt_kind = args.window != "none"
+        else:                                      # plain fixed-shape graph
+            rebuilt_kind = bool(shapes)
         if rebuilt_kind and old not in done:
             shutil.rmtree(old)
     print(f"done: {len(done)} graph(s)")

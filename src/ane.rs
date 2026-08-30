@@ -132,6 +132,91 @@ fn ml_array(shape: &[usize], dtype: MLMultiArrayDataType) -> crate::Result<Retai
         .map_err(|e| format!("failed to create MLMultiArray: {e:?}").into())
 }
 
+/// Build the feature provider both windowed graphs share: one chunk of `ids` at
+/// absolute position `pos0`, the RoPE tables for those positions, and the
+/// validity-masked past K/V for `past_layers` layers ([past_layers × p × kvd]
+/// f16 bits). RoPE is computed here in f32 rather than in the graph — the fp16
+/// pipeline cannot represent integers above 2,048 exactly, which corrupts RoPE
+/// from that position on.
+#[allow(clippy::too_many_arguments)]
+fn windowed_provider(
+    s: usize,
+    p: usize,
+    ids: &[u32],
+    pos0: usize,
+    k_past: &[u16],
+    v_past: &[u16],
+    past_layers: usize,
+    kvd: usize,
+    head_dim: usize,
+    theta: f32,
+) -> crate::Result<Retained<MLDictionaryFeatureProvider>> {
+    let ids_arr = ml_array(&[1, s], MLMultiArrayDataType::Int32)?;
+    let cos_arr = ml_array(&[s, head_dim], MLMultiArrayDataType::Float16)?;
+    let sin_arr = ml_array(&[s, head_dim], MLMultiArrayDataType::Float16)?;
+    let k_arr = ml_array(&[past_layers, p, kvd], MLMultiArrayDataType::Float16)?;
+    let v_arr = ml_array(&[past_layers, p, kvd], MLMultiArrayDataType::Float16)?;
+    let valid_arr = ml_array(&[1, p], MLMultiArrayDataType::Float16)?;
+    #[allow(deprecated)] // dataPointer: plain pointers, same reasoning as above
+    unsafe {
+        let idp = ids_arr.dataPointer().as_ptr() as *mut i32;
+        for i in 0..s {
+            *idp.add(i) = if i < ids.len() { ids[i] as i32 } else { 0 };
+        }
+        let cp = cos_arr.dataPointer().as_ptr() as *mut u16;
+        let sp = sin_arr.dataPointer().as_ptr() as *mut u16;
+        let half = head_dim / 2;
+        for r in 0..s {
+            let pos = (pos0 + r) as f32;
+            for i in 0..half {
+                let freq = theta.powf(-2.0 * i as f32 / head_dim as f32);
+                let (s_v, c_v) = (pos * freq).sin_cos();
+                let (c_b, s_b) = (f16::from_f32(c_v).to_bits(), f16::from_f32(s_v).to_bits());
+                *cp.add(r * head_dim + i) = c_b;
+                *cp.add(r * head_dim + i + half) = c_b; // HF layout: both halves
+                *sp.add(r * head_dim + i) = s_b;
+                *sp.add(r * head_dim + i + half) = s_b;
+            }
+        }
+        std::ptr::copy_nonoverlapping(
+            k_past.as_ptr(),
+            k_arr.dataPointer().as_ptr() as *mut u16,
+            k_past.len(),
+        );
+        std::ptr::copy_nonoverlapping(
+            v_past.as_ptr(),
+            v_arr.dataPointer().as_ptr() as *mut u16,
+            v_past.len(),
+        );
+        let vp = valid_arr.dataPointer().as_ptr() as *mut u16;
+        let one = f16::from_f32(1.0).to_bits();
+        for i in 0..p {
+            *vp.add(i) = if i < pos0 { one } else { 0 };
+        }
+    }
+
+    let names = ["ids", "cos", "sin", "k_past", "v_past", "past_valid"];
+    let arrays = [ids_arr, cos_arr, sin_arr, k_arr, v_arr, valid_arr];
+    let keys: Vec<_> = names.iter().map(|n| NSString::from_str(n)).collect();
+    let key_refs: Vec<&NSString> = keys.iter().map(|k| &**k).collect();
+    let values: Vec<Retained<AnyObject>> = arrays
+        .into_iter()
+        .map(|a| {
+            let v = unsafe { MLFeatureValue::featureValueWithMultiArray(&a) };
+            Retained::into_super(Retained::into_super(v))
+        })
+        .collect();
+    let dict = NSDictionary::from_retained_objects(&key_refs, &values);
+    let provider = unsafe {
+        MLDictionaryFeatureProvider::initWithDictionary_error(
+            MLDictionaryFeatureProvider::alloc(),
+            &dict,
+        )
+    }
+    .map_err(|e| format!("feature provider: {e:?}"))?;
+    Ok(provider)
+}
+
 impl CoreMlWindowed {
     fn load(path: &Path, s: usize, p: usize) -> crate::Result<Self> {
         let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
@@ -143,10 +228,7 @@ impl CoreMlWindowed {
     }
 
     /// One chunk: `ids` (≤ s tokens) at absolute position `pos0`, with `pos0` (≤ p)
-    /// valid rows of accumulated K/V ([layers × p × kvd], f16 bits). RoPE cos/sin
-    /// are computed here in f32 and fed as inputs — the graph must not derive
-    /// positions itself, because the fp16 pipeline cannot represent integers above
-    /// 2,048 exactly and RoPE breaks from that position on.
+    /// valid rows of accumulated K/V ([layers × p × kvd], f16 bits).
     #[allow(clippy::too_many_arguments)]
     fn predict(
         &self,
@@ -160,70 +242,9 @@ impl CoreMlWindowed {
         theta: f32,
     ) -> crate::Result<(Vec<f32>, Vec<f32>)> {
         autoreleasepool(|_| {
-            let ids_arr = ml_array(&[1, self.s], MLMultiArrayDataType::Int32)?;
-            let cos_arr = ml_array(&[self.s, head_dim], MLMultiArrayDataType::Float16)?;
-            let sin_arr = ml_array(&[self.s, head_dim], MLMultiArrayDataType::Float16)?;
-            let k_arr = ml_array(&[n_layers, self.p, kvd], MLMultiArrayDataType::Float16)?;
-            let v_arr = ml_array(&[n_layers, self.p, kvd], MLMultiArrayDataType::Float16)?;
-            let valid_arr = ml_array(&[1, self.p], MLMultiArrayDataType::Float16)?;
-            #[allow(deprecated)] // dataPointer: plain pointers, same reasoning as above
-            unsafe {
-                let idp = ids_arr.dataPointer().as_ptr() as *mut i32;
-                for i in 0..self.s {
-                    *idp.add(i) = if i < ids.len() { ids[i] as i32 } else { 0 };
-                }
-                let cp = cos_arr.dataPointer().as_ptr() as *mut u16;
-                let sp = sin_arr.dataPointer().as_ptr() as *mut u16;
-                let half = head_dim / 2;
-                for r in 0..self.s {
-                    let pos = (pos0 + r) as f32;
-                    for i in 0..half {
-                        let freq = theta.powf(-2.0 * i as f32 / head_dim as f32);
-                        let (s_v, c_v) = (pos * freq).sin_cos();
-                        let (c_b, s_b) = (f16::from_f32(c_v).to_bits(), f16::from_f32(s_v).to_bits());
-                        *cp.add(r * head_dim + i) = c_b;
-                        *cp.add(r * head_dim + i + half) = c_b; // HF layout: both halves
-                        *sp.add(r * head_dim + i) = s_b;
-                        *sp.add(r * head_dim + i + half) = s_b;
-                    }
-                }
-                std::ptr::copy_nonoverlapping(
-                    k_past.as_ptr(),
-                    k_arr.dataPointer().as_ptr() as *mut u16,
-                    k_past.len(),
-                );
-                std::ptr::copy_nonoverlapping(
-                    v_past.as_ptr(),
-                    v_arr.dataPointer().as_ptr() as *mut u16,
-                    v_past.len(),
-                );
-                let vp = valid_arr.dataPointer().as_ptr() as *mut u16;
-                let one = f16::from_f32(1.0).to_bits();
-                for i in 0..self.p {
-                    *vp.add(i) = if i < pos0 { one } else { 0 };
-                }
-            }
-
-            let names = ["ids", "cos", "sin", "k_past", "v_past", "past_valid"];
-            let arrays = [ids_arr, cos_arr, sin_arr, k_arr, v_arr, valid_arr];
-            let keys: Vec<_> = names.iter().map(|n| NSString::from_str(n)).collect();
-            let key_refs: Vec<&NSString> = keys.iter().map(|k| &**k).collect();
-            let values: Vec<Retained<AnyObject>> = arrays
-                .into_iter()
-                .map(|a| {
-                    let v = unsafe { MLFeatureValue::featureValueWithMultiArray(&a) };
-                    Retained::into_super(Retained::into_super(v))
-                })
-                .collect();
-            let dict = NSDictionary::from_retained_objects(&key_refs, &values);
-            let provider = unsafe {
-                MLDictionaryFeatureProvider::initWithDictionary_error(
-                    MLDictionaryFeatureProvider::alloc(),
-                    &dict,
-                )
-            }
-            .map_err(|e| format!("feature provider: {e:?}"))?;
-
+            let provider = windowed_provider(
+                self.s, self.p, ids, pos0, k_past, v_past, n_layers, kvd, head_dim, theta,
+            )?;
             let out = unsafe {
                 self.model
                     .predictionFromFeatures_error(ProtocolObject::from_ref(&*provider))
@@ -232,6 +253,68 @@ impl CoreMlWindowed {
             Ok((fetch_f32(&out, "k_cache")?, fetch_f32(&out, "v_cache")?))
         })
     }
+}
+
+
+/// The layer-split FRONT graph: like the windowed graph, but it runs only layers
+/// 0..`n_front` and additionally returns the hidden state, so another device can
+/// finish the remaining layers for the same chunk. This is what lets the ANE and
+/// the GPU work on one prompt at the same time — see `AneSession::prefill_split`.
+struct CoreMlFront {
+    model: Retained<MLModel>,
+    s: usize,
+    p: usize,
+    n_front: usize,
+}
+
+unsafe impl Send for CoreMlFront {}
+unsafe impl Sync for CoreMlFront {}
+
+impl CoreMlFront {
+    fn load(path: &Path, s: usize, p: usize, n_front: usize) -> crate::Result<Self> {
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        let config = unsafe { MLModelConfiguration::new() };
+        unsafe { config.setComputeUnits(MLComputeUnits::CPUAndNeuralEngine) };
+        let model = unsafe { MLModel::modelWithContentsOfURL_configuration_error(&url, &config) }
+            .map_err(|e| format!("failed to load {}: {e:?}", path.display()))?;
+        Ok(Self { model, s, p, n_front })
+    }
+
+    /// One chunk through layers 0..n_front → (K, V) for those layers
+    /// ([n_front × s × kvd] f32) plus the hidden state ([s × hidden] f32).
+    #[allow(clippy::too_many_arguments)]
+    fn predict(
+        &self,
+        ids: &[u32],
+        pos0: usize,
+        k_past: &[u16],
+        v_past: &[u16],
+        kvd: usize,
+        head_dim: usize,
+        theta: f32,
+    ) -> crate::Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        autoreleasepool(|_| {
+            let provider = windowed_provider(
+                self.s, self.p, ids, pos0, k_past, v_past, self.n_front, kvd, head_dim, theta,
+            )?;
+            let out = unsafe {
+                self.model
+                    .predictionFromFeatures_error(ProtocolObject::from_ref(&*provider))
+            }
+            .map_err(|e| format!("Core ML prediction failed: {e:?}"))?;
+            Ok((
+                fetch_f32(&out, "k_cache")?,
+                fetch_f32(&out, "v_cache")?,
+                fetch_f32(&out, "x_out")?,
+            ))
+        })
+    }
+}
+
+/// Opt-in: run prefill as a two-device pipeline (see `AneSession::prefill_split`).
+/// Off by default — with it unset the `ane` backend behaves exactly as before.
+fn split_enabled() -> bool {
+    std::env::var("LOKAL_SPLIT_PREFILL").is_ok_and(|v| v != "0" && !v.is_empty())
 }
 
 /// Pull an f32 multiarray output into a Vec<f32>.
@@ -252,6 +335,10 @@ pub struct AneEngine {
     metal: MetalEngine,
     graphs: Vec<CoreMlPrefill>, // sorted by seq, ascending — one fixed shape each
     windowed: Option<CoreMlWindowed>,
+    // Split prefill, only loaded when LOKAL_SPLIT_PREFILL is set. A ladder like the
+    // plain graphs: a windowed graph costs its full P+S attention on every chunk
+    // whatever the prompt length, so a short prompt wants a short window.
+    front: Vec<CoreMlFront>, // sorted by reach (s + p), ascending
 }
 
 impl AneEngine {
@@ -260,13 +347,21 @@ impl AneEngine {
         // (plain) and prefill-<s>w<p>.mlmodelc (windowed).
         let mut found = Vec::new();
         let mut win = None;
+        let mut fronts = Vec::new();
         for entry in std::fs::read_dir(model_dir)? {
             let name = entry?.file_name().to_string_lossy().into_owned();
             let Some(spec) = name.strip_prefix("prefill-").and_then(|s| s.strip_suffix(".mlmodelc"))
             else {
                 continue;
             };
-            if let Some((s, p)) = spec.split_once('w') {
+            // prefill-f<layers>-<s>w<p>: the layer-split front half.
+            if let Some((layers, rest)) = spec.strip_prefix('f').and_then(|r| r.split_once('-')) {
+                if let (Ok(a), Some((s, p))) = (layers.parse::<usize>(), rest.split_once('w')) {
+                    if let (Ok(s), Ok(p)) = (s.parse::<usize>(), p.parse::<usize>()) {
+                        fronts.push((model_dir.join(&name), s, p, a));
+                    }
+                }
+            } else if let Some((s, p)) = spec.split_once('w') {
                 if let (Ok(s), Ok(p)) = (s.parse::<usize>(), p.parse::<usize>()) {
                     win = Some((model_dir.join(&name), s, p));
                 }
@@ -296,6 +391,30 @@ impl AneEngine {
             Some((path, s, p)) => Some(CoreMlWindowed::load(&path, s, p)?),
             None => None,
         };
+        // The front graph is a separate shape and so a separate ANECompilerService
+        // pass; load it only when split prefill is actually asked for, so the
+        // default backend's start-up cost is exactly what it was.
+        let mut front = Vec::new();
+        if split_enabled() {
+            fronts.sort_by_key(|&(_, s, p, _)| s + p);
+            if fronts.is_empty() {
+                eprintln!(
+                    "ANE: LOKAL_SPLIT_PREFILL set but no prefill-f<layers>-<s>w<p>.mlmodelc in {} \
+                     — falling back to the normal ane path",
+                    model_dir.display()
+                );
+            }
+            for (path, s, p, a) in fronts {
+                // Every new shape is its own ANECompilerService pass on this machine —
+                // silent and slow the first time, cached afterwards. Time it out loud.
+                let t = Instant::now();
+                front.push(CoreMlFront::load(&path, s, p, a)?);
+                eprintln!(
+                    "ANE: split prefill on — front graph {s}x{p} layers 0..{a} loaded in {:.1}s",
+                    t.elapsed().as_secs_f64()
+                );
+            }
+        }
         let shapes: Vec<usize> = graphs.iter().map(|g| g.seq).collect();
         match &windowed {
             Some(w) => eprintln!(
@@ -304,7 +423,7 @@ impl AneEngine {
             ),
             None => eprintln!("ANE: loaded prefill graphs {shapes:?} (Core ML, compute = CPU+ANE)"),
         }
-        Ok(Self { metal: MetalEngine::new(model)?, graphs, windowed })
+        Ok(Self { metal: MetalEngine::new(model)?, graphs, windowed, front })
     }
 }
 
@@ -322,6 +441,7 @@ impl Engine for AneEngine {
             metal: self.metal.raw_session(max_seq),
             graphs: &self.graphs,
             windowed: self.windowed.as_ref(),
+            front: &self.front,
         }))
     }
     fn batcher(&self, n_slots: usize, max_seq: usize) -> Option<Box<dyn Batcher + '_>> {
@@ -346,6 +466,7 @@ impl Batcher for AneBatcher<'_> {
             metal: self.inner.slot_session(slot),
             graphs: &self.engine.graphs,
             windowed: self.engine.windowed.as_ref(),
+            front: &self.engine.front,
         };
         s.prefill(ids)
     }
@@ -362,6 +483,7 @@ struct AneSession<'a> {
     metal: MetalSession<'a>,
     graphs: &'a [CoreMlPrefill], // sorted by seq, ascending
     windowed: Option<&'a CoreMlWindowed>,
+    front: &'a [CoreMlFront], // sorted by reach (s + p), ascending; empty = split off
     n_layers: usize,
     kvd: usize,
 }
@@ -398,6 +520,141 @@ impl AneSession<'_> {
                 }
             }
         }
+    }
+
+
+    /// Split prefill — the two-device pipeline, opt-in via LOKAL_SPLIT_PREFILL.
+    ///
+    /// The prompt is cut into chunks of the front graph's S. The ANE runs chunk c
+    /// through layers 0..A while Metal runs chunk c-1 through layers A..L, so in
+    /// steady state both engines are working on the same prompt instead of one
+    /// waiting for the other. Causality holds because each half only ever needs
+    /// its OWN layers' past K/V — which that device already produced for every
+    /// earlier chunk — plus this chunk's hidden state from the stage before it.
+    ///
+    /// The ANE's front-layer K/V still land in Metal's cache: decoding runs every
+    /// layer on the GPU and needs all of them. Conversion to the cache's f16
+    /// happens on the ANE thread, which needs those same rows for the next
+    /// chunk's past anyway, so the thread driving the GPU only memcpys.
+    fn prefill_split(&mut self, ids: &[u32]) -> crate::Result<Vec<f32>> {
+        // Smallest window that reaches the whole prompt — a wider one would pay
+        // full P+S attention on every chunk for past that is never valid.
+        let f = self
+            .front
+            .iter()
+            .find(|g| g.s + g.p >= ids.len())
+            .unwrap_or_else(|| self.front.last().expect("caller checked"));
+        let kvd = self.kvd;
+        let cfg = self.metal.config_ref();
+        let (head_dim, theta, hidden) = (cfg.head_dim(), cfg.rope_theta, cfg.hidden_size);
+        let ane_total = ids.len().min(f.s + f.p);
+        let a = f.n_front;
+        // The hidden state is written straight into Metal's per-chunk scratch.
+        let room = self.metal.max_chunk_rows();
+        if f.s > room {
+            return Err(format!(
+                "split prefill: front graph chunk S={} exceeds Metal's per-chunk scratch ({room} rows) \
+                 — re-export with a smaller --front chunk",
+                f.s
+            )
+            .into());
+        }
+
+        struct Chunk {
+            pos: usize,
+            n: usize,
+            k: Vec<u16>, // [A × n × kvd] f16 bits, ready for the cache
+            v: Vec<u16>,
+            x: Vec<f32>, // [n × hidden] — the layer-A input for the other device
+            ane_s: f64,  // how long this chunk's front half took, for the balance report
+        }
+
+        let t = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel::<crate::Result<Chunk>>();
+        let (logits, chunks, ane_s, metal_s) =
+            std::thread::scope(|scope| -> crate::Result<(Vec<f32>, usize, f64, f64)> {
+            scope.spawn(move || {
+                let mut past_k = vec![0u16; a * f.p * kvd];
+                let mut past_v = vec![0u16; a * f.p * kvd];
+                let mut pos = 0;
+                while pos < ane_total {
+                    let n = (ane_total - pos).min(f.s);
+                    let t_chunk = Instant::now();
+                    let (k, v, x) = match f.predict(
+                        &ids[pos..pos + n], pos, &past_k, &past_v, kvd, head_dim, theta,
+                    ) {
+                        Ok(out) => out,
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                            return;
+                        }
+                    };
+                    let rows = n * kvd;
+                    let (mut kb, mut vb) = (vec![0u16; a * rows], vec![0u16; a * rows]);
+                    for l in 0..a {
+                        let src = l * f.s * kvd;
+                        for i in 0..rows {
+                            kb[l * rows + i] = f16::from_f32(k[src + i]).to_bits();
+                            vb[l * rows + i] = f16::from_f32(v[src + i]).to_bits();
+                        }
+                    }
+                    // Rows at index ≥ p can never be attended to again — skip them.
+                    let keep = rows.min(f.p.saturating_sub(pos) * kvd);
+                    for l in 0..a {
+                        let dst = l * f.p * kvd + pos * kvd;
+                        past_k[dst..dst + keep].copy_from_slice(&kb[l * rows..l * rows + keep]);
+                        past_v[dst..dst + keep].copy_from_slice(&vb[l * rows..l * rows + keep]);
+                    }
+                    let chunk = Chunk {
+                        pos,
+                        n,
+                        k: kb,
+                        v: vb,
+                        x: x[..n * hidden].to_vec(),
+                        ane_s: t_chunk.elapsed().as_secs_f64(),
+                    };
+                    if tx.send(Ok(chunk)).is_err() {
+                        return; // the consumer gave up (an error downstream)
+                    }
+                    pos += n;
+                }
+            });
+
+            let (mut logits, mut chunks) = (Vec::new(), 0usize);
+            let (mut ane_s, mut metal_s) = (0.0, 0.0);
+            for msg in rx {
+                let c = msg?;
+                let t_stage = Instant::now();
+                ane_s += c.ane_s;
+                let rows = c.n * kvd;
+                for l in 0..a {
+                    let (lo, hi) = (l * rows, (l + 1) * rows);
+                    self.metal.write_kv_bits(l, c.pos, &c.k[lo..hi], &c.v[lo..hi]);
+                }
+                let last = c.pos + c.n == ids.len();
+                logits = self.metal.prefill_tail_layers(&c.x, c.pos, c.n, a, last)?;
+                metal_s += t_stage.elapsed().as_secs_f64();
+                chunks += 1;
+            }
+            Ok((logits, chunks, ane_s, metal_s))
+        })?;
+
+        // The balance of the two sides is the whole story: a pipeline is only worth
+        // its complexity while neither engine is waiting much on the other.
+        eprintln!(
+            "  ANE split prefill: {ane_total} tokens ({chunks} chunks of {}, layers 0..{a} on ANE ‖ {a}.. on Metal, P={}) \
+             in {:.3}s [ANE {:.3}s, Metal {:.3}s, {:.0}% overlapped]",
+            f.s,
+            f.p,
+            t.elapsed().as_secs_f64(),
+            ane_s,
+            metal_s,
+            100.0 * (1.0 - t.elapsed().as_secs_f64() / (ane_s + metal_s)).max(0.0)
+        );
+        if ane_total < ids.len() {
+            return self.metal.prefill_from(&ids[ane_total..], ane_total);
+        }
+        Ok(logits)
     }
 
     /// Prompts longer than the largest plain graph: head chunk through the plain
@@ -476,6 +733,11 @@ impl Session for AneSession<'_> {
                 ids.len()
             );
             return self.metal.prefill_from(ids, 0);
+        }
+        // Opt-in split prefill: `front` is only Some when LOKAL_SPLIT_PREFILL is set,
+        // so the default path below is untouched.
+        if !self.front.is_empty() {
+            return self.prefill_split(ids);
         }
         let largest = self.graphs.last().map(|g| g.seq).unwrap_or(0);
         if want > largest && self.windowed.is_some() {
