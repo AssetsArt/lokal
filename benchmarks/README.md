@@ -37,10 +37,10 @@ one that everybody can.
 
 | engine | version | prefill tok/s | prefill spread | decode | 4x concurrent aggregate |
 |---|---|---|---|---|---|
-| lokal `-b hybrid` | main | **11,896** | 11,608–11,896 | 237 tok/s | **380 tok/s** |
-| lokal `-b metal` | main | 9,920 | 9,490–9,920 | 231 tok/s | 362 tok/s |
-| llama.cpp | b9960 | 9,803 | 9,687–9,803 | 232 tok/s | 366 tok/s |
-| oMLX | 0.6.3 | 4,623 | 4,528–4,623 | **261 tok/s** | 335 tok/s |
+| lokal `-b hybrid` | main | **11,986** | 11,898–11,986 | 238 tok/s | **373 tok/s** |
+| llama.cpp | b9960 | 9,880 | 9,727–9,880 | 232 tok/s | 363 tok/s |
+| lokal `-b metal` | main | 9,491 | 9,470–9,491 | 231 tok/s | 352 tok/s |
+| oMLX | 0.6.3 | 4,586 | 4,525–4,586 | **261 tok/s** | 336 tok/s |
 
 All four engines were measured in one session with the machine idle
 between passes, and every pass is a row in `results.jsonl` with its machine
@@ -55,17 +55,19 @@ support.
 
 ## Reading
 
-- **Prefill**: lokal's GPU-only path (9,920 tok/s) now edges past llama.cpp
-  (9,803) — that path went 1,461 → 8,271 → 9,920 in a day, first from a
+- **Prefill**: lokal's GPU-only path (9,491 tok/s) runs level with llama.cpp
+  (9,880) — that path went 1,461 → 8,271 → ~9,500 in a day, first from a
   flash-attention rewrite plus Metal 4 tensor-ops matmuls (the same
   mechanism llama.cpp's Metal backend uses), then from moving the k/v
   projections onto tensor ops and letting independent prefill dispatches
   run concurrently. The lead, though, comes from not being GPU-only:
   `-b hybrid` pipelines each prompt across both engines — the front layers
   of a chunk on the Neural Engine while the GPU works the back layers of
-  the previous chunk — for 11,896 tok/s, 21% past llama.cpp. Those two
-  results compound: the GPU work is one of the pipeline's two stages, so
-  the same-day GPU gain lifted the hybrid number from 11,080 to 11,896.
+  the previous chunk — for 11,986 tok/s, 21% past llama.cpp, and it holds
+  that lead across the whole 500–2,000 band (next section). Those results
+  compound: the GPU work is one of the pipeline's two stages, so the
+  same-day GPU gain lifted the hybrid number from 11,080 to 11,896 without
+  anyone touching the ANE side.
 - **Decode**: oMLX leads single-stream (261); lokal (231–237) and llama.cpp
   (232) are tied behind it. Prefill work does not touch the decode path.
 - **Concurrency**: continuous batching — one weight read serving every

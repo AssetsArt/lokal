@@ -347,7 +347,7 @@ def main():
     if bool(args.engine) == bool(args.api):
         raise SystemExit("pass either --engine <name> (managed server) or --api <kind> (your own)")
 
-    server = None
+    server, server_port = None, None
     if args.engine:
         ctx = args.ctx or max(8192, round((args.prompt_tokens or 512) * 1.2) + 1024)
         cmd, ready, flags = engines.resolve(args.engine, args.model, ctx, args.concurrency or 1)
@@ -358,11 +358,12 @@ def main():
         args.model_name = args.model_name or engines.MODELS[args.model]["hf"]
         args.name = args.name or args.engine
         server = engines.start(cmd, ready, os.path.join(args.logdir, f"{args.engine}.server.log"))
+        server_port = engines.port_of(cmd)
 
     try:
         run(args)
     finally:
-        engines.stop(server)
+        engines.stop(server, server_port)
 
 
 def run(args):

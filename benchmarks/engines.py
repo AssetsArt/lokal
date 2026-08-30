@@ -14,6 +14,7 @@ import json
 import os
 import shlex
 import signal
+import socket
 import subprocess
 import time
 import urllib.request
@@ -139,10 +140,22 @@ def _probe(ready):
         return r.status == 200
 
 
+def port_of(cmd):
+    """The --port a server command asks for, so the caller can wait on it."""
+    if cmd and "--port" in cmd:
+        return int(cmd[cmd.index("--port") + 1])
+    return None
+
+
 def start(cmd, ready, log_path, timeout=600, quiet=False):
     """Launch a server and wait until it answers. Returns None for CLI engines."""
     if not cmd:
         return None
+    port = port_of(cmd)
+    if port and not _port_free(port):
+        raise SystemExit(
+            f"port {port} is already serving — another benchmark server is still "
+            f"up; kill it before measuring or the row will describe the wrong engine")
     if not quiet:
         print(f"  starting: {shlex.join(cmd)}", flush=True)
     log = open(log_path, "w")
@@ -164,14 +177,35 @@ def start(cmd, ready, log_path, timeout=600, quiet=False):
     raise SystemExit(f"server never became ready at {ready[1]}; log: {log_path}")
 
 
-def stop(proc):
+def stop(proc, port=None):
+    """Kill a server's whole process group and wait for its port to come free.
+
+    Both halves matter when rows run back to back: a server that has already
+    exited makes killpg raise, and a port still held by a dying process makes
+    the NEXT row's server exit at bind — which used to surface as an empty row
+    rather than an error.
+    """
     if proc is None:
         return
-    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    for _ in range(50):
-        if proc.poll() is not None:
-            break
-        time.sleep(0.2)
-    else:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        for _ in range(50):
+            if proc.poll() is not None:
+                break
+            time.sleep(0.2)
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # already gone
     time.sleep(3)  # let the GPU allocations actually go back
+    if port:
+        for _ in range(50):
+            if _port_free(port):
+                return
+            time.sleep(0.2)
+
+
+def _port_free(port):
+    with socket.socket() as s:
+        s.settimeout(0.2)
+        return s.connect_ex(("127.0.0.1", port)) != 0

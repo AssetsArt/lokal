@@ -88,9 +88,10 @@ def main():
                   flush=True)
         cmd, ready, _ = engines.resolve(key, args.model, args.ctx, args.parallel)
         print(f"\n=== {key}", flush=True)
-        proc = None
+        proc, proc_port = None, None
         try:
             proc = engines.start(cmd, ready, os.path.join(args.logdir, f"{key}.server.log"))
+            proc_port = engines.port_of(cmd)
             for size in sizes:
                 cmd = [sys.executable, BENCH, *engines.bench_flags(key, args.model),
                        "--prompt-tokens", str(size), "--name", f"{key} @{size}",
@@ -122,7 +123,7 @@ def main():
                     continue
                 print(r.stdout.strip().splitlines()[0], flush=True)
         finally:
-            engines.stop(proc)
+            engines.stop(proc, proc_port)
 
 
 if __name__ == "__main__":
