@@ -215,7 +215,7 @@ impl WeightPool {
                     self.free_bytes -= sz;
                     continue;
                 }
-                match self.evict_lru() {
+                match self.evict_mru() {
                     Evict::Done => {}
                     Evict::AllInFlight => return Ok(Admit::NeedWait),
                     Evict::Exhausted => {
@@ -259,7 +259,14 @@ impl WeightPool {
         }
     }
 
-    fn evict_lru(&mut self) -> Evict {
+    /// Evict the MOST-recently-used unpinned page. The pool's access pattern is
+    /// a repeating scan (layer 0..L, every chunk and every token), and LRU is
+    /// pessimal on loops — it evicts each page moments before its reuse, so a
+    /// model over budget restaged WHOLE every token. MRU keeps a stable
+    /// resident prefix (those pages never touch the bus again) and streams only
+    /// the overflow through one hot slot: per-token traffic drops from
+    /// model_bytes to model_bytes − pool_bytes.
+    fn evict_mru(&mut self) -> Evict {
         let mut best: Option<(&(u32, u32), &Page)> = None;
         let mut in_flight_only = false;
         for (k, p) in &self.pages {
@@ -270,7 +277,7 @@ impl WeightPool {
                 in_flight_only = true;
                 continue;
             }
-            if best.map(|(_, b)| p.last_used < b.last_used).unwrap_or(true) {
+            if best.map(|(_, b)| p.last_used > b.last_used).unwrap_or(true) {
                 best = Some((k, p));
             }
         }
