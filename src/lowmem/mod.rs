@@ -321,6 +321,16 @@ impl LowMemEngine {
             Err(_) => plan.pool_bytes,
         };
         let pool = WeightPool::new(&device, pool_bytes);
+        let staged_bytes = manifest.n_params * 2; // f16 in the pool, whatever the disk dtype
+        if staged_bytes > pool_bytes {
+            // The ANE-compile lesson: long silent work must announce itself.
+            eprintln!(
+                "lowmem: model needs {:.1} GB staged but the weight pool holds {:.1} GB — running disk-bound; a full prefill pass streams the whole model (~{:.0}s per sweep at SSD speed)",
+                staged_bytes as f64 / (1 << 30) as f64,
+                pool_bytes as f64 / (1 << 30) as f64,
+                staged_bytes as f64 / 2.5e9,
+            );
+        }
         // The one-line budget arithmetic, printed at load (D9).
         eprintln!(
             "lowmem: {} — budget {} MB = weights {} MB (paged, ≤{} MB pages) + KV {} MB (window {} +{} sink × {} layers) + activations {} MB + overhead {} MB",
