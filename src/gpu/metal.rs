@@ -25,7 +25,7 @@ use metal::{
 /// Maximum tokens processed together during prefill (one command buffer per chunk).
 /// Bigger chunks amortize weight reads better but grow the scratch buffers
 /// (the attention scores buffer in particular).
-const PREFILL_CHUNK: usize = 128;
+const PREFILL_CHUNK: usize = 512;
 
 // ---------- kernel parameters passed via set_bytes — must match the MSL structs exactly ----------
 
@@ -112,6 +112,7 @@ struct AttnParams {
     n_kv_heads: u32,
     pos0: u32,
     max_seq: u32,
+    n_rows: u32,
 }
 #[repr(C)]
 struct AttnDecParams {
@@ -141,6 +142,7 @@ struct Pipelines {
     rope_h: ComputePipelineState,
     rope_qk_decode: ComputePipelineState,
     attention: ComputePipelineState,
+    attention_prefill_flash: ComputePipelineState,
     attention_decode_partial: ComputePipelineState,
     attention_decode_reduce: ComputePipelineState,
     silu_mul: ComputePipelineState,
@@ -160,6 +162,9 @@ const ATTN_SPLIT: usize = 128;
 const DEC_TG: usize = 128;
 /// Max q heads one GQA decode threadgroup covers — must match MAX_GQA_CHUNK in kernels.metal.
 const MAX_GQA_CHUNK: usize = 8;
+/// The head_dim the flash prefill attention kernel is specialized for (FA_HD in
+/// kernels.metal); other head sizes take the scores-scratch fallback kernel.
+const FLASH_HEAD_DIM: usize = 64;
 /// Max rows the logits buffer holds — the ceiling for one speculative verify batch.
 const SPEC_MAX: usize = 8;
 
@@ -272,6 +277,7 @@ impl MetalEngine {
             rope_h: pipe("rope_h")?,
             rope_qk_decode: pipe("rope_qk_decode")?,
             attention: pipe("attention")?,
+            attention_prefill_flash: pipe("attention_prefill_flash")?,
             attention_decode_partial: gqa_pipe("attention_decode_partial")?,
             attention_decode_reduce: pipe("attention_decode_reduce")?,
             silu_mul: pipe("silu_mul")?,
@@ -406,10 +412,10 @@ impl MetalEngine {
             enc.set_buffer(2, Some(x), x_off);
             enc.set_buffer(3, Some(y), y_off);
             enc.set_bytes(4, size_of::<MatmulParams>() as u64, &p as *const _ as *const _);
-            // 2D grid: (tiles of 32 outputs) × (tiles of 8 tokens), 128 threads =
+            // 2D grid: (tiles of 64 outputs) × (tiles of 32 tokens), 128 threads =
             // 4 simdgroups per tile — see MM_* in kernels.metal.
-            let tiles_out = (l.out_dim as u64).div_ceil(32);
-            let tiles_row = (n_rows as u64).div_ceil(8);
+            let tiles_out = (l.out_dim as u64).div_ceil(64);
+            let tiles_row = (n_rows as u64).div_ceil(32);
             enc.dispatch_thread_groups(
                 MTLSize::new(tiles_out, tiles_row, 1),
                 MTLSize::new(128, 1, 1),
@@ -480,7 +486,22 @@ impl MetalEngine {
             n_kv_heads: self.cfg.num_key_value_heads as u32,
             pos0: pos0 as u32,
             max_seq: max_seq as u32,
+            n_rows: n_rows as u32,
         };
+        if self.cfg.head_dim() == FLASH_HEAD_DIM {
+            // Flash path: no scores scratch, one threadgroup per (head, 16-row tile).
+            enc.set_compute_pipeline_state(&self.pipes.attention_prefill_flash);
+            enc.set_buffer(0, Some(q), 0);
+            enc.set_buffer(1, Some(k_cache), cache_off);
+            enc.set_buffer(2, Some(v_cache), cache_off);
+            enc.set_buffer(3, Some(out), 0);
+            enc.set_bytes(4, size_of::<AttnParams>() as u64, &p as *const _ as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(self.cfg.num_attention_heads as u64, n_rows.div_ceil(16) as u64, 1),
+                MTLSize::new(128, 1, 1),
+            );
+            return;
+        }
         enc.set_compute_pipeline_state(&self.pipes.attention);
         enc.set_buffer(0, Some(q), 0);
         enc.set_buffer(1, Some(k_cache), cache_off);
@@ -734,7 +755,13 @@ impl MetalEngine {
             gate: f32_buffer(d, chunk * cfg.intermediate_size),
             up: f32_buffer(d, chunk * cfg.intermediate_size),
             logits: f32_buffer(d, SPEC_MAX * cfg.vocab_size),
-            scores: f32_buffer(d, chunk * cfg.num_attention_heads * max_seq),
+            // The flash prefill path never touches scores; keep a 1-float stub so
+            // the fallback binding stays valid without the (huge) allocation.
+            scores: if cfg.head_dim() == FLASH_HEAD_DIM {
+                f32_buffer(d, 1)
+            } else {
+                f32_buffer(d, chunk * cfg.num_attention_heads * max_seq)
+            },
             partials: f32_buffer(
                 d,
                 cfg.num_attention_heads * max_seq.div_ceil(ATTN_SPLIT) * (cfg.head_dim() + 2),
