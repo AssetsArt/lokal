@@ -394,23 +394,41 @@ Roughly ordered by leverage:
    the metal backend (the ANE hybrid hides this on another device).
    Interleaving PREFILL_CHUNK-sized pieces with decode steps caps the stall
    at one chunk.
-4. **Remaining prefill headroom.** Prefill went 1,461 → 9,920 tok/s on the
-   GPU (and 11,896 hybrid) during 2026-08-30, in three steps: a flash
-   attention kernel with no scores scratch, matmuls moved onto Metal 4
-   tensor ops (`mpp::tensor_ops::matmul2d`, the same path llama.cpp's Metal
-   backend takes on macOS 26 — hand-tiled simdgroup MMA plateaus near
-   ~700 GFLOPS here no matter the tiling), and then the k/v projections onto
-   tensor ops plus a concurrent prefill encoder. What is left: a
-   Qwen-specific profile (its bigger lm_head and 14:2 GQA lag SmolLM2's
-   ratios), and the balance point of the split pipeline, which moved when
-   the GPU stage got faster — the front-layer count per chunk width was
-   tuned against a slower Metal half. **Measured and rejected:** porting the
-   flash kernel's QK^T and P·V to tensor ops costs 39% at 2k — the online
-   softmax between the two matmuls breaks the cooperative-tensor dataflow,
-   and the register-resident FA-2 kernel stays. The 8,192-position ANE
-   window remains the long-prompt head start; wider windows stay priced out
-   by the superlinear first-load ANE compile (99 s at 6,144, 250 s at 8,192,
-   21+ min at 16,384).
+4. **Prefill: what is left is attention.** Prefill went 1,461 -> ~9,900 tok/s
+   on the GPU (and ~11,900 hybrid) during 2026-08-30, through a flash
+   attention kernel with no scores scratch, matmuls on Metal 4 tensor ops
+   (`mpp::tensor_ops::matmul2d`, the path llama.cpp's Metal backend takes on
+   macOS 26 — hand-tiled simdgroup MMA plateaus near ~700 GFLOPS here no
+   matter the tiling), k/v projections onto the same, a concurrent prefill
+   encoder, and FA tiles retuned for long K/V loops (96 query rows x 32
+   positions: row reuse is the axis that pays once the loop is thousands of
+   positions long, while wider position tiles blow past the 16 KB of shared
+   memory that keeps two threadgroups per core).
+
+   A phase profile against llama.cpp on Qwen2.5-0.5B then settled where the
+   remaining gap lives, and it is not where a reader would guess:
+
+   - **The GEMMs are not it.** Per layer per token they are *more*
+     FLOP-efficient than SmolLM2's despite 4.26x the parameters.
+   - **Attention is it.** Per head per layer, 62 us against SmolLM2's 43 at
+     identical tile shape and head_dim — a 1.46x premium that tracks the
+     GQA 14:2 ratio, i.e. the prefill kernel re-reads each kv head once per
+     query head, the same redundancy the decode kernel already eliminated.
+     At 8k, attention is 52% of prefill and the *entire* gap: 51.7 ns/tok^2
+     against llama.cpp's 37.9, while non-attention time matches theirs.
+   - Two per-chunk overheads were closed once the profile named them (the
+     RoPE pair fused, the q-bias folded into its matmul): +8-9% at 500-2k.
+   - Two costs worth knowing when reading a benchmark: a 1-token tail chunk
+     costs 8-24 ms (decode walk plus lm_head), and every process pays
+     ~250 ms of shader compilation, which a server amortizes and a
+     one-shot CLI run does not.
+
+   **Measured and rejected:** porting the flash kernel's QK^T and P.V to
+   tensor ops costs 39% at 2k — the online softmax between the two matmuls
+   breaks the cooperative-tensor dataflow, and the register-resident FA-2
+   kernel stays. The 8,192-position ANE window remains the long-prompt head
+   start; wider windows stay priced out by the superlinear first-load ANE
+   compile (99 s at 6,144, 250 s at 8,192, 21+ min at 16,384).
 5. The rest: an OpenAI-compatible API (`/v1/chat/completions`) and SSE
    streaming in serve mode; a hybrid scheduler that picks the backend
    automatically; CUDA/Vulkan backends on the same Engine/Session seam.
