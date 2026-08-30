@@ -40,14 +40,18 @@ Measured 2026-08-30 on an M1 Pro, 16 GB, `-t 0`, on a verified-quiet machine
 |---|---|---|---|
 | prefill | ~33 tok/s | 9,920 tok/s | **11,896 tok/s** ¹ |
 | decode | ~49 tok/s | 231 tok/s | 237 tok/s |
-| prefill (Qwen2.5-0.5B) | — | 2,704 tok/s | ² |
-| decode (Qwen2.5-0.5B) | ~27 tok/s | ~113 tok/s | = metal |
+| prefill (Qwen2.5-0.5B) | ~5 tok/s | 3,802 tok/s | 4,660 tok/s ² |
+| decode (Qwen2.5-0.5B) | ~27 tok/s | 119 tok/s | 120 tok/s |
 
 ¹ the hybrid row implies the split-prefill ladder is exported
 (`./run.sh export-ane-split`, once per model) — with it present, `-b hybrid`
 splits by default; without it hybrid prefill runs the plain ANE path. Best of 3 passes, as
 in [benchmarks/](benchmarks/) — a warm laptop reads 15–20% lower.
-² per-model ANE graphs; see setup below.
+² Qwen has the plain and windowed ANE graphs exported but not the split
+ladder, so its hybrid row is ANE prefill without the two-device pipeline —
+the ladder is per model (`./run.sh export-ane-split Qwen/Qwen2.5-0.5B-Instruct`).
+Qwen is 3.7x the parameters of SmolLM2, which is most of the gap between
+the two blocks.
 
 Prefill took a 4–6x jump (2026-08-30) from a flash-attention kernel plus
 Metal 4 tensor-ops matmuls — the same mechanism llama.cpp's Metal backend
@@ -62,7 +66,7 @@ path past llama.cpp, 9,920 vs 9,803) lifted the hybrid number with it.
 Decode speed comes from f16 weights resident on the GPU, flash-decoding
 attention, and a GQA-aware kernel that
 reads each cached KV byte once per q-head group — which is also what keeps
-decode flat at long context (Qwen: 113 tok/s at 500 ctx, 53 at 32k).
+decode from collapsing at long context (Qwen: 119 tok/s at 500 ctx, 53 at 32k).
 
 Serving is where the hybrid pays off most. Concurrent requests decode as one
 batch — a single read of the weights serves every active request — while the
