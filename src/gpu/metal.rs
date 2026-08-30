@@ -182,11 +182,10 @@ const MAX_GQA_CHUNK: usize = 8;
 /// The head_dim the flash prefill attention kernel is specialized for (FA_HD in
 /// kernels.metal); other head sizes take the scores-scratch fallback kernel.
 const FLASH_HEAD_DIM: usize = 64;
-/// Flash tile shape, injected into the shader source as FA_BR/FA_BC so the
-/// kernel layout and the dispatch geometry share one source of truth.
-const FLASH_BR: usize = 96;
-const FLASH_BC: usize = 32;
-const FLASH_THREADS: usize = FLASH_BR / 8 * 32;
+/// Flash kernel dispatch geometry (FA_Q / FA_C / FA_THREADS in the shader).
+const FLASH_Q: usize = 8;
+const FLASH_C: usize = 64;
+const FLASH_THREADS: usize = 128;
 /// Token-rows per tensor-ops matmul tile (MM_TROWS in the shader).
 const MM_TILE_ROWS: usize = 64;
 /// Max rows the logits buffer holds — the ceiling for one speculative verify batch.
@@ -248,9 +247,16 @@ fn f32_buffer(device: &Device, len: usize) -> Buffer {
     device.new_buffer((len * 4) as u64, MTLResourceOptions::StorageModeShared)
 }
 
-/// Uninitialized f16 buffer — the KV cache's dtype.
+/// Zero-filled f16 buffer — the KV cache's dtype. The zeroing is load-bearing:
+/// the flash prefill kernel reads K/V tiles straight from the cache, and a
+/// tile's masked tail may touch rows no projection has written yet. Masked
+/// scores never reach the output, but the P·V accumulate still multiplies the
+/// raw values by zero — and 0 x NaN is NaN, so uninitialized rows must not be
+/// able to hold NaN bit patterns.
 fn f16_empty_buffer(device: &Device, len: usize) -> Buffer {
-    device.new_buffer((len * 2) as u64, MTLResourceOptions::StorageModeShared)
+    let buf = device.new_buffer((len * 2) as u64, MTLResourceOptions::StorageModeShared);
+    unsafe { std::ptr::write_bytes(buf.contents() as *mut u8, 0, len * 2) };
+    buf
 }
 
 impl MetalEngine {
@@ -263,8 +269,9 @@ impl MetalEngine {
         let lib = device
             .new_library_with_source(
                 &format!(
-                    "#define FA_BR {FLASH_BR}\n#define FA_BC {FLASH_BC}\n#define MM_TROWS {MM_TILE_ROWS}\n{}",
-                    include_str!("kernels.metal")
+                    "#define MM_TROWS {MM_TILE_ROWS}\n#define FA_KVD {kvd}\n{}",
+                    include_str!("kernels.metal"),
+                    kvd = model.cfg.kv_dim(),
                 ),
                 &CompileOptions::new(),
             )
@@ -629,7 +636,7 @@ impl MetalEngine {
             enc.dispatch_thread_groups(
                 MTLSize::new(
                     self.cfg.num_attention_heads as u64,
-                    n_rows.div_ceil(FLASH_BR) as u64,
+                    n_rows.div_ceil(FLASH_Q) as u64,
                     1,
                 ),
                 MTLSize::new(FLASH_THREADS as u64, 1, 1),
@@ -862,10 +869,10 @@ impl MetalEngine {
         let cfg = &self.cfg;
         let d = &self.device;
         let caches = (0..cfg.num_hidden_layers)
-            .map(|_| f16_empty_buffer(d, max_seq * cfg.kv_dim()))
+            .map(|_| f16_empty_buffer(d, (max_seq + FLASH_C) * cfg.kv_dim()))
             .collect::<Vec<_>>();
         let v_caches = (0..cfg.num_hidden_layers)
-            .map(|_| f16_empty_buffer(d, max_seq * cfg.kv_dim()))
+            .map(|_| f16_empty_buffer(d, (max_seq + FLASH_C) * cfg.kv_dim()))
             .collect::<Vec<_>>();
         let scratch = self.session_scratch(max_seq);
         self.session_with_cache(max_seq, caches, v_caches, 0, scratch)
@@ -1257,10 +1264,10 @@ impl MetalEngine {
         let splits_max = max_seq.div_ceil(ATTN_SPLIT);
         Some(MetalBatcher {
             k_cache: (0..cfg.num_hidden_layers)
-                .map(|_| f16_empty_buffer(d, n_slots * max_seq * kvd))
+                .map(|_| f16_empty_buffer(d, (n_slots * max_seq + FLASH_C) * kvd))
                 .collect(),
             v_cache: (0..cfg.num_hidden_layers)
-                .map(|_| f16_empty_buffer(d, n_slots * max_seq * kvd))
+                .map(|_| f16_empty_buffer(d, (n_slots * max_seq + FLASH_C) * kvd))
                 .collect(),
             ids: d.new_buffer((n_slots * 4) as u64, MTLResourceOptions::StorageModeShared),
             meta: d.new_buffer(
