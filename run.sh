@@ -28,18 +28,19 @@ case "$cmd" in
   export-ane-split) # ./run.sh export-ane-split [repo or dir]  — add the split-prefill ladder (slow)
     MODEL="${1:-HuggingFaceTB/SmolLM2-135M}"
     if [ -d "$MODEL" ]; then DIR="$MODEL"; else DIR="$("$BIN" path -m "$MODEL")"; fi
-    echo "note: six front-half graphs, ~15-20 s to export and ~150 MB on disk each" >&2
+    echo "note: eight front-half graphs, ~15-20 s to export and ~150 MB on disk each" >&2
     echo "      (every rung carries its own weight copy), plus one ANE compile per" >&2
     echo "      rung on this machine's first load. Once exported, -b hybrid uses it." >&2
-    # Exactly the ladder that was measured on 2026-08-30: stride 128 with 20 front
-    # layers for short prompts, stride 256 with 15 for longer ones — the split point
-    # moves with the chunk width because it is the GPU half that runs out of work
-    # first. Do not add rungs casually: the widest rung of a stride sets how far the
-    # ANE reaches (ane_total = s + p_max in ane.rs), so a new one silently changes
-    # which part of a prompt runs where.
+    # Exactly the ladder the 2026-08-30 curve was measured with: stride 128 with 20
+    # front layers for short prompts, stride 256 with 13 for longer ones (the split
+    # point moves with the chunk width; 15, 12 and 11 all measured slower at 256),
+    # a P=0 rung so the first chunk pays no past attention, and a 512 rung that
+    # closes the mid-band gap. Do not add rungs casually: the widest rung of a
+    # stride sets how far the ANE reaches (ane_total = s + p_max in ane.rs), so a
+    # new one silently changes which part of a prompt runs where.
     exec uv run --python 3.12 --with torch --with coremltools --with safetensors --with numpy --with tokenizers \
       tools/export_prefill.py "$DIR" --shapes none --window none \
-      --front 128x128x20,128x384x20,256x256x15,256x768x15,256x1280x15,256x2048x15
+      --front 128x128x20,128x384x20,256x0x13,256x256x13,256x512x13,256x768x13,256x1280x13,256x2048x13
     ;;
   export-ane-long) # ./run.sh export-ane-long [repo or dir]  — add the long-context windowed graph (slow)
     MODEL="${1:-HuggingFaceTB/SmolLM2-135M}"

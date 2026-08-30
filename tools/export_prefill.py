@@ -179,17 +179,22 @@ class WindowedNet(torch.nn.Module):
         attr = f"model_layers_{layer}_self_attn_{name}_bias"
         return getattr(self, attr) if hasattr(self, attr) else None
 
-    def forward(self, ids, cos, sin, k_past, v_past, past_valid):
+    def forward(self, ids, cos, sin, k_past=None, v_past=None, past_valid=None):
         # ids [1,S] i32 · cos/sin [S,hd] (host-computed for this chunk's absolute
         # positions — computing positions in-graph is fatal: the fp16 pipeline can't
         # represent integers above 2048 exactly, which corrupts RoPE from position
         # 2048 on) · k/v_past [L,P,kv·hd] · past_valid [1,P] (1=real)
         S, P, hd, kv = self.s, self.p, self.hd, self.n_kv
         # Mask over [past | current]: padded past is dead, current is causal-in-block.
-        past_mask = (1.0 - past_valid) * -30000.0                 # [1,P]
-        full_mask = torch.cat(
-            (past_mask.view(1, 1, 1, P).expand(1, 1, S, P), self.causal), dim=3
-        )  # [1,1,S,P+S]
+        # P=0 is the first-chunk rung: no past inputs at all, and no past attention
+        # paid — the mask is just the in-block causal one.
+        if P > 0:
+            past_mask = (1.0 - past_valid) * -30000.0                 # [1,P]
+            full_mask = torch.cat(
+                (past_mask.view(1, 1, 1, P).expand(1, 1, S, P), self.causal), dim=3
+            )  # [1,1,S,P+S]
+        else:
+            full_mask = self.causal
 
         x = F.embedding(ids.to(torch.long), self.model_embed_tokens_weight)
         k_out, v_out = [], []
@@ -207,10 +212,13 @@ class WindowedNet(torch.nn.Module):
             k_out.append(k.transpose(1, 2).reshape(S, kv * hd))
             v_out.append(v.transpose(1, 2).reshape(S, kv * hd))
 
-            kp = k_past[li].view(1, P, kv, hd).transpose(1, 2)  # past is already post-RoPE
-            vp = v_past[li].view(1, P, kv, hd).transpose(1, 2)
-            k_all = torch.cat((kp, k), dim=2)
-            v_all = torch.cat((vp, v), dim=2)
+            if P > 0:
+                kp = k_past[li].view(1, P, kv, hd).transpose(1, 2)  # past is already post-RoPE
+                vp = v_past[li].view(1, P, kv, hd).transpose(1, 2)
+                k_all = torch.cat((kp, k), dim=2)
+                v_all = torch.cat((vp, v), dim=2)
+            else:
+                k_all, v_all = k, v
             kf = k_all.unsqueeze(2).expand(1, kv, rep, P + S, hd).reshape(1, self.n_heads, P + S, hd)
             vf = v_all.unsqueeze(2).expand(1, kv, rep, P + S, hd).reshape(1, self.n_heads, P + S, hd)
             # Segmented attention with an online-softmax merge (flash-attention at
@@ -277,10 +285,11 @@ def export_front(args, cfg, weights, spec):
         torch.zeros(1, fs, dtype=torch.int32),
         torch.zeros(fs, hd),
         torch.zeros(fs, hd),
+    ) + ((
         torch.zeros(A, fp, kvd),
         torch.zeros(A, fp, kvd),
         torch.zeros(1, fp),
-    )
+    ) if fp > 0 else ())
     with torch.no_grad():
         traced = torch.jit.trace(fnet, ex)
     print("converting ...", flush=True)
@@ -290,10 +299,11 @@ def export_front(args, cfg, weights, spec):
             ct.TensorType(name="ids", shape=(1, fs), dtype=np.int32),
             ct.TensorType(name="cos", shape=(fs, hd), dtype=np.float16),
             ct.TensorType(name="sin", shape=(fs, hd), dtype=np.float16),
+        ] + ([
             ct.TensorType(name="k_past", shape=(A, fp, kvd), dtype=np.float16),
             ct.TensorType(name="v_past", shape=(A, fp, kvd), dtype=np.float16),
             ct.TensorType(name="past_valid", shape=(1, fp), dtype=np.float16),
-        ],
+        ] if fp > 0 else []),
         # K/V come out as fp16, the dtype the KV cache stores: the graph already
         # computes in fp16, so upcasting here only to round back down on the Rust
         # side costs a full extra pass over the data on the critical thread.
@@ -326,32 +336,43 @@ def export_front(args, cfg, weights, spec):
 
     c1, s1 = rope_tables(0, fs)
     c2, s2 = rope_tables(fs, fs)
-    with torch.no_grad():
-        z = torch.zeros(A, fp, kvd)
-        k1, v1, _ = fnet(torch.from_numpy(text_ids[:fs][None, :]),
-                         torch.from_numpy(c1), torch.from_numpy(s1),
-                         z, z, torch.zeros(1, fp))
-        kp, vp = torch.zeros(A, fp, kvd), torch.zeros(A, fp, kvd)
-        kp[:, :fs], vp[:, :fs] = k1, v1
-        valid = torch.zeros(1, fp)
-        valid[0, :fs] = 1.0
-        k2, v2, x2 = fnet(torch.from_numpy(text_ids[fs:][None, :]),
-                          torch.from_numpy(c2), torch.from_numpy(s2), kp, vp, valid)
-    got = mlmodel.predict({
-        "ids": text_ids[fs:][None, :],
-        "cos": c2.astype(np.float16),
-        "sin": s2.astype(np.float16),
-        "k_past": kp.numpy().astype(np.float16),
-        "v_past": vp.numpy().astype(np.float16),
-        "past_valid": valid.numpy().astype(np.float16),
-    })
+    if fp > 0:
+        with torch.no_grad():
+            z = torch.zeros(A, fp, kvd)
+            k1, v1, _ = fnet(torch.from_numpy(text_ids[:fs][None, :]),
+                             torch.from_numpy(c1), torch.from_numpy(s1),
+                             z, z, torch.zeros(1, fp))
+            kp, vp = torch.zeros(A, fp, kvd), torch.zeros(A, fp, kvd)
+            kp[:, :fs], vp[:, :fs] = k1, v1
+            valid = torch.zeros(1, fp)
+            valid[0, :fs] = 1.0
+            k2, v2, x2 = fnet(torch.from_numpy(text_ids[fs:][None, :]),
+                              torch.from_numpy(c2), torch.from_numpy(s2), kp, vp, valid)
+        got = mlmodel.predict({
+            "ids": text_ids[fs:][None, :],
+            "cos": c2.astype(np.float16),
+            "sin": s2.astype(np.float16),
+            "k_past": kp.numpy().astype(np.float16),
+            "v_past": vp.numpy().astype(np.float16),
+            "past_valid": valid.numpy().astype(np.float16),
+        })
+    else:
+        # P=0: a single first chunk, no past to build — compare chunk 1 directly.
+        with torch.no_grad():
+            k2, v2, x2 = fnet(torch.from_numpy(text_ids[:fs][None, :]),
+                              torch.from_numpy(c1), torch.from_numpy(s1))
+        got = mlmodel.predict({
+            "ids": text_ids[:fs][None, :],
+            "cos": c1.astype(np.float16),
+            "sin": s1.astype(np.float16),
+        })
     dk = np.abs(got["k_cache"] - k2.numpy()).max()
     dv = np.abs(got["v_cache"] - v2.numpy()).max()
     dx = np.abs(got["x_out"] - x2.numpy()).max()
     xr = float(np.abs(x2.numpy()).max())
     print(f"front S={fs} P={fp} layers 0..{A}: max abs diff Core ML vs torch fp32: "
           f"K {dk:.4f}, V {dv:.4f}, x {dx:.4f} (|x|max {xr:.2f})", flush=True)
-    del fnet, got, k1, v1, k2, v2, x2, kp, vp
+    del fnet, got, k2, v2, x2
     gc.collect()
 
     dest = args.model_dir / f"prefill-f{A}-{fs}w{fp}.mlmodelc"

@@ -73,6 +73,39 @@ support.
   oMLX's 335). A joining request is prefilled across both engines instead
   of stalling the batch that is already decoding.
 
+## The 500–2,000 curve
+
+A single ~500-token point can hide a curve that sags between rungs, so the
+band real prompts live in was measured end to end (2026-08-30, same
+session, each lokal/llama.cpp pair back to back, one
+`bench_engines.py --prompt-tokens` row per point — median of 5 requests —
+with the machine state recorded on every row; llama.cpp was re-measured at
+582 and 794 and agreed with its first pass within noise). lokal is
+`-b hybrid` with the ladder `run.sh export-ane-split` ships, no env vars:
+
+| prompt tokens (lokal · llama.cpp) | lokal `-b hybrid` | llama.cpp | edge |
+|---|---|---|---|
+| 496 · 517 | **11,715** | 9,731 | +20% |
+| 582 · 603 | **11,355** | 10,536–10,706 | +6–8% |
+| 699 · 720 | **12,375** | 10,726 | +15% |
+| 794 · 815 | **11,173** | 10,722–10,792 | +4% |
+| 982 · 1,003 | **12,397** | 10,832 | +14% |
+| 1,253 · 1,274 | **10,829** | 10,310 | +5% |
+| 1,530 · 1,551 | **10,569** | 9,675 | +9% |
+| 1,929 · 1,950 | **9,824** | 9,420 | +4% |
+
+(The token counts differ per engine because each tokenizes the same
+character slice itself.) Holding the whole band took four ladder changes,
+each measured against a version without it: the stride guard counts real
+chunks (`div_ceil` — the old `len >= 3*s` test pushed 513–767-token
+prompts onto a stride whose ladder reaches only 512 tokens), a 256×512
+rung closes the mid-band rung gap, the 256-wide family's split point moved
+from 15 front layers to 13 (15, 12 and 11 all measured slower — the two
+engines re-balance as rungs widen), and a P=0 rung lets the first chunk —
+which has no past — skip paying the 256-position past attention every
+other rung computes and masks. Handing short leftover chunks to the GPU
+instead was measured slower every time it was tried.
+
 ## Long context
 
 The table above is a ~500-token prompt, which is not the length real

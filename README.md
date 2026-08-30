@@ -62,6 +62,10 @@ one prompt keeps both busy — 11,896 tok/s against llama.cpp's 9,803 in the
 same session. The two gains compound: the GPU half is one of the
 pipeline's stages, so the day's Metal work (which also took the GPU-only
 path past llama.cpp, 9,920 vs 9,803) lifted the hybrid number with it.
+And the lead is a curve, not a point: measured across the 500–2,000-token
+band, hybrid beats llama.cpp at every length — from +4% at the tightest
+points to +20% — with the ladder `export-ane-split` ships; the full table
+is in [benchmarks/](benchmarks/).
 
 Decode speed comes from f16 weights resident on the GPU, flash-decoding
 attention, and a GQA-aware kernel that

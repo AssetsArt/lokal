@@ -155,9 +155,17 @@ fn windowed_provider(
     let ids_arr = ml_array(&[1, s], MLMultiArrayDataType::Int32)?;
     let cos_arr = ml_array(&[s, head_dim], MLMultiArrayDataType::Float16)?;
     let sin_arr = ml_array(&[s, head_dim], MLMultiArrayDataType::Float16)?;
-    let k_arr = ml_array(&[past_layers, p, kvd], MLMultiArrayDataType::Float16)?;
-    let v_arr = ml_array(&[past_layers, p, kvd], MLMultiArrayDataType::Float16)?;
-    let valid_arr = ml_array(&[1, p], MLMultiArrayDataType::Float16)?;
+    // A P=0 graph — the ladder rung for the first chunk, which has no past and
+    // pays no past attention — takes only ids/cos/sin.
+    let past_arrs = if p > 0 {
+        Some((
+            ml_array(&[past_layers, p, kvd], MLMultiArrayDataType::Float16)?,
+            ml_array(&[past_layers, p, kvd], MLMultiArrayDataType::Float16)?,
+            ml_array(&[1, p], MLMultiArrayDataType::Float16)?,
+        ))
+    } else {
+        None
+    };
     #[allow(deprecated)] // dataPointer: plain pointers, same reasoning as above
     unsafe {
         let idp = ids_arr.dataPointer().as_ptr() as *mut i32;
@@ -179,25 +187,31 @@ fn windowed_provider(
                 *sp.add(r * head_dim + i + half) = s_b;
             }
         }
-        std::ptr::copy_nonoverlapping(
-            k_past.as_ptr(),
-            k_arr.dataPointer().as_ptr() as *mut u16,
-            k_past.len(),
-        );
-        std::ptr::copy_nonoverlapping(
-            v_past.as_ptr(),
-            v_arr.dataPointer().as_ptr() as *mut u16,
-            v_past.len(),
-        );
-        let vp = valid_arr.dataPointer().as_ptr() as *mut u16;
-        let one = f16::from_f32(1.0).to_bits();
-        for i in 0..p {
-            *vp.add(i) = if i < pos0 { one } else { 0 };
+        if let Some((k_arr, v_arr, valid_arr)) = &past_arrs {
+            std::ptr::copy_nonoverlapping(
+                k_past.as_ptr(),
+                k_arr.dataPointer().as_ptr() as *mut u16,
+                k_past.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                v_past.as_ptr(),
+                v_arr.dataPointer().as_ptr() as *mut u16,
+                v_past.len(),
+            );
+            let vp = valid_arr.dataPointer().as_ptr() as *mut u16;
+            let one = f16::from_f32(1.0).to_bits();
+            for i in 0..p {
+                *vp.add(i) = if i < pos0 { one } else { 0 };
+            }
         }
     }
 
-    let names = ["ids", "cos", "sin", "k_past", "v_past", "past_valid"];
-    let arrays = [ids_arr, cos_arr, sin_arr, k_arr, v_arr, valid_arr];
+    let mut names = vec!["ids", "cos", "sin"];
+    let mut arrays = vec![ids_arr, cos_arr, sin_arr];
+    if let Some((k_arr, v_arr, valid_arr)) = past_arrs {
+        names.extend(["k_past", "v_past", "past_valid"]);
+        arrays.extend([k_arr, v_arr, valid_arr]);
+    }
     let keys: Vec<_> = names.iter().map(|n| NSString::from_str(n)).collect();
     let key_refs: Vec<&NSString> = keys.iter().map(|k| &**k).collect();
     let values: Vec<Retained<AnyObject>> = arrays
@@ -578,38 +592,53 @@ impl AneSession<'_> {
         // Pick the chunk stride first. Two chunks is all fill and drain — the
         // pipeline only starts paying for itself once there are stages in the
         // middle where both engines are busy — so take the widest exported stride
-        // that still cuts this prompt into at least MIN_CHUNKS pieces.
+        // that still cuts this prompt into at least MIN_CHUNKS pieces. The count
+        // that matters is the REAL chunk count, div_ceil — demanding len >= 3*s
+        // would reject a 764-token prompt at stride 256 even though it cuts into
+        // three chunks, and push the whole 513..767 band onto a narrower stride
+        // whose ladder reaches shorter.
         const MIN_CHUNKS: usize = 3;
         let mut strides: Vec<usize> =
             front.iter().map(|g| g.s).filter(|&s| s <= room).collect();
         strides.sort_unstable();
         strides.dedup();
-        let Some(&smallest) = strides.first() else {
+        if strides.is_empty() {
             // Every exported rung is wider than Metal's per-chunk scratch — the
             // ladder cannot feed this session. Not an error on a default path:
             // the caller degrades to the plain ANE prefill.
             return Ok(None);
+        }
+        // Per stride: the ladder as the ANE thread will see it (one front-layer
+        // count — a leftover graph exported at a different split would make the
+        // chunks disagree about where layer A is), and the span the ANE takes.
+        // The span is NOT trimmed: handing a runt last chunk to Metal was
+        // measured slower every time (582 tokens: 256+256+70 does 10.2k tok/s,
+        // 2x256 + a 70-token Metal tail 9.1k, 4x128 + tail 9.4k) — the pipeline
+        // hides a runt's rung cost better than a serial layer-0 tail repays it.
+        let plan_for = |s: usize| {
+            let mut rungs: Vec<&CoreMlFront> = front.iter().filter(|g| g.s == s).collect();
+            rungs.sort_by_key(|g| g.p);
+            let a = rungs[0].n_front;
+            rungs.retain(|g| g.n_front == a);
+            let p_max = rungs.last().expect("at least one rung").p;
+            let span = ids.len().min(s + p_max);
+            (rungs, a, span)
         };
+        // Widest stride whose ANE span still cuts into >= MIN_CHUNKS chunks —
+        // two chunks is all fill and drain, the pipeline only pays for itself
+        // with stages in the middle where both engines are busy. The count is
+        // the REAL chunk count, div_ceil: a len >= 3*s guard would reject a
+        // 764-token prompt at stride 256 despite its three real chunks, and
+        // push the whole 513..767 band onto a narrower stride whose ladder
+        // reaches shorter.
         let s = strides
             .iter()
             .rev()
             .copied()
-            .find(|&s| ids.len() >= MIN_CHUNKS * s)
-            .unwrap_or(smallest);
-
-        // Within that stride, the window ladder: a windowed graph computes and
-        // masks its full P+S attention every call whatever the real past is, so
-        // each chunk takes the shortest rung that still reaches back to pos0.
-        let mut rungs: Vec<&CoreMlFront> = front.iter().filter(|g| g.s == s).collect();
-        rungs.sort_by_key(|g| g.p);
-        // The split point is a property of the chunk width, not of the model: where
-        // the GPU half binds, the ANE should carry more layers, and that balance
-        // moves with the chunk size. Keep one ladder — a leftover graph exported at
-        // a different split would make the chunks disagree about where layer A is.
-        let a = rungs[0].n_front;
-        rungs.retain(|g| g.n_front == a);
+            .find(|&s| plan_for(s).2.div_ceil(s) >= MIN_CHUNKS)
+            .unwrap_or(strides[0]);
+        let (rungs, a, ane_total) = plan_for(s);
         let p_max = rungs.last().expect("at least one rung").p;
-        let ane_total = ids.len().min(s + p_max);
         let ladder: &[&CoreMlFront] = &rungs; // shared with the Core ML thread
 
         struct Chunk {
