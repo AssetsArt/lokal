@@ -36,20 +36,24 @@ with `hf auth login`. No config files, no daemon.
 Measured 2026-08-30 on an M1 Pro, 16 GB, `-t 0`, on a verified-quiet machine
 (SmolLM2-135M-Instruct, ~500-token prompt, unless noted):
 
-| workload | cpu | metal | ane (hybrid) |
+| workload | cpu | metal | hybrid |
 |---|---|---|---|
-| prefill | ~33 tok/s | **7,863 tok/s** | 8,517 tok/s ¹ |
+| prefill | ~33 tok/s | 7,863 tok/s | **9,920 tok/s** ¹ |
 | decode | ~49 tok/s | 232 tok/s | 232 tok/s |
 | prefill (Qwen2.5-0.5B) | — | 2,704 tok/s | ² |
 | decode (Qwen2.5-0.5B) | ~27 tok/s | ~113 tok/s | = metal |
 
-¹ serve-mode wall time 0.06 s: the prompt runs on the Neural Engine while the
-GPU stays free to decode. ² per-model ANE graphs; see ANE setup below.
+¹ with split prefill on (`LOKAL_SPLIT_PREFILL=1`, needs the extra graphs from
+`./run.sh export-ane-split`); the plain ANE path does 8,517. ² per-model ANE
+graphs; see ANE setup below.
 
 Prefill took a 4–6x jump (2026-08-30) from a flash-attention kernel plus
 Metal 4 tensor-ops matmuls — the same mechanism llama.cpp's Metal backend
-uses; lokal's GPU-only prefill now lands within ~12% of llama.cpp's rate on
-the same machine, same session. Decode speed comes from f16 weights
+uses — and then went past every engine on this machine by using two of them
+at once: **split prefill** puts the front layers of each prompt chunk on the
+Neural Engine while the GPU works the back layers of the previous chunk, so
+one prompt keeps both busy (9,920 tok/s vs llama.cpp's 8,749, measured
+back-to-back). Decode speed comes from f16 weights
 resident on the GPU, flash-decoding attention, and a GQA-aware kernel that
 reads each cached KV byte once per q-head group — which is also what keeps
 decode flat at long context (Qwen: 113 tok/s at 500 ctx, 53 at 32k).
@@ -58,7 +62,7 @@ Serving is where the hybrid pays off most. Concurrent requests decode as one
 batch — a single read of the weights serves every active request — while the
 Neural Engine prefills newly arrived requests off-GPU:
 
-| 4 concurrent requests (~500-token prompts) | metal | ane (hybrid) |
+| 4 concurrent requests (~500-token prompts) | metal | hybrid |
 |---|---|---|
 | single-request prefill | 0.06 s | **0.06 s** |
 | aggregate throughput | 338 tok/s | **341 tok/s** |
@@ -83,17 +87,17 @@ Architectures: `LlamaForCausalLM`, `Qwen2ForCausalLM`, `MistralForCausalLM`.
 
 ## Backends
 
-Pick with `-b cpu | metal | ane`. cpu and metal are verified to produce
-identical greedy output; ane matches them in practice too, though on very
+Pick with `-b cpu | metal | hybrid`. cpu and metal are verified to produce
+identical greedy output; hybrid matches them in practice too, though on very
 long prompts fp16 rounding can pick a different — equally sensible — token
 at a near-tie.
 
-### ANE setup (optional, once per model)
+### Hybrid setup (optional, once per model)
 
 ```bash
 ./run.sh export-ane        # builds the plain prefill graphs (512 and 2048 tokens) — a few minutes
 ./run.sh export-ane-long   # optional: adds the long-context windowed graph (slow; see note below)
-./run.sh ane "Once upon a time"
+./run.sh hybrid "Once upon a time"
 ```
 
 lokal picks the graph that fits the prompt: tiny prompts (< 64 tokens) skip
@@ -135,7 +139,7 @@ lokal path [-m <model>]   download if needed, then print the model's local direc
 
 -m, --model <repo|dir>   Hugging Face repo or local directory
     --draft <repo|dir>   smaller same-tokenizer model: speculative decoding (greedy)
--b, --backend <name>     cpu | metal | ane                      [cpu]
+-b, --backend <name>     cpu | metal | hybrid                      [cpu]
 -p, --prompt <text>      prompt text
 -n, --max-tokens <N>     generation budget                      [200]
 -t, --temperature <T>    0 = greedy/deterministic               [0.7]
@@ -155,7 +159,7 @@ cargo test
 
 The main correctness gate is deterministic cross-backend comparison: with
 `--temperature 0`, the same prompt must produce token-identical output on
-cpu and metal; the fp16 ane backend is held to a numeric envelope vs the f32
+cpu and metal; the fp16 hybrid backend is held to a numeric envelope vs the f32
 reference and may differ at rare greedy near-ties on long prompts.
 Architecture notes, backend internals, and the guide for adding new backends
 live in [DESIGN.md](DESIGN.md).

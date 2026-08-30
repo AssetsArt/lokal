@@ -52,7 +52,7 @@ Usage:
 Options:
   -m, --model <repo|dir>   Hugging Face repo or local directory [HuggingFaceTB/SmolLM2-135M]
       --draft <repo|dir>   smaller same-tokenizer model for speculative decoding (greedy only)
-  -b, --backend <name>     cpu, metal (Apple GPU), ane (Neural Engine prefill + Metal decode) [cpu]
+  -b, --backend <name>     cpu, metal (Apple GPU), hybrid (Neural Engine + GPU together) [cpu]
   -p, --prompt <text>      prompt text [\"Once upon a time\"]
   -n, --max-tokens <N>     maximum number of tokens to generate [200]
   -t, --temperature <T>    0 = greedy (fully deterministic), higher = more adventurous [0.7]
@@ -158,7 +158,7 @@ fn run() -> Result<()> {
                 .into());
             }
             let dmodel = model::Model::load(&ddir, dcfg)?;
-            let dbackend = if args.backend == "ane" { "metal" } else { &args.backend };
+            let dbackend = if args.backend == "hybrid" || args.backend == "ane" { "metal" } else { &args.backend };
             let dengine = engine::create(dbackend, dmodel, &ddir)?;
             eprintln!("draft: {name} ({})", dengine.name());
             Some(dengine)

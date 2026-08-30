@@ -31,7 +31,7 @@ prompt ──tokenizer──→ token ids ──[session.prefill]──→ logit
 session.forward/prefill dispatch to the selected backend:
   -b cpu   → model.rs        (reference implementation, plain Rust)
   -b metal → gpu/metal.rs    (Apple GPU, MSL kernels)
-  -b ane   → ane.rs          (Neural Engine prefill + Metal decode)
+  -b hybrid→ ane.rs          (Neural Engine prefill — or an ANE+GPU split — plus Metal decode)
 ```
 
 ## Startup
@@ -141,7 +141,7 @@ performance:
 The kernels are deliberately annotated against their CPU twins — `matvec` ↔
 `math::matvec`, `attention` ↔ `model::attention`, and so on.
 
-## ANE backend
+## Hybrid backend (ANE + GPU)
 
 `ane.rs` + `tools/export_prefill.py`. The Neural Engine is only reachable
 through Core ML, whose authoring toolchain is Python — so the design accepts a
@@ -214,7 +214,7 @@ values and run offline.
 
 ## Performance snapshot (M1 Pro, SmolLM2-135M, greedy)
 
-| workload | cpu | metal | ane hybrid |
+| workload | cpu | metal | hybrid |
 |---|---|---|---|
 | decode (short context) | ~49 tok/s | ~267 tok/s | = metal |
 | decode (~500 positions) | — | ~237 tok/s | = metal |
@@ -308,7 +308,7 @@ caching and 16+ concurrency, which this project doesn't need yet.
 Measured (M1 Pro, SmolLM2-135M-Instruct, 451-token prompts, 128 generated,
 4 concurrent):
 
-| | metal | ane hybrid |
+| | metal | hybrid |
 |---|---|---|
 | single-request prefill | ~0.49 s | ~0.06 s |
 | aggregate throughput | 168 gen-tok/s | **365 gen-tok/s** |

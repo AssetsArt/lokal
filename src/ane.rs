@@ -1,4 +1,5 @@
-//! The "ane" backend — a hybrid: prefill on the Apple Neural Engine, decode on Metal.
+//! The "hybrid" backend (`-b hybrid`, formerly `-b ane`): prefill on the Apple
+//! Neural Engine — or split across the ANE and the GPU — and decode on Metal.
 //!
 //! The ANE has no direct programming API — the only public road in is Core ML. The
 //! prefill graph is exported ahead of time to a .mlmodelc file (see
@@ -313,7 +314,7 @@ impl CoreMlFront {
 }
 
 /// Opt-in: run prefill as a two-device pipeline (see `AneSession::prefill_split`).
-/// Off by default — with it unset the `ane` backend behaves exactly as before.
+/// Off by default — with it unset the hybrid backend behaves exactly as before.
 fn split_enabled() -> bool {
     std::env::var("LOKAL_SPLIT_PREFILL").is_ok_and(|v| v != "0" && !v.is_empty())
 }
@@ -785,7 +786,7 @@ impl Session for AneSession<'_> {
     fn prefill(&mut self, ids: &[u32]) -> crate::Result<Vec<f32>> {
         let want = ids.len().saturating_sub(1);
         if want < ANE_MIN {
-            // Say so — the user picked -b ane and would otherwise wonder why the
+            // Say so — the user picked -b hybrid and would otherwise wonder why the
             // Neural Engine stays idle on a short prompt.
             eprintln!(
                 "  ANE skipped: {}-token prompt (< {ANE_MIN}) — the GPU prefills it faster than the smallest padded graph",
