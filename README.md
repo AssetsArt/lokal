@@ -38,8 +38,8 @@ Measured 2026-08-30 on an M1 Pro, 16 GB, `-t 0`, on a verified-quiet machine
 
 | workload | cpu | metal | ane (hybrid) |
 |---|---|---|---|
-| prefill | ~33 tok/s | **6,243 tok/s** | 8,617 tok/s ¹ |
-| decode | ~49 tok/s | 246 tok/s | 234 tok/s |
+| prefill | ~33 tok/s | **7,863 tok/s** | 8,517 tok/s ¹ |
+| decode | ~49 tok/s | 232 tok/s | 232 tok/s |
 | prefill (Qwen2.5-0.5B) | — | 2,704 tok/s | ² |
 | decode (Qwen2.5-0.5B) | ~27 tok/s | ~113 tok/s | = metal |
 
@@ -48,9 +48,8 @@ GPU stays free to decode. ² per-model ANE graphs; see ANE setup below.
 
 Prefill took a 4–6x jump (2026-08-30) from a flash-attention kernel plus
 Metal 4 tensor-ops matmuls — the same mechanism llama.cpp's Metal backend
-uses; lokal's GPU-only prefill now runs at ~65% of llama.cpp's rate on the
-same machine, with the ANE hybrid ahead of both on time-to-first-token
-(0.06 s vs 0.08 s at ~500 tokens). Decode speed comes from f16 weights
+uses; lokal's GPU-only prefill now lands within ~12% of llama.cpp's rate on
+the same machine, same session. Decode speed comes from f16 weights
 resident on the GPU, flash-decoding attention, and a GQA-aware kernel that
 reads each cached KV byte once per q-head group — which is also what keeps
 decode flat at long context (Qwen: 113 tok/s at 500 ctx, 53 at 32k).
@@ -61,8 +60,8 @@ Neural Engine prefills newly arrived requests off-GPU:
 
 | 4 concurrent requests (~500-token prompts) | metal | ane (hybrid) |
 |---|---|---|
-| single-request prefill | 0.08 s | **0.06 s** |
-| aggregate throughput | 216 tok/s | **374 tok/s** |
+| single-request prefill | 0.06 s | **0.06 s** |
+| aggregate throughput | 338 tok/s | **341 tok/s** |
 
 How lokal compares against other engines on the same machine and model, with
 reproduction steps, lives in [benchmarks/](benchmarks/).
