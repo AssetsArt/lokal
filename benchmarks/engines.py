@@ -80,11 +80,13 @@ ENGINES = {
     "lokal-metal-cli": _lokal_cli("metal"),
     "lokal-hybrid-cli": _lokal_cli("hybrid"),
     "llamacpp": {
-        # llama.cpp splits one KV allocation across its parallel slots, so a
-        # 4-way run at N tokens needs 4x the context a single-stream run does.
+        # llama.cpp splits -c across --parallel slots, so a slot holds ctx/par.
+        # Asking for ctx*par is what makes each slot actually hold ctx — without
+        # it a 4-way run rejects prompts a single-stream run accepts, and the row
+        # comes back as an HTTP 400 rather than a number.
         "server": lambda m, ctx, par: [
             "llama-server", "-m", m["gguf"], "--port", str(PORTS["llamacpp"]),
-            "-ngl", "99", "-c", str(ctx), "--parallel", str(par), "--no-webui"],
+            "-ngl", "99", "-c", str(ctx * par), "--parallel", str(par), "--no-webui"],
         "ready": lambda m: ("GET", f"http://127.0.0.1:{PORTS['llamacpp']}/health", None),
         "bench": lambda m: {"api": "openai", "url": f"http://127.0.0.1:{PORTS['llamacpp']}/v1",
                             "model-name": m["openai"]},

@@ -39,7 +39,7 @@ one that everybody can.
 |---|---|---|---|---|---|
 | lokal `-b hybrid` | main | **11,986** | 11,898–11,986 | 238 tok/s | **373 tok/s** |
 | llama.cpp | b9960 | 9,880 | 9,727–9,880 | 232 tok/s | 363 tok/s |
-| lokal `-b metal` | main | 9,491 | 9,470–9,491 | 231 tok/s | 352 tok/s |
+| lokal `-b metal` | main | 9,900 | 9,742–9,900 | 252 tok/s | 364 tok/s |
 | oMLX | 0.6.3 | 4,586 | 4,525–4,586 | **261 tok/s** | 336 tok/s |
 
 All four engines were measured in one session with the machine idle
@@ -55,7 +55,7 @@ support.
 
 ## Reading
 
-- **Prefill**: lokal's GPU-only path (9,491 tok/s) runs level with llama.cpp
+- **Prefill**: lokal's GPU-only path (9,900 tok/s) runs level with llama.cpp
   (9,880) — that path went 1,461 → 8,271 → ~9,500 in a day, first from a
   flash-attention rewrite plus Metal 4 tensor-ops matmuls (the same
   mechanism llama.cpp's Metal backend uses), then from moving the k/v
@@ -124,6 +124,33 @@ Facts that survive from that pass: the windowed ANE graph covers the first
 8,192 positions of a long prompt (Metal takes the tail), and a machine pays
 a one-time ~250 s Apple ANE-compiler cost on the first load of that graph
 (cached afterwards).
+
+## Long context: Qwen2.5-0.5B at 8k
+
+The 500–2,000 curve above is SmolLM2. Long prompts need a model with the
+context for them, so the 8k point is Qwen2.5-0.5B-Instruct (~7.7k-token
+corpus prompt, HTTP transport, cool machine, median of 5 requests):
+
+| engine | prefill | tok/s |
+|---|---|---|
+| llama.cpp b9960 | 2.61 s | **2,958** |
+| lokal `-b metal` | 3.17 s | 2,429 |
+
+`-b metal` was at 1,884 tok/s here this morning; retuning the flash
+attention tiles for long K/V loops (96 query rows × 32 positions — row reuse
+is what pays once the loop is thousands of positions long, while wider
+position tiles blow past the 16 KB of shared memory that keeps two
+threadgroups per core) and widening the GEMM row tile brought it to 2,429.
+That fixed the *shape* of the curve: lokal now falls off at llama.cpp's own
+rate from 500 to 7.7k tokens (−36% against −35%). What remains is a
+length-independent gap of ~15% on Qwen, present even at 500 tokens where
+attention is a rounding error — a model-level cost (Qwen's q/k/v biases,
+its narrow 128-wide kv projections, 14:2 GQA) that tile tuning cannot
+reach, and the next thing to profile.
+
+The `-b hybrid` row at 8k is deliberately absent: Qwen's split ladder is
+still being tuned, and a number measured against a ladder that is about to
+change would be obsolete before it was published.
 
 ## Reproduction
 

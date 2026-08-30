@@ -38,9 +38,9 @@ Measured 2026-08-30 on an M1 Pro, 16 GB, `-t 0`, on a verified-quiet machine
 
 | workload | cpu | metal | hybrid |
 |---|---|---|---|
-| prefill | ~33 tok/s | 9,491 tok/s | **11,986 tok/s** ¹ |
+| prefill | ~33 tok/s | 9,900 tok/s | **11,986 tok/s** ¹ |
 | decode | ~49 tok/s | 231 tok/s | 237 tok/s |
-| prefill (Qwen2.5-0.5B) | ~5 tok/s | 3,802 tok/s | 4,660 tok/s ² |
+| prefill (Qwen2.5-0.5B) | ~5 tok/s | 4,000 tok/s | 4,660 tok/s ² |
 | decode (Qwen2.5-0.5B) | ~27 tok/s | 119 tok/s | 120 tok/s |
 
 ¹ the hybrid row implies the split-prefill ladder is exported
@@ -62,7 +62,7 @@ one prompt keeps both busy — 11,986 tok/s against llama.cpp's 9,880 in the
 same session, and the lead holds from 500 to 2,000 tokens (the curve is in
 [benchmarks/](benchmarks/)). The gains compound: the GPU half is one of the
 pipeline's stages, so the day's Metal work — which brought GPU-only prefill
-level with llama.cpp, 9,491 vs 9,880 — lifted the hybrid number with it.
+level with llama.cpp, 9,900 vs 9,880 — lifted the hybrid number with it.
 And the lead is a curve, not a point: measured across the 500–2,000-token
 band, hybrid beats llama.cpp at every length — from +4% at the tightest
 points to +20% — with the ladder `export-ane-split` ships; the full table
