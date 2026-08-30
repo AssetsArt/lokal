@@ -121,6 +121,7 @@ pub(crate) struct Pipes {
     pub matvec_swiglu: ComputePipelineState,
     pub matmul_pg: ComputePipelineState,
     pub f32_to_f16: ComputePipelineState,
+    pub bf16_to_f16: ComputePipelineState,
     pub rope: ComputePipelineState,
     pub rope_h: ComputePipelineState,
     pub rope_qk_decode: ComputePipelineState,
@@ -167,6 +168,10 @@ pub struct LowMemEngine {
     /// LOKAL_LOWMEM_SYNC=1: wait out every command buffer before the next —
     /// the bisect mode for anything that smells like an eviction race.
     sync: bool,
+    /// The GPU bf16 converter's overflow flag (one u32, set on any clip) and
+    /// the once-only latch for the warning it feeds.
+    clip_flag: Buffer,
+    clip_warned: std::sync::atomic::AtomicBool,
 }
 
 // Same justification as MetalEngine: Apple documents these Metal objects as
@@ -244,6 +249,7 @@ impl LowMemEngine {
             matvec_swiglu: pipe("matvec_swiglu")?,
             matmul_pg: pipe("matmul_pg")?,
             f32_to_f16: pipe("f32_to_f16")?,
+            bf16_to_f16: pipe("bf16_to_f16_inplace")?,
             rope: pipe("rope")?,
             rope_h: pipe("rope_h")?,
             rope_qk_decode: pipe("rope_qk_decode")?,
@@ -346,10 +352,16 @@ impl LowMemEngine {
             OVERHEAD_MB,
         );
 
+        let clip_flag =
+            device.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
+        unsafe { *(clip_flag.contents() as *mut u32) = 0 };
+
         Ok(Self {
             gqa: gpu::gqa_decode_dims(&cfg),
             sync: std::env::var("LOKAL_LOWMEM_SYNC").is_ok_and(|v| v == "1"),
             win,
+            clip_flag,
+            clip_warned: std::sync::atomic::AtomicBool::new(false),
             cfg,
             manifest,
             device,

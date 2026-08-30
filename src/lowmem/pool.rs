@@ -15,7 +15,7 @@
 //! per-layer pipeline phase.
 
 use super::manifest::WeightManifest;
-use half::{bf16, f16};
+use half::f16;
 use metal::{Buffer, Device, MTLResourceOptions};
 use rayon::prelude::*;
 use safetensors::Dtype;
@@ -113,6 +113,16 @@ pub(super) struct WeightPool {
     epoch: u64,
     /// Highest epoch whose command buffer has finished on the GPU.
     completed: u64,
+    /// bf16 pages land as RAW BITS (memcpy) and convert on the GPU: each entry
+    /// is a buffer awaiting a bf16_to_f16_inplace dispatch, which the session
+    /// encodes at the head of the same command buffer that first reads it.
+    pending_convert: Vec<(Buffer, usize)>,
+    /// Evicted pages park their buffers here by size instead of freeing them:
+    /// a fresh MTLBuffer costs an allocation plus a zero-fill page fault for
+    /// every byte written — in thrash mode that doubled the staging traffic.
+    /// Freelist bytes still count against the budget (free_bytes).
+    free: HashMap<usize, Vec<Buffer>>,
+    free_bytes: usize,
     /// f32→f16 clips past 65504 — flag an overflowing checkpoint once, at the
     /// first page that actually clips (cheaper than a full scan at open).
     overflow_warned: bool,
@@ -128,8 +138,17 @@ impl WeightPool {
             clock: 0,
             epoch: 0,
             completed: 0,
+            pending_convert: Vec::new(),
+            free: HashMap::new(),
+            free_bytes: 0,
             overflow_warned: false,
         }
+    }
+
+    /// Buffers staged since the last call that still hold raw bf16 bits — the
+    /// caller encodes their conversion before any dispatch that reads them.
+    pub fn take_pending_converts(&mut self) -> Vec<(Buffer, usize)> {
+        std::mem::take(&mut self.pending_convert)
     }
 
     pub fn budget_bytes(&self) -> usize {
@@ -174,7 +193,28 @@ impl WeightPool {
                 continue;
             }
             let need = t.block_bytes(*b);
-            while self.used + need > self.budget {
+            // Make room: a parked buffer of the RIGHT size satisfies the request
+            // without growing the total; otherwise shrink (drop wrong-size parked
+            // buffers, then evict — eviction PARKS, so a right-size victim is
+            // picked up by the reuse check one iteration later).
+            loop {
+                if self.free.get(&need).is_some_and(|v| !v.is_empty()) {
+                    break;
+                }
+                if self.used + self.free_bytes + need <= self.budget {
+                    break;
+                }
+                if self.free_bytes > 0 {
+                    let sz = self
+                        .free
+                        .iter()
+                        .find(|(_, v)| !v.is_empty())
+                        .map(|(s, _)| *s)
+                        .expect("free_bytes > 0 implies a parked buffer");
+                    self.free.get_mut(&sz).unwrap().pop();
+                    self.free_bytes -= sz;
+                    continue;
+                }
                 match self.evict_lru() {
                     Evict::Done => {}
                     Evict::AllInFlight => return Ok(Admit::NeedWait),
@@ -187,9 +227,15 @@ impl WeightPool {
                     }
                 }
             }
-            let buf = self
-                .device
-                .new_buffer(need as u64, MTLResourceOptions::StorageModeShared);
+            let buf = match self.free.get_mut(&need).and_then(|v| v.pop()) {
+                Some(b) => {
+                    self.free_bytes -= need;
+                    b // warm pages: no allocation, no zero-fill faults
+                }
+                None => self
+                    .device
+                    .new_buffer(need as u64, MTLResourceOptions::StorageModeShared),
+            };
             self.stage(mf, t, *b, &buf)?;
             self.clock += 1;
             self.used += need;
@@ -232,6 +278,8 @@ impl WeightPool {
             Some(key) => {
                 let p = self.pages.remove(&key).unwrap();
                 self.used -= p.bytes;
+                self.free_bytes += p.bytes;
+                self.free.entry(p.bytes).or_default().push(p.buf);
                 Evict::Done
             }
             None if in_flight_only => Evict::AllInFlight,
@@ -263,19 +311,21 @@ impl WeightPool {
                 }
                 false
             }
-            Dtype::BF16 => out
-                .par_chunks_mut(t.in_dim)
-                .zip(src.par_chunks(t.in_dim * 2))
-                .map(|(d, s)| {
-                    let mut c = false;
-                    for (o, b) in d.iter_mut().zip(s.chunks_exact(2)) {
-                        let v = bf16::from_le_bytes([b[0], b[1]]).to_f32();
-                        c |= v.abs() > f16::MAX.to_f32();
-                        *o = f16::from_f32(v).to_bits();
-                    }
-                    c
-                })
-                .reduce(|| false, |a, b| a | b),
+            Dtype::BF16 => {
+                // Raw bits only — the GPU converts in place before first use
+                // (bf16_to_f16_inplace). The CPU's share of a bf16 page is a
+                // copy, parallelized because a single core's ~10 GB/s memcpy is
+                // the whole thrash-mode budget (~1 GB restaged per token when
+                // the model exceeds the pool).
+                let out_b =
+                    unsafe { std::slice::from_raw_parts_mut(dp as *mut u8, src.len()) };
+                out_b
+                    .par_chunks_mut(1 << 20)
+                    .zip(src.par_chunks(1 << 20))
+                    .for_each(|(d, s)| d.copy_from_slice(s));
+                self.pending_convert.push((dst.clone(), rows * t.in_dim));
+                false
+            }
             Dtype::F32 => out
                 .par_chunks_mut(t.in_dim)
                 .zip(src.par_chunks(t.in_dim * 4))

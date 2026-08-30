@@ -1951,6 +1951,28 @@ kernel void silu_mul_hf(
     gate_h[gid] = (half)v;
 }
 
+// -b lowmem stage-in: reinterpret a freshly staged page of raw bf16 bits as f16,
+// in place. bf16 → f32 is an exact bit shift; f32 → f16 rounds to nearest even —
+// the same two steps the CPU path takes, so the staged values are identical while
+// the CPU's share of a page drops to a plain memcpy. A value past f16 range
+// (|x| > 65504 → ±inf) flips the flag so the host can warn once.
+kernel void bf16_to_f16_inplace(
+    device ushort *w [[buffer(0)]],
+    constant uint &dim [[buffer(1)]],
+    device atomic_uint *clip [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= dim) {
+        return;
+    }
+    float v = as_type<float>((uint)w[gid] << 16);
+    half h = (half)v;
+    if (isinf(h) && !isinf(v)) {
+        atomic_store_explicit(clip, 1u, memory_order_relaxed);
+    }
+    w[gid] = as_type<ushort>(h);
+}
+
 // x += y  (residual connection)
 kernel void add_inplace(
     device float *x [[buffer(0)]],

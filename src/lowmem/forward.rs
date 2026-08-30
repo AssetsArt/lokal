@@ -282,6 +282,19 @@ impl<'a> LowMemSession<'a> {
         }
     }
 
+    /// Convert freshly staged bf16 pages to f16 in place — encoded at the HEAD
+    /// of the command buffer that first reads them (serial encoder = ordered).
+    fn enc_pending_converts(&self, enc: &ComputeCommandEncoderRef, conv: &[(Buffer, usize)]) {
+        for (buf, elems) in conv {
+            let d = *elems as u32;
+            enc.set_compute_pipeline_state(&self.e.pipes.bf16_to_f16);
+            enc.set_buffer(0, Some(buf), 0);
+            set_bytes(enc, 1, &d);
+            enc.set_buffer(2, Some(&self.e.clip_flag), 0);
+            gpu::dispatch_grid(enc, *elems);
+        }
+    }
+
     fn enc_f32_to_f16(
         &self,
         enc: &ComputeCommandEncoderRef,
@@ -526,8 +539,10 @@ impl<'a> LowMemSession<'a> {
         for (l, lw) in e.layers.iter().enumerate() {
             let pages = layer_pages(lw);
             let ep = admit(&mut pool, &e.manifest, &pages, &mut inflight)?;
+            let conv = pool.take_pending_converts();
             let cb = e.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
+            self.enc_pending_converts(enc, &conv);
             if fused_decode {
                 self.encode_layer_decode(enc, &pool, lw, l, pos0);
             } else {
@@ -550,8 +565,10 @@ impl<'a> LowMemSession<'a> {
                 let hi = (blk + group).min(lm.n_pages);
                 let pages: Vec<_> = (blk..hi).map(|b| (lm, b)).collect();
                 let ep = admit(&mut pool, &e.manifest, &pages, &mut inflight)?;
+                let conv = pool.take_pending_converts();
                 let cb = e.queue.new_command_buffer();
                 let enc = cb.new_compute_command_encoder();
+                self.enc_pending_converts(enc, &conv);
                 if first {
                     self.enc_rmsnorm(enc, &self.x, ((n - 1) * h * 4) as u64, &e.final_norm, &self.xn, 1);
                     first = false;
@@ -583,6 +600,12 @@ impl<'a> LowMemSession<'a> {
         }
         for (_, ep) in inflight.drain(..) {
             pool.mark_completed(ep);
+        }
+        // The GPU converter's overflow flag — warn once per process.
+        if unsafe { *(e.clip_flag.contents() as *const u32) } != 0
+            && !e.clip_warned.swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            eprintln!("lowmem: warning — checkpoint holds values beyond f16 range; they clip at ±65504");
         }
 
         if !want_logits {
