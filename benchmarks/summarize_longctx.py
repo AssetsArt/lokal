@@ -16,9 +16,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Display order and pretty names; anything else falls through in file order.
 ORDER = [
-    ("lokal-ane-cli", "lokal `-b hybrid` (cli)"),
+    ("lokal-hybrid-cli", "lokal `-b hybrid` (cli)"),
     ("lokal-metal-cli", "lokal `-b metal` (cli)"),
-    ("lokal-ane-http", "lokal `-b hybrid` (serve)"),
+    ("lokal-hybrid", "lokal `-b hybrid` (serve)"),
     ("lokal-metal-http", "lokal `-b metal` (serve)"),
     ("llamacpp", "llama.cpp"),
     ("omlx", "oMLX"),

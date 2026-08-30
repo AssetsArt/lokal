@@ -95,23 +95,24 @@ a one-time ~250 s Apple ANE-compiler cost on the first load of that graph
 One engine, one row — the server is started and stopped for you:
 
 ```bash
-python3 benchmarks/bench_engines.py --engine lokal-ane
+python3 benchmarks/bench_engines.py --engine lokal-hybrid
 python3 benchmarks/bench_engines.py --engine llamacpp
 python3 benchmarks/bench_engines.py --engine omlx --out benchmarks/results.jsonl
 
-# lokal-ane splits by default once ./run.sh export-ane-split has run;
+# lokal-hybrid splits by default once ./run.sh export-ane-split has run;
 # the ladder-less hybrid row, for A/B against it:
-LOKAL_SPLIT_PREFILL=0 python3 benchmarks/bench_engines.py --engine lokal-ane
+LOKAL_SPLIT_PREFILL=0 python3 benchmarks/bench_engines.py --engine lokal-hybrid
 ```
 
-`--engine` takes any key from `engines.py`: `lokal-metal`, `lokal-ane`,
-`lokal-metal-cli`, `lokal-ane-cli`, `llamacpp`, `omlx`. Add `--model qwen` to
+`--engine` takes any key from `engines.py`: `lokal-metal`, `lokal-hybrid`,
+`lokal-metal-cli`, `lokal-hybrid-cli`, `llamacpp`, `omlx` (the old
+`lokal-ane*` spellings still resolve). Add `--model qwen` to
 run the same engine on Qwen2.5-0.5B-Instruct instead of the default
 SmolLM2-135M-Instruct, and `--prompt-tokens N` for a long prompt. Sweeping
 sizes or engines is the same registry through the other driver:
 
 ```bash
-python3 benchmarks/run_longctx.py --engines lokal-ane-cli,llamacpp,omlx \
+python3 benchmarks/run_longctx.py --engines lokal-hybrid-cli,llamacpp,omlx \
     --sizes 2000,6000,10000,16000,24000,32000
 ```
 

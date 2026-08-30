@@ -23,9 +23,9 @@
 #
 # Usage — one engine, server started and stopped for you (engines.py knows the
 # flags; --model picks the family, default smol):
-#   python3 benchmarks/bench_engines.py --engine lokal-ane
+#   python3 benchmarks/bench_engines.py --engine lokal-hybrid
 #   python3 benchmarks/bench_engines.py --engine llamacpp --model qwen --prompt-tokens 2000
-#   python3 benchmarks/bench_engines.py --engine lokal-ane-cli --model qwen --prompt-tokens 16000
+#   python3 benchmarks/bench_engines.py --engine lokal-hybrid-cli --model qwen --prompt-tokens 16000
 #
 # Or point it at a server you are running yourself:
 #   python3 benchmarks/bench_engines.py --api lokal  --url http://127.0.0.1:8080 --name "lokal (metal)"

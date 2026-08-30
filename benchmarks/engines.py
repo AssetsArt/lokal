@@ -4,7 +4,7 @@
 # client flags have to agree and keeping two copies of that pairing is how a
 # benchmark ends up measuring a differently-configured server than it reports.
 #
-#   bench_engines.py --engine lokal-ane      # one row, server managed for you
+#   bench_engines.py --engine lokal-hybrid   # one row, server managed for you
 #   run_longctx.py --engines llamacpp ...    # a whole sweep, same registry
 #
 # A spec has three parts: how to START the server (None for the CLI path, which
@@ -71,9 +71,9 @@ def _lokal_cli(backend):
 
 ENGINES = {
     "lokal-metal": _lokal_http("metal"),
-    "lokal-ane": _lokal_http("hybrid"),
+    "lokal-hybrid": _lokal_http("hybrid"),
     "lokal-metal-cli": _lokal_cli("metal"),
-    "lokal-ane-cli": _lokal_cli("hybrid"),
+    "lokal-hybrid-cli": _lokal_cli("hybrid"),
     "llamacpp": {
         # llama.cpp splits one KV allocation across its parallel slots, so a
         # 4-way run at N tokens needs 4x the context a single-stream run does.
@@ -95,8 +95,11 @@ ENGINES = {
                             "model-name": m["omlx"], "bearer": "bench"},
     },
 }
-# Kept so older command lines keep working.
-ENGINES["lokal-ane-http"] = ENGINES["lokal-ane"]
+# Kept so older command lines and saved benchmark scripts keep working.
+ENGINES["lokal-ane"] = ENGINES["lokal-hybrid"]
+ENGINES["lokal-ane-cli"] = ENGINES["lokal-hybrid-cli"]
+ENGINES["lokal-ane-http"] = ENGINES["lokal-hybrid"]
+ENGINES["lokal-hybrid-http"] = ENGINES["lokal-hybrid"]
 ENGINES["lokal-metal-http"] = ENGINES["lokal-metal"]
 
 

@@ -8,7 +8,7 @@
 # a pooled slot there (src/batch.rs POOL_SEQ_CAP), so those sizes go through the
 # CLI path instead, which needs no server at all.
 #
-#   python3 benchmarks/run_longctx.py --engines lokal-ane-cli,llamacpp,omlx \
+#   python3 benchmarks/run_longctx.py --engines lokal-hybrid-cli,llamacpp,omlx \
 #       --sizes 2000,6000,10000,16000,24000,32000 --ctx 34816
 #
 # Engine names, server flags and model packagings all live in engines.py, which
