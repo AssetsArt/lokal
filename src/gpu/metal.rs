@@ -318,11 +318,14 @@ impl MetalEngine {
         };
         let pipes = Pipelines {
             embed: pipe("embed")?,
-            matvec: pipe("matvec")?,
-            matvec_acc: pipe("matvec_acc")?,
-            matvec_swiglu: pipe("matvec_swiglu")?,
-            matvec_qkv: pipe("matvec_qkv")?,
-            matvec_h: pipe("matvec_h")?,
+            // The matvec family references the lowmem LM_W_BF16 function
+            // constant through dot_wx — unspecialized builds are refused, so
+            // these take the empty specialization (identical code).
+            matvec: default_spec("matvec")?,
+            matvec_acc: default_spec("matvec_acc")?,
+            matvec_swiglu: default_spec("matvec_swiglu")?,
+            matvec_qkv: default_spec("matvec_qkv")?,
+            matvec_h: default_spec("matvec_h")?,
             matmul: pipe("matmul")?,
             matmul_t: pipe("matmul_t")?,
             matmul_th: pipe("matmul_th")?,
@@ -343,9 +346,9 @@ impl MetalEngine {
             attention_decode_reduce: pipe("attention_decode_reduce")?,
             silu_mul: pipe("silu_mul")?,
             add_inplace: pipe("add_inplace")?,
-            matvec_qkv_batch: pipe("matvec_qkv_batch")?,
-            matvec_acc_batch: pipe("matvec_acc_batch")?,
-            matvec_swiglu_batch: pipe("matvec_swiglu_batch")?,
+            matvec_qkv_batch: default_spec("matvec_qkv_batch")?,
+            matvec_acc_batch: default_spec("matvec_acc_batch")?,
+            matvec_swiglu_batch: default_spec("matvec_swiglu_batch")?,
             rope_qk_batch: pipe("rope_qk_batch")?,
             attention_decode_partial_batch: gqa_pipe("attention_decode_partial_batch")?,
             attention_decode_reduce_batch: pipe("attention_decode_reduce_batch")?,

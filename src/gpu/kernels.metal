@@ -50,11 +50,39 @@ kernel void embed(
 // memory-bandwidth-bound, and wide loads are what gets a small kernel near peak
 // bandwidth. A scalar tail handles in_dim % 4 (zero for every supported model).
 
+// -b lowmem direct-read specialization: with LM_W_BF16 set, the matvec family
+// reads its weight buffer as RAW bf16 checkpoint bytes (bound over the mmap's
+// no-copy view — pages the pool has no room for stream straight from the page
+// cache, touching the bus once instead of thrice). Every value still rounds
+// through f16 on the way into the dot product, so results are bit-identical
+// to the staged path. Unspecialized pipelines fold the branch away.
+constant bool LM_W_BF16_FC [[function_constant(24)]];
+constant bool LM_W_BF16 = is_function_constant_defined(LM_W_BF16_FC) && LM_W_BF16_FC;
+
 inline float dot_wx(device const half *w_row, device const float *x, uint in_dim, uint lane) {
+    float acc = 0.0f;
+    if (LM_W_BF16) {
+        // ushort2 keeps 4-byte alignment for any 4-aligned tensor offset
+        // (the host falls back to staging when a span is odder than that).
+        device const ushort2 *w2 = (device const ushort2 *)w_row;
+        device const float2 *x2 = (device const float2 *)x;
+        uint n2 = in_dim / 2;
+#pragma clang loop unroll_count(4)
+        for (uint i = lane; i < n2; i += 32) {
+            ushort2 wb = w2[i];
+            half2 h = half2((half)as_type<float>((uint)wb.x << 16),
+                            (half)as_type<float>((uint)wb.y << 16));
+            acc += dot(float2(h), x2[i]);
+        }
+        for (uint i = n2 * 2 + lane; i < in_dim; i += 32) {
+            device const ushort *wu = (device const ushort *)w_row;
+            acc += (float)(half)as_type<float>((uint)wu[i] << 16) * x[i];
+        }
+        return acc;
+    }
     device const half4 *w4 = (device const half4 *)w_row;
     device const float4 *x4 = (device const float4 *)x;
     uint n4 = in_dim / 4;
-    float acc = 0.0f;
     // Partially unrolled so the scheduler can keep several loads in flight —
     // this loop is where decode spends its memory-bound time.
 #pragma clang loop unroll_count(4)

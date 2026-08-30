@@ -135,6 +135,16 @@ pub(crate) struct Pipes {
     pub add_inplace: ComputePipelineState,
 }
 
+/// The matvec family specialized with LM_W_BF16: weight buffers are RAW bf16
+/// checkpoint bytes read through the mmap views (values still round through
+/// f16, so results match the staged pipelines bit for bit).
+pub(crate) struct DirectPipes {
+    pub matvec: ComputePipelineState,
+    pub matvec_h: ComputePipelineState,
+    pub matvec_acc: ComputePipelineState,
+    pub matvec_swiglu: ComputePipelineState,
+}
+
 /// One transformer block: eagerly-resident norms, paged projection matrices.
 pub(crate) struct LayerWeights {
     pub input_ln: Buffer,
@@ -154,6 +164,7 @@ pub struct LowMemEngine {
     device: Device,
     queue: CommandQueue,
     pipes: Pipes,
+    direct: DirectPipes,
     layers: Vec<LayerWeights>,
     final_norm: Buffer,
     lm_head: PagedTensor,
@@ -198,8 +209,29 @@ impl LowMemEngine {
         let lib = device
             .new_library_with_source(&gpu::shader_source(cfg.kv_dim()), &CompileOptions::new())
             .map_err(|e| format!("failed to compile kernels.metal: {e}"))?;
+        // Every build goes through the specialization API: kernels that
+        // reference function constants (the matvec family via dot_wx, the
+        // attention set via LM_*) refuse the unspecialized path, and the empty
+        // set compiles identical code for the rest.
         let pipe = |name: &str| -> crate::Result<ComputePipelineState> {
-            let f = lib.get_function(name, None).map_err(|e| format!("kernel {name}: {e}"))?;
+            let f = lib
+                .get_function(name, Some(FunctionConstantValues::new()))
+                .map_err(|e| format!("kernel {name}: {e}"))?;
+            device
+                .new_compute_pipeline_state_with_function(&f)
+                .map_err(|e| format!("kernel {name}: {e}").into())
+        };
+        let bf16_pipe = |name: &str| -> crate::Result<ComputePipelineState> {
+            let consts = FunctionConstantValues::new();
+            let yes = true;
+            consts.set_constant_value_at_index(
+                &yes as *const bool as *const _,
+                MTLDataType::Bool,
+                24,
+            );
+            let f = lib
+                .get_function(name, Some(consts))
+                .map_err(|e| format!("kernel {name}: {e}"))?;
             device
                 .new_compute_pipeline_state_with_function(&f)
                 .map_err(|e| format!("kernel {name}: {e}").into())
@@ -260,6 +292,12 @@ impl LowMemEngine {
             attn_dec_reduce: pipe("attention_decode_reduce")?,
             silu_mul: pipe("silu_mul")?,
             add_inplace: pipe("add_inplace")?,
+        };
+        let direct = DirectPipes {
+            matvec: bf16_pipe("matvec")?,
+            matvec_h: bf16_pipe("matvec_h")?,
+            matvec_acc: bf16_pipe("matvec_acc")?,
+            matvec_swiglu: bf16_pipe("matvec_swiglu")?,
         };
 
         // Small weights (norms, biases): eagerly resident, a few hundred KB —
@@ -368,6 +406,7 @@ impl LowMemEngine {
             device,
             queue,
             pipes,
+            direct,
             layers,
             final_norm,
             lm_head,

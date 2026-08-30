@@ -10,7 +10,7 @@
 //!     chunk touches at most `chunk` scattered rows, which never justifies
 //!     keeping a vocab × hidden table resident.
 
-use super::pool::{Admit, PagedTensor, PendingConvert, WeightPool};
+use super::pool::{Admit, Bind, PagedTensor, PendingConvert, WeightPool};
 use super::{LayerWeights, LowMemEngine};
 use crate::engine::Session;
 use crate::gpu::metal as gpu;
@@ -252,25 +252,35 @@ impl<'a> LowMemSession<'a> {
     }
 
     /// Decode y[r0..] = W_block·x + bias per block — matvec / matvec_h /
-    /// matvec_acc all share the binding layout. `y_elem` is the output's
+    /// matvec_acc all share the binding layout. Each block reads either its
+    /// staged f16 pool page or the raw bf16 checkpoint span through the mmap
+    /// view (the LM_W_BF16-specialized pipeline). `y_elem` is the output's
     /// element size in bytes (4 for f32, 2 for the f16 caches).
     #[allow(clippy::too_many_arguments)]
-    fn enc_matvec_paged(
+    fn enc_matvec_bound(
         &self,
         enc: &ComputeCommandEncoderRef,
-        pool: &WeightPool,
-        pipe: &ComputePipelineState,
+        pipes: (&ComputePipelineState, &ComputePipelineState), // (staged f16, direct bf16)
         t: &PagedTensor,
+        binds: &[Bind],
         x: &Buffer,
         y: &Buffer,
         y_base: u64,
         y_elem: u64,
     ) {
-        for blk in 0..t.n_pages {
+        for (blk, bind) in binds.iter().enumerate() {
             let (r0, rows) = t.block_rows(blk);
             let p = MatvecParams { in_dim: t.in_dim as u32, out_dim: rows as u32 };
-            enc.set_compute_pipeline_state(pipe);
-            enc.set_buffer(0, Some(pool.get(t, blk)), 0);
+            match bind {
+                Bind::Pool(buf) => {
+                    enc.set_compute_pipeline_state(pipes.0);
+                    enc.set_buffer(0, Some(buf), 0);
+                }
+                Bind::Direct(view, off) => {
+                    enc.set_compute_pipeline_state(pipes.1);
+                    enc.set_buffer(0, Some(view), *off as u64);
+                }
+            }
             match &t.bias {
                 Some(b) => enc.set_buffer(1, Some(b), (r0 * 2) as u64),
                 None => enc.set_buffer(1, Some(&self.e.zero_bias), 0),
@@ -443,7 +453,7 @@ impl<'a> LowMemSession<'a> {
     fn encode_layer_decode(
         &self,
         enc: &ComputeCommandEncoderRef,
-        pool: &WeightPool,
+        plan: &LayerPlan,
         lw: &LayerWeights,
         l: usize,
         pos: usize,
@@ -454,9 +464,12 @@ impl<'a> LowMemSession<'a> {
         let kv_byte_off = (e.win.slot_of(pos) * cfg.kv_dim() * 2) as u64;
 
         self.enc_rmsnorm(enc, &self.x, 0, &lw.input_ln, &self.xn, 1);
-        self.enc_matvec_paged(enc, pool, &e.pipes.matvec, &lw.q, &self.xn, &self.q, 0, 4);
-        self.enc_matvec_paged(enc, pool, &e.pipes.matvec_h, &lw.k, &self.xn, &self.k_cache[l], kv_byte_off, 2);
-        self.enc_matvec_paged(enc, pool, &e.pipes.matvec_h, &lw.v, &self.xn, &self.v_cache[l], kv_byte_off, 2);
+        let mv = (&e.pipes.matvec, &e.direct.matvec);
+        let mvh = (&e.pipes.matvec_h, &e.direct.matvec_h);
+        let mva = (&e.pipes.matvec_acc, &e.direct.matvec_acc);
+        self.enc_matvec_bound(enc, mv, &lw.q, &plan.q, &self.xn, &self.q, 0, 4);
+        self.enc_matvec_bound(enc, mvh, &lw.k, &plan.k, &self.xn, &self.k_cache[l], kv_byte_off, 2);
+        self.enc_matvec_bound(enc, mvh, &lw.v, &plan.v, &self.xn, &self.v_cache[l], kv_byte_off, 2);
         {
             let p = RopeQkParams {
                 head_dim: hd as u32,
@@ -503,22 +516,45 @@ impl<'a> LowMemSession<'a> {
                 MTLSize::new(hd as u64, 1, 1),
             );
         }
-        self.enc_matvec_paged(enc, pool, &e.pipes.matvec_acc, &lw.o, &self.att, &self.x, 0, 4);
+        self.enc_matvec_bound(enc, mva, &lw.o, &plan.o, &self.att, &self.x, 0, 4);
 
         self.enc_rmsnorm(enc, &self.x, 0, &lw.post_ln, &self.xn, 1);
         // SwiGLU: gate and up share [inter, h], so their pages split identically.
-        for blk in 0..lw.gate.n_pages {
-            let (r0, rows) = lw.gate.block_rows(blk);
-            let p = MatvecParams { in_dim: lw.gate.in_dim as u32, out_dim: rows as u32 };
-            enc.set_compute_pipeline_state(&e.pipes.matvec_swiglu);
-            enc.set_buffer(0, Some(pool.get(&lw.gate, blk)), 0);
-            enc.set_buffer(1, Some(pool.get(&lw.up, blk)), 0);
-            enc.set_buffer(2, Some(&self.xn), 0);
-            enc.set_buffer(3, Some(&self.gate), (r0 * 4) as u64);
-            set_bytes(enc, 4, &p);
-            gpu::dispatch_simdgroup_rows(enc, rows as u32);
+        // The fused kernel needs both operands in the SAME mode per block; a
+        // mixed block pair falls back to two matvecs + the elementwise silu_mul.
+        let mixed = plan
+            .gate
+            .iter()
+            .zip(&plan.up)
+            .any(|(g, u)| !matches!((g, u), (Bind::Pool(_), Bind::Pool(_)) | (Bind::Direct(..), Bind::Direct(..))));
+        if mixed {
+            self.enc_matvec_bound(enc, mv, &lw.gate, &plan.gate, &self.xn, &self.gate, 0, 4);
+            self.enc_matvec_bound(enc, mv, &lw.up, &plan.up, &self.xn, &self.up, 0, 4);
+            self.enc_elem(enc, &e.pipes.silu_mul, &self.gate, &self.up, cfg.intermediate_size);
+        } else {
+            for (blk, (bg, bu)) in plan.gate.iter().zip(&plan.up).enumerate() {
+                let (r0, rows) = lw.gate.block_rows(blk);
+                let p = MatvecParams { in_dim: lw.gate.in_dim as u32, out_dim: rows as u32 };
+                match (bg, bu) {
+                    (Bind::Pool(g), Bind::Pool(u)) => {
+                        enc.set_compute_pipeline_state(&e.pipes.matvec_swiglu);
+                        enc.set_buffer(0, Some(g), 0);
+                        enc.set_buffer(1, Some(u), 0);
+                    }
+                    (Bind::Direct(g, go), Bind::Direct(u, uo)) => {
+                        enc.set_compute_pipeline_state(&e.direct.matvec_swiglu);
+                        enc.set_buffer(0, Some(g), *go as u64);
+                        enc.set_buffer(1, Some(u), *uo as u64);
+                    }
+                    _ => unreachable!("mixed pairs took the split path"),
+                }
+                enc.set_buffer(2, Some(&self.xn), 0);
+                enc.set_buffer(3, Some(&self.gate), (r0 * 4) as u64);
+                set_bytes(enc, 4, &p);
+                gpu::dispatch_simdgroup_rows(enc, rows as u32);
+            }
         }
-        self.enc_matvec_paged(enc, pool, &e.pipes.matvec_acc, &lw.down, &self.gate, &self.x, 0, 4);
+        self.enc_matvec_bound(enc, mva, &lw.down, &plan.down, &self.gate, &self.x, 0, 4);
     }
 
     /// Process `n` tokens at positions pos0.. — one command buffer per layer,
@@ -541,16 +577,19 @@ impl<'a> LowMemSession<'a> {
         self.embed_gather(ids)?;
 
         for (l, lw) in e.layers.iter().enumerate() {
-            let pages = layer_pages(lw);
-            let ep = admit(&mut pool, &e.manifest, &pages, &mut inflight)?;
+            let (ep, plan) = if fused_decode {
+                let (ep, plan) = plan_decode(&mut pool, &e.manifest, lw, &mut inflight)?;
+                (ep, Some(plan))
+            } else {
+                (admit(&mut pool, &e.manifest, &layer_pages(lw), &mut inflight)?, None)
+            };
             let conv = pool.take_pending_converts();
             let cb = e.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
             self.enc_pending_converts(enc, &conv);
-            if fused_decode {
-                self.encode_layer_decode(enc, &pool, lw, l, pos0);
-            } else {
-                self.encode_layer_prefill(enc, &pool, lw, l, pos0, n);
+            match &plan {
+                Some(plan) => self.encode_layer_decode(enc, plan, lw, l, pos0),
+                None => self.encode_layer_prefill(enc, &pool, lw, l, pos0, n),
             }
             enc.end_encoding();
             cb.commit();
@@ -559,41 +598,31 @@ impl<'a> LowMemSession<'a> {
         }
 
         if want_logits {
-            // Final norm on the last row, then the lm_head in page groups small
-            // enough to pin — the vocab × hidden matrix never sits resident whole.
+            // Final norm on the last row, then every lm_head block in ONE
+            // command buffer: resident blocks read the pool, the rest read the
+            // checkpoint directly — the vocab × hidden matrix never needs to
+            // sit resident, staged, or grouped.
             let lm = &e.lm_head;
-            let group = (pool.budget_bytes() / 2 / super::pool::PAGE_BYTES).max(1);
-            let mut blk = 0;
-            let mut first = true;
-            while blk < lm.n_pages {
-                let hi = (blk + group).min(lm.n_pages);
-                let pages: Vec<_> = (blk..hi).map(|b| (lm, b)).collect();
-                let ep = admit(&mut pool, &e.manifest, &pages, &mut inflight)?;
-                let conv = pool.take_pending_converts();
-                let cb = e.queue.new_command_buffer();
-                let enc = cb.new_compute_command_encoder();
-                self.enc_pending_converts(enc, &conv);
-                if first {
-                    self.enc_rmsnorm(enc, &self.x, ((n - 1) * h * 4) as u64, &e.final_norm, &self.xn, 1);
-                    first = false;
-                }
-                for b in blk..hi {
-                    let (r0, rows) = lm.block_rows(b);
-                    let p = MatvecParams { in_dim: lm.in_dim as u32, out_dim: rows as u32 };
-                    enc.set_compute_pipeline_state(&e.pipes.matvec);
-                    enc.set_buffer(0, Some(pool.get(lm, b)), 0);
-                    enc.set_buffer(1, Some(&e.zero_bias), 0);
-                    enc.set_buffer(2, Some(&self.xn), 0);
-                    enc.set_buffer(3, Some(&self.logits), (r0 * 4) as u64);
-                    set_bytes(enc, 4, &p);
-                    gpu::dispatch_simdgroup_rows(enc, rows as u32);
-                }
-                enc.end_encoding();
-                cb.commit();
-                pool.unpin_all();
-                retire(&mut pool, &mut inflight, cb, ep, e.sync);
-                blk = hi;
-            }
+            let (ep, binds) = plan_tensor(&mut pool, &e.manifest, lm, &mut inflight)?;
+            let conv = pool.take_pending_converts();
+            let cb = e.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            self.enc_pending_converts(enc, &conv);
+            self.enc_rmsnorm(enc, &self.x, ((n - 1) * h * 4) as u64, &e.final_norm, &self.xn, 1);
+            self.enc_matvec_bound(
+                enc,
+                (&e.pipes.matvec, &e.direct.matvec),
+                lm,
+                &binds,
+                &self.xn,
+                &self.logits,
+                0,
+                4,
+            );
+            enc.end_encoding();
+            cb.commit();
+            pool.unpin_all();
+            retire(&mut pool, &mut inflight, cb, ep, e.sync);
         }
 
         // Drain before the pool lock drops: queue order makes the last command
@@ -681,6 +710,92 @@ fn layer_pages(lw: &LayerWeights) -> Vec<(&PagedTensor, usize)> {
         }
     }
     v
+}
+
+/// Where each decode dispatch reads a layer's weights from.
+struct LayerPlan {
+    q: Vec<Bind>,
+    k: Vec<Bind>,
+    v: Vec<Bind>,
+    o: Vec<Bind>,
+    gate: Vec<Bind>,
+    up: Vec<Bind>,
+    down: Vec<Bind>,
+}
+
+/// Bind one tensor's blocks for a decode-style dispatch, waiting out in-flight
+/// command buffers when a staging admission needs room.
+fn plan_tensor(
+    pool: &mut WeightPool,
+    mf: &super::manifest::WeightManifest,
+    t: &PagedTensor,
+    inflight: &mut Vec<(metal::CommandBuffer, u64)>,
+) -> crate::Result<(u64, Vec<Bind>)> {
+    let ep = pool.begin_cb();
+    let mut binds = Vec::with_capacity(t.n_pages);
+    let mut blk = 0;
+    while blk < t.n_pages {
+        match pool.bind_decode(mf, t, blk, ep)? {
+            Ok(b) => {
+                binds.push(b);
+                blk += 1;
+            }
+            Err(Admit::NeedWait) => {
+                if inflight.is_empty() {
+                    return Err("lowmem: pool wait requested with nothing in flight (bug)".into());
+                }
+                let (cb, cbep) = inflight.remove(0);
+                cb.wait_until_completed();
+                pool.mark_completed(cbep);
+            }
+            Err(Admit::Ready) => unreachable!(),
+        }
+    }
+    Ok((ep, binds))
+}
+
+/// The whole layer's decode plan under ONE epoch.
+fn plan_decode(
+    pool: &mut WeightPool,
+    mf: &super::manifest::WeightManifest,
+    lw: &LayerWeights,
+    inflight: &mut Vec<(metal::CommandBuffer, u64)>,
+) -> crate::Result<(u64, LayerPlan)> {
+    let ep = pool.begin_cb();
+    let mut bind_all = |t: &PagedTensor| -> crate::Result<Vec<Bind>> {
+        let mut binds = Vec::with_capacity(t.n_pages);
+        let mut blk = 0;
+        while blk < t.n_pages {
+            match pool.bind_decode(mf, t, blk, ep)? {
+                Ok(b) => {
+                    binds.push(b);
+                    blk += 1;
+                }
+                Err(Admit::NeedWait) => {
+                    if inflight.is_empty() {
+                        return Err("lowmem: pool wait requested with nothing in flight (bug)".into());
+                    }
+                    let (cb, cbep) = inflight.remove(0);
+                    cb.wait_until_completed();
+                    pool.mark_completed(cbep);
+                }
+                Err(Admit::Ready) => unreachable!(),
+            }
+        }
+        Ok(binds)
+    };
+    Ok((
+        ep,
+        LayerPlan {
+            q: bind_all(&lw.q)?,
+            k: bind_all(&lw.k)?,
+            v: bind_all(&lw.v)?,
+            o: bind_all(&lw.o)?,
+            gate: bind_all(&lw.gate)?,
+            up: bind_all(&lw.up)?,
+            down: bind_all(&lw.down)?,
+        },
+    ))
 }
 
 impl Session for LowMemSession<'_> {

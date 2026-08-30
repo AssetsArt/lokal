@@ -98,6 +98,16 @@ pub(super) struct PendingConvert {
     pub elems: usize,
 }
 
+/// Where one decode dispatch reads a weight block from.
+pub(super) enum Bind {
+    /// Staged f16 in the pool (resident or just admitted).
+    Pool(Buffer),
+    /// The checkpoint's raw bf16 through the mmap view at this byte offset —
+    /// pages the budget has no room for stream from the page cache, read once,
+    /// never staged and never evicting anything.
+    Direct(Buffer, usize),
+}
+
 /// make_resident's verdict when the budget is tight.
 pub(super) enum Admit {
     Ready,
@@ -258,6 +268,43 @@ impl WeightPool {
 
     pub fn get(&self, t: &PagedTensor, block: usize) -> &Buffer {
         &self.pages[&(t.id, block as u32)].buf
+    }
+
+    /// Decode admission for one block. Resident pages pin and bind from the
+    /// pool; a block with budget room stages in (growing the resident prefix);
+    /// past the budget line it binds DIRECT — matvec work reads each streamed
+    /// byte once, so staging would only add traffic. Falls back to the staged
+    /// path (with eviction) when the span has no usable GPU view.
+    pub fn bind_decode(
+        &mut self,
+        mf: &WeightManifest,
+        t: &PagedTensor,
+        block: usize,
+        epoch: u64,
+    ) -> crate::Result<Result<Bind, Admit>> {
+        let key = (t.id, block as u32);
+        if let Some(p) = self.pages.get_mut(&key) {
+            self.clock += 1;
+            p.last_used = self.clock;
+            p.pinned = true;
+            p.epoch = epoch;
+            return Ok(Ok(Bind::Pool(p.buf.clone())));
+        }
+        let need = t.block_bytes(block);
+        if self.used + self.free_bytes + need > self.budget
+            && mf.meta(&t.name)?.dtype == Dtype::BF16 // the direct pipes read raw bf16
+        {
+            let (r0, rows) = t.block_rows(block);
+            if let Some((view, off)) = mf.gpu_span(&t.name, r0, r0 + rows)? {
+                if off % 4 == 0 {
+                    return Ok(Ok(Bind::Direct(view.clone(), off)));
+                }
+            }
+        }
+        match self.make_resident(mf, &[(t, block)], epoch)? {
+            Admit::Ready => Ok(Ok(Bind::Pool(self.get(t, block).clone()))),
+            Admit::NeedWait => Ok(Err(Admit::NeedWait)),
+        }
     }
 
     /// The command buffer for the current encode is committed — pages stay
