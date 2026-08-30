@@ -17,6 +17,7 @@
 
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
 
 // ---------- embedding: token ids → one vector per row (step 1 of model.rs) ----------
@@ -341,6 +342,69 @@ kernel void matmul(
                 y[(ulong)gr * p.out_dim + go] = Cs[m * MM_TN + n];
             }
         }
+    }
+}
+
+// ---------- tensor-ops matmul: the Metal 4 path (macOS 26) ----------
+// mpp::tensor_ops::matmul2d drives the same tensor hardware llama.cpp's mul_mm
+// uses on this OS — measured 6x faster than any hand-tiled simdgroup variant we
+// tried on the MLP GEMMs. Operands are half (X converted by f32_to_f16 below),
+// the destination accumulates in f32 device memory directly, and the op does its
+// own edge checking against the real extents. Tensors are built in-kernel from
+// plain buffer pointers, so the host side binds ordinary buffers.
+
+kernel void matmul_t(
+    device const half *w [[buffer(0)]],
+    device const half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant MatmulParams &p [[buffer(3)]],
+    uint2 tgid [[threadgroup_position_in_grid]], // x = output tile (64), y = token tile (32)
+    uint2 tpos [[thread_position_in_threadgroup]])
+{
+    (void)tpos;
+    // Cast away const: the tensor-ops templates only accept non-const elements.
+    auto tA = tensor((device half *)x, dextents<int32_t, 2>(p.in_dim, p.n_rows), array<int, 2>({1, (int)p.in_dim}));
+    auto tB = tensor((device half *)w, dextents<int32_t, 2>(p.in_dim, p.out_dim), array<int, 2>({1, (int)p.in_dim}));
+    auto tC = tensor(y, dextents<int32_t, 2>(p.out_dim, p.n_rows), array<int, 2>({1, (int)p.out_dim}));
+
+    // A (tokens over k, NN) x B^T (W stored [out][k] = NT right operand) -> C.
+    // f32 accumulation lives in the cooperative destination tensor (registers);
+    // store() writes the f32 result with edge checking against C's real extents.
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        32, 64, static_cast<int>(dynamic_extent), false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
+
+    auto mA = tA.slice(0, (int)(tgid.y * 32));
+    auto mB = tB.slice(0, (int)(tgid.x * 64));
+    auto mC = tC.slice((int)(tgid.x * 64), (int)(tgid.y * 32));
+    auto cT = op.get_destination_cooperative_tensor<decltype(mA), decltype(mB), float>();
+    op.run(mA, mB, cT);
+    cT.store(mC);
+}
+
+// f32 activations -> half staging for the tensor-ops matmul operands.
+kernel void f32_to_f16(
+    device const float *x [[buffer(0)]],
+    device half *y [[buffer(1)]],
+    constant uint &dim [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < dim) {
+        y[gid] = (half)x[gid];
+    }
+}
+
+// y[row][o] += bias[o] — only dispatched for layers that actually carry a bias
+// (Qwen's q projection on the tensor-ops path; k/v go through matmul_h).
+kernel void bias_add(
+    device float *y [[buffer(0)]],
+    device const half *bias [[buffer(1)]],
+    constant MatmulParams &p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < p.n_rows * p.out_dim) {
+        y[gid] += (float)bias[gid % p.out_dim];
     }
 }
 
