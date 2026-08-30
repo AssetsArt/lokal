@@ -381,8 +381,9 @@ impl MetalEngine {
         n_rows: usize,
         xh: Option<&Buffer>,
         convert: bool,
+        conc: bool,
     ) {
-        self.enc_linear_with(&self.pipes.matvec, &self.pipes.matmul, enc, l, x, x_off, y, y_off, n_rows, xh, convert);
+        self.enc_linear_with(&self.pipes.matvec, &self.pipes.matmul, enc, l, x, x_off, y, y_off, n_rows, xh, convert, conc);
     }
 
     /// enc_linear writing f16 — the k/v projections, whose output IS the KV cache.
@@ -401,7 +402,7 @@ impl MetalEngine {
         xh: Option<&Buffer>,
     ) {
         let (Some(xh), true) = (xh, n_rows > 1) else {
-            self.enc_linear_with(&self.pipes.matvec_h, &self.pipes.matmul_h, enc, l, x, 0, y, y_off, n_rows, None, false);
+            self.enc_linear_with(&self.pipes.matvec_h, &self.pipes.matmul_h, enc, l, x, 0, y, y_off, n_rows, None, false, false);
             return;
         };
         let p = MatmulParams { in_dim: l.in_dim, out_dim: l.out_dim, n_rows: n_rows as u32 };
@@ -431,6 +432,7 @@ impl MetalEngine {
         n_rows: usize,
         xh: Option<&Buffer>,
         convert: bool,
+        conc: bool,
     ) {
         if n_rows == 1 {
             let p = MatvecParams { in_dim: l.in_dim, out_dim: l.out_dim };
@@ -453,6 +455,9 @@ impl MetalEngine {
                 enc.set_buffer(1, Some(xh), 0);
                 enc.set_bytes(2, 4, &dim as *const _ as *const _);
                 dispatch_grid(enc, dim as usize);
+                if conc {
+                    enc.memory_barrier_with_resources(&[xh]); // matmul_t reads the fresh half copy
+                }
             }
 
             enc.set_compute_pipeline_state(&self.pipes.matmul_t);
@@ -466,6 +471,9 @@ impl MetalEngine {
             );
 
             if l.has_bias {
+                if conc {
+                    enc.memory_barrier_with_resources(&[y]); // bias_add reads y back
+                }
                 enc.set_compute_pipeline_state(&self.pipes.bias_add);
                 enc.set_buffer(0, Some(y), y_off);
                 enc.set_buffer(1, Some(&l.bias), 0);
@@ -980,14 +988,25 @@ impl MetalSession<'_> {
         }
 
         let cb = e.queue.new_command_buffer();
-        // Serial encoder: dispatches execute in order, each seeing its predecessors'
-        // results — no manual barriers needed.
-        let enc = cb.new_compute_command_encoder();
+        let fused_decode = n == 1 && cfg.head_dim() <= DEC_TG && cfg.head_dim().is_multiple_of(4);
+        // Decode keeps the serial encoder (every dispatch depends on the previous
+        // one anyway). Prefill uses a concurrent encoder with explicit barriers so
+        // independent dispatches — q/k/v projections, the rope pair, gate/up — can
+        // overlap; each barrier names exactly the buffers the next stage reads.
+        let enc = if fused_decode {
+            cb.new_compute_command_encoder()
+        } else {
+            cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent)
+        };
+        let conc = !fused_decode;
+        macro_rules! bar {
+            ($($b:expr),+) => { if conc { enc.memory_barrier_with_resources(&[$($b),+]) } };
+        }
 
         if matches!(src, Source::Ids(_)) {
             e.enc_embed(enc, &self.ids, &self.x, n);
+            bar!(&self.x);
         }
-        let fused_decode = n == 1 && cfg.head_dim() <= DEC_TG && cfg.head_dim().is_multiple_of(4);
         for (l, blk) in e.blocks.iter().enumerate().skip(layer0) {
             if fused_decode {
                 // Decode path: fused kernels — 9 dispatches per layer instead of 15.
@@ -1006,21 +1025,30 @@ impl MetalSession<'_> {
             }
 
             // Prefill path (and the rare head_dim > DEC_TG decode): tiled matmuls.
-            // Attention half.
+            // Attention half. Barrier-free groups: q/k/v projections (disjoint
+            // outputs, shared read-only input), the two ropes, gate/up.
             e.enc_rmsnorm_hf(enc, &self.x, &blk.input_layernorm, &self.xn, &self.xh, n);
-            e.enc_linear(enc, &blk.q_proj, &self.xn, 0, &self.q, 0, n, Some(&self.xh), false);
+            bar!(&self.xn, &self.xh);
+            e.enc_linear(enc, &blk.q_proj, &self.xn, 0, &self.q, 0, n, Some(&self.xh), false, conc);
             e.enc_linear_kv(enc, &blk.k_proj, &self.xn, &self.k_cache[l], kv_byte_off, n, Some(&self.xh));
             e.enc_linear_kv(enc, &blk.v_proj, &self.xn, &self.v_cache[l], kv_byte_off, n, Some(&self.xh));
+            bar!(&self.q, &self.k_cache[l], &self.v_cache[l]);
             e.enc_rope(enc, &self.q, 0, cfg.num_attention_heads, pos0, n, false);
             e.enc_rope(enc, &self.k_cache[l], kv_byte_off, cfg.num_key_value_heads, pos0, n, true);
+            bar!(&self.q, &self.k_cache[l]);
             e.enc_attention(enc, &self.q, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.scores, &self.att, pos0, n, self.max_seq, &self.xh);
-            e.enc_linear(enc, &blk.o_proj, &self.att, 0, &self.xb, 0, n, Some(&self.xh), e.cfg.head_dim() != FLASH_HEAD_DIM);
+            bar!(&self.att, &self.xh);
+            e.enc_linear(enc, &blk.o_proj, &self.att, 0, &self.xb, 0, n, Some(&self.xh), e.cfg.head_dim() != FLASH_HEAD_DIM, conc);
+            bar!(&self.xb);
             e.enc_elementwise(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
+            bar!(&self.x);
 
             // SwiGLU MLP half.
             e.enc_rmsnorm_hf(enc, &self.x, &blk.post_attention_layernorm, &self.xn, &self.xh, n);
-            e.enc_linear(enc, &blk.gate_proj, &self.xn, 0, &self.gate, 0, n, Some(&self.xh), false);
-            e.enc_linear(enc, &blk.up_proj, &self.xn, 0, &self.up, 0, n, Some(&self.xh), false);
+            bar!(&self.xn, &self.xh);
+            e.enc_linear(enc, &blk.gate_proj, &self.xn, 0, &self.gate, 0, n, Some(&self.xh), false, conc);
+            e.enc_linear(enc, &blk.up_proj, &self.xn, 0, &self.up, 0, n, Some(&self.xh), false, conc);
+            bar!(&self.gate, &self.up);
             {
                 let p = ElemParams { dim: (n * cfg.intermediate_size) as u32 };
                 enc.set_compute_pipeline_state(&e.pipes.silu_mul_hf);
@@ -1030,15 +1058,19 @@ impl MetalSession<'_> {
                 enc.set_bytes(3, size_of::<ElemParams>() as u64, &p as *const _ as *const _);
                 dispatch_grid(enc, n * cfg.intermediate_size);
             }
-            e.enc_linear(enc, &blk.down_proj, &self.gate, 0, &self.xb, 0, n, Some(&self.xh), false);
+            bar!(&self.gate, &self.xh); // silu_mul_hf writes both copies
+            e.enc_linear(enc, &blk.down_proj, &self.gate, 0, &self.xb, 0, n, Some(&self.xh), false, conc);
+            bar!(&self.xb);
             e.enc_elementwise(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
+            bar!(&self.x);
         }
         if logits_rows > 0 {
             // Norm every row (cheap), then run the big lm_head only on the rows whose
             // logits are wanted — the final one for decode, all of them for verification.
             e.enc_rmsnorm_hf(enc, &self.x, &e.norm, &self.xn, &self.xh, n);
+            bar!(&self.xn, &self.xh);
             let first = n - logits_rows;
-            e.enc_linear(enc, &e.lm_head, &self.xn, (first * h * 4) as u64, &self.logits, 0, logits_rows, Some(&self.xh), true);
+            e.enc_linear(enc, &e.lm_head, &self.xn, (first * h * 4) as u64, &self.logits, 0, logits_rows, Some(&self.xh), true, conc);
         }
 
         enc.end_encoding();
@@ -1325,7 +1357,7 @@ impl crate::engine::Batcher for MetalBatcher<'_> {
             self.enc_matvec_batch(enc, &e.pipes.matvec_acc_batch, &blk.down_proj, &self.gate, &self.x, n);
         }
         e.enc_rmsnorm(enc, &self.x, &e.norm, &self.xn, n);
-        e.enc_linear(enc, &e.lm_head, &self.xn, 0, &self.logits, 0, n, None, false);
+        e.enc_linear(enc, &e.lm_head, &self.xn, 0, &self.logits, 0, n, None, false, false);
 
         enc.end_encoding();
         cb.commit();
