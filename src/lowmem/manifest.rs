@@ -67,7 +67,7 @@ impl WeightManifest {
         self.tensors.contains_key(name)
     }
 
-    fn meta(&self, name: &str) -> crate::Result<&TensorMeta> {
+    pub fn meta(&self, name: &str) -> crate::Result<&TensorMeta> {
         self.tensors
             .get(name)
             .ok_or_else(|| format!("tensor {name} not found in the weight files").into())
@@ -83,5 +83,23 @@ impl WeightManifest {
     pub fn read_f32(&self, name: &str) -> crate::Result<Vec<f32>> {
         let m = self.meta(name)?;
         crate::weights::to_f32(m.dtype, self.bytes(m))
+    }
+
+    /// Raw bytes of rows r0..r1 of a 2-D tensor — one contiguous mmap slice
+    /// (rows are contiguous on disk), plus the dtype to interpret it. This is
+    /// the read the pager stages pages through; the slice may be unaligned, so
+    /// callers convert via byte chunks, never typed pointers.
+    pub fn read_rows(&self, name: &str, r0: usize, r1: usize) -> crate::Result<(&[u8], Dtype)> {
+        let m = self.meta(name)?;
+        let n_rows = m.shape.first().copied().unwrap_or(0);
+        if m.shape.len() != 2 || r1 > n_rows || r0 >= r1 {
+            return Err(format!(
+                "read_rows({name}, {r0}..{r1}): tensor has shape {:?}",
+                m.shape
+            )
+            .into());
+        }
+        let row_bytes = m.len / n_rows;
+        Ok((&self.bytes(m)[r0 * row_bytes..r1 * row_bytes], m.dtype))
     }
 }

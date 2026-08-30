@@ -232,6 +232,8 @@ struct MatmulParams {
     uint n_rows;
 };
 
+// NOTE: matmul_pg below is this kernel plus a y_stride — a fix or improvement
+// in one belongs in both, or lowmem numerics silently drift from metal's.
 kernel void matmul(
     device const half *w [[buffer(0)]],
     device const half *bias [[buffer(1)]],
@@ -340,6 +342,121 @@ kernel void matmul(
             uint go = out0 + n;
             if (gr < p.n_rows && go < p.out_dim) {
                 y[(ulong)gr * p.out_dim + go] = Cs[m * MM_TN + n];
+            }
+        }
+    }
+}
+
+// Paged-tensor matmul (-b lowmem): identical algorithm to `matmul` above (keep
+// them in sync — that kernel is the source of truth), with one difference: the
+// weight buffer holds only a ROW BLOCK of the full tensor (a pool page), so the
+// output columns this dispatch produces land inside a wider row. `out_dim` is
+// the block's row count (guards + W indexing), `y_stride` the full output width;
+// the y/bias buffers are bound with a byte offset selecting the block's columns.
+struct MatmulPagedParams {
+    uint in_dim;
+    uint out_dim;   // rows in this weight block = output columns produced here
+    uint n_rows;
+    uint y_stride;  // full out_dim of the logical tensor
+};
+
+kernel void matmul_pg(
+    device const half *w [[buffer(0)]],
+    device const half *bias [[buffer(1)]],
+    device const float *x [[buffer(2)]],
+    device float *y [[buffer(3)]],
+    constant MatmulPagedParams &p [[buffer(4)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint2 tpos [[thread_position_in_threadgroup]])
+{
+    uint tid = tpos.x;
+    uint sgid = tid / 32;
+    uint out0 = tgid.x * MM_TN;
+    uint row0 = tgid.y * MM_TM;
+
+    threadgroup float shared_[2048];
+    threadgroup half *sa = (threadgroup half *)shared_;
+    threadgroup half *sb = (threadgroup half *)(shared_ + 1024);
+    threadgroup float *biasTile = shared_ + 1536;
+    threadgroup float *Cs = shared_;
+
+    for (uint idx = tid; idx < 8 * MM_TN; idx += MM_THREADS) {
+        uint o = idx % MM_TN;
+        biasTile[idx] = (out0 + o < p.out_dim) ? (float)bias[out0 + o] : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (uint i = 0; i < 8; i++) {
+        simdgroup_load(mc[i], biasTile + (sgid % 2) * 32 + (i % 4) * 8, MM_TN);
+    }
+
+    uint w_row = tid / 2;
+    uint w_strip = tid % 2;
+    uint x_row = tid / 4;
+    uint x_blk = tid % 4;
+
+    for (uint k0 = 0; k0 < p.in_dim; k0 += MM_TK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < 16; i++) {
+            uint gk = k0 + w_strip * 16 + i;
+            uint go = out0 + w_row;
+            half v = (go < p.out_dim && gk < p.in_dim) ? w[(ulong)go * p.in_dim + gk] : 0.0h;
+            uint ib = 8 * (2 * w_strip + i / 8) + w_row / 8;
+            sa[64 * ib + 8 * (i % 8) + w_row % 8] = v;
+        }
+        for (uint i = 0; i < 8; i++) {
+            uint gk = k0 + x_blk * 8 + i;
+            uint gr = row0 + x_row;
+            half v = (gr < p.n_rows && gk < p.in_dim) ? (half)x[(ulong)gr * p.in_dim + gk] : 0.0h;
+            uint ib = 4 * x_blk + x_row / 8;
+            sb[64 * ib + 8 * (x_row % 8) + i] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half *lsma = sa + 4 * 64 * (sgid % 2);
+        threadgroup const half *lsmb = sb + 2 * 64 * (sgid / 2);
+        for (uint ik = 0; ik < MM_TK / 8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (uint i = 0; i < 4; i++) {
+                simdgroup_load(ma[i], lsma + 64 * i, 8, ulong2(0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            for (uint i = 0; i < 2; i++) {
+                simdgroup_load(mb[i], lsmb + 64 * i, 8, ulong2(0), false);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            for (uint i = 0; i < 8; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb[i / 4], ma[i % 4], mc[i]);
+            }
+            lsma += 8 * 64;
+            lsmb += 4 * 64;
+        }
+    }
+
+    if (row0 + MM_TM <= p.n_rows && out0 + MM_TN <= p.out_dim) {
+        for (uint i = 0; i < 8; i++) {
+            ulong gr = row0 + (sgid / 2) * 16 + (i / 4) * 8;
+            ulong go = out0 + (sgid % 2) * 32 + (i % 4) * 8;
+            simdgroup_store(mc[i], y + gr * p.y_stride + go, p.y_stride);
+        }
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < 8; i++) {
+            uint t0 = (sgid / 2) * 16 + (i / 4) * 8;
+            uint o0 = (sgid % 2) * 32 + (i % 4) * 8;
+            simdgroup_store(mc[i], Cs + t0 * MM_TN + o0, MM_TN);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < MM_TM * MM_TN; idx += MM_THREADS) {
+            uint m = idx / MM_TN;
+            uint n = idx % MM_TN;
+            uint gr = row0 + m;
+            uint go = out0 + n;
+            if (gr < p.n_rows && go < p.out_dim) {
+                y[(ulong)gr * p.y_stride + go] = Cs[m * MM_TN + n];
             }
         }
     }
