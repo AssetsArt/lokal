@@ -260,9 +260,10 @@ def export_front(args, cfg, weights, spec):
 
     import coremltools as ct
 
-    fs, fp = (int(v) for v in spec.split("x"))
+    parts = [int(v) for v in spec.split("x")]
+    fs, fp = parts[0], parts[1]
     L = cfg["num_hidden_layers"]
-    A = args.front_layers or L // 2
+    A = parts[2] if len(parts) > 2 else (args.front_layers or L // 2)
     if not 0 < A < L:
         raise SystemExit(f"--front-layers must be in 1..{L - 1} (got {A})")
     hd = cfg["hidden_size"] // cfg["num_attention_heads"]
@@ -293,8 +294,12 @@ def export_front(args, cfg, weights, spec):
             ct.TensorType(name="v_past", shape=(A, fp, kvd), dtype=np.float16),
             ct.TensorType(name="past_valid", shape=(1, fp), dtype=np.float16),
         ],
-        outputs=[ct.TensorType(name="k_cache", dtype=np.float32),
-                 ct.TensorType(name="v_cache", dtype=np.float32),
+        # K/V come out as fp16, the dtype the KV cache stores: the graph already
+        # computes in fp16, so upcasting here only to round back down on the Rust
+        # side costs a full extra pass over the data on the critical thread.
+        # x_out stays f32 — it is written straight into Metal's f32 activations.
+        outputs=[ct.TensorType(name="k_cache", dtype=np.float16),
+                 ct.TensorType(name="v_cache", dtype=np.float16),
                  ct.TensorType(name="x_out", dtype=np.float32)],
         compute_precision=ct.precision.FLOAT16,
         compute_units=ct.ComputeUnit.CPU_AND_NE,
@@ -373,9 +378,12 @@ def main():
     ap.add_argument("--window", default="1024x7168",
                     help="windowed graph as SxP (chunk x past), 'none' to skip")
     ap.add_argument("--front", default="none",
-                    help="layer-split front-half graphs as SxP[,SxP...] (chunk x past); pairs with "
-                         "--front-layers. Runs layers 0..front_layers and also returns the "
-                         "hidden state so another device finishes the rest (split prefill)")
+                    help="layer-split front-half graphs as SxP[xA][,...] (chunk x past x front "
+                         "layers, A defaulting to --front-layers). Runs layers 0..A and also "
+                         "returns the hidden state so another device finishes the rest (split "
+                         "prefill). A is per chunk width on purpose: where the GPU half is the "
+                         "bottleneck the ANE should carry more layers, and that balance point "
+                         "moves with the chunk size")
     ap.add_argument("--front-layers", type=int, default=0,
                     help="how many leading layers the --front graph runs (default: half)")
     args = ap.parse_args()
@@ -435,8 +443,10 @@ def main():
     del net
     gc.collect()
 
+    front_widths = set()
     if args.front != "none":
         for spec in args.front.split(","):
+            front_widths.add(int(spec.split("x")[0]))
             done.append(export_front(args, cfg, weights, spec))
 
     if args.window != "none":
@@ -542,7 +552,11 @@ def main():
     for old in args.model_dir.glob("prefill-*.mlmodelc"):
         spec = old.stem.removeprefix("prefill-")
         if spec.startswith("f") and "-" in spec:   # front-half split graph
-            rebuilt_kind = args.front != "none"
+            # Scoped to the chunk width: rebuilding the 128-wide family must not
+            # delete the 256-wide one (they are independent ladders, and they may
+            # legitimately carry different front-layer counts).
+            width = spec.split("-", 1)[1].split("w")[0]
+            rebuilt_kind = width.isdigit() and int(width) in front_widths
         elif "w" in spec:                          # windowed graph
             rebuilt_kind = args.window != "none"
         else:                                      # plain fixed-shape graph

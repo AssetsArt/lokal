@@ -280,8 +280,9 @@ impl CoreMlFront {
         Ok(Self { model, s, p, n_front })
     }
 
-    /// One chunk through layers 0..n_front → (K, V) for those layers
-    /// ([n_front × s × kvd] f32) plus the hidden state ([s × hidden] f32).
+    /// One chunk through layers 0..n_front → (K, V) for those layers as the
+    /// cache's own f16 bits ([n_front × s × kvd]) plus the hidden state
+    /// ([s × hidden] f32, the dtype Metal's activations use).
     #[allow(clippy::too_many_arguments)]
     fn predict(
         &self,
@@ -292,7 +293,7 @@ impl CoreMlFront {
         kvd: usize,
         head_dim: usize,
         theta: f32,
-    ) -> crate::Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    ) -> crate::Result<(Vec<u16>, Vec<u16>, Vec<f32>)> {
         autoreleasepool(|_| {
             let provider = windowed_provider(
                 self.s, self.p, ids, pos0, k_past, v_past, self.n_front, kvd, head_dim, theta,
@@ -303,8 +304,8 @@ impl CoreMlFront {
             }
             .map_err(|e| format!("Core ML prediction failed: {e:?}"))?;
             Ok((
-                fetch_f32(&out, "k_cache")?,
-                fetch_f32(&out, "v_cache")?,
+                fetch_f16_bits(&out, "k_cache")?,
+                fetch_f16_bits(&out, "v_cache")?,
                 fetch_f32(&out, "x_out")?,
             ))
         })
@@ -315,6 +316,21 @@ impl CoreMlFront {
 /// Off by default — with it unset the `ane` backend behaves exactly as before.
 fn split_enabled() -> bool {
     std::env::var("LOKAL_SPLIT_PREFILL").is_ok_and(|v| v != "0" && !v.is_empty())
+}
+
+/// Pull an fp16 multiarray output into its raw bits — the KV cache's own dtype,
+/// so nothing on the hot path has to convert.
+fn fetch_f16_bits(out: &ProtocolObject<dyn MLFeatureProvider>, name: &str) -> crate::Result<Vec<u16>> {
+    let fv = unsafe { out.featureValueForName(&NSString::from_str(name)) }
+        .ok_or_else(|| format!("no output named {name}"))?;
+    let arr = unsafe { fv.multiArrayValue() }.ok_or_else(|| format!("{name} is not a multiarray"))?;
+    let count = unsafe { arr.count() } as usize;
+    let mut v = vec![0u16; count];
+    #[allow(deprecated)] // dataPointer: same reasoning as on the input side
+    unsafe {
+        std::ptr::copy_nonoverlapping(arr.dataPointer().as_ptr() as *const u16, v.as_mut_ptr(), count)
+    };
+    Ok(v)
 }
 
 /// Pull an f32 multiarray output into a Vec<f32>.
@@ -537,28 +553,51 @@ impl AneSession<'_> {
     /// happens on the ANE thread, which needs those same rows for the next
     /// chunk's past anyway, so the thread driving the GPU only memcpys.
     fn prefill_split(&mut self, ids: &[u32]) -> crate::Result<Vec<f32>> {
-        // Smallest window that reaches the whole prompt — a wider one would pay
-        // full P+S attention on every chunk for past that is never valid.
-        let f = self
-            .front
-            .iter()
-            .find(|g| g.s + g.p >= ids.len())
-            .unwrap_or_else(|| self.front.last().expect("caller checked"));
         let kvd = self.kvd;
         let cfg = self.metal.config_ref();
         let (head_dim, theta, hidden) = (cfg.head_dim(), cfg.rope_theta, cfg.hidden_size);
-        let ane_total = ids.len().min(f.s + f.p);
-        let a = f.n_front;
-        // The hidden state is written straight into Metal's per-chunk scratch.
+        // The hidden state is written straight into Metal's per-chunk scratch, so a
+        // graph wider than that scratch could never be used.
         let room = self.metal.max_chunk_rows();
-        if f.s > room {
+        let front = self.front;
+
+        // Pick the chunk stride first. Two chunks is all fill and drain — the
+        // pipeline only starts paying for itself once there are stages in the
+        // middle where both engines are busy — so take the widest exported stride
+        // that still cuts this prompt into at least MIN_CHUNKS pieces.
+        const MIN_CHUNKS: usize = 3;
+        let mut strides: Vec<usize> =
+            front.iter().map(|g| g.s).filter(|&s| s <= room).collect();
+        strides.sort_unstable();
+        strides.dedup();
+        let Some(&smallest) = strides.first() else {
             return Err(format!(
-                "split prefill: front graph chunk S={} exceeds Metal's per-chunk scratch ({room} rows) \
-                 — re-export with a smaller --front chunk",
-                f.s
+                "split prefill: every exported front graph is wider than Metal's per-chunk \
+                 scratch ({room} rows) — re-export with a smaller --front chunk"
             )
             .into());
-        }
+        };
+        let s = strides
+            .iter()
+            .rev()
+            .copied()
+            .find(|&s| ids.len() >= MIN_CHUNKS * s)
+            .unwrap_or(smallest);
+
+        // Within that stride, the window ladder: a windowed graph computes and
+        // masks its full P+S attention every call whatever the real past is, so
+        // each chunk takes the shortest rung that still reaches back to pos0.
+        let mut rungs: Vec<&CoreMlFront> = front.iter().filter(|g| g.s == s).collect();
+        rungs.sort_by_key(|g| g.p);
+        // The split point is a property of the chunk width, not of the model: where
+        // the GPU half binds, the ANE should carry more layers, and that balance
+        // moves with the chunk size. Keep one ladder — a leftover graph exported at
+        // a different split would make the chunks disagree about where layer A is.
+        let a = rungs[0].n_front;
+        rungs.retain(|g| g.n_front == a);
+        let p_max = rungs.last().expect("at least one rung").p;
+        let ane_total = ids.len().min(s + p_max);
+        let ladder: &[&CoreMlFront] = &rungs; // shared with the Core ML thread
 
         struct Chunk {
             pos: usize,
@@ -574,14 +613,35 @@ impl AneSession<'_> {
         let (logits, chunks, ane_s, metal_s) =
             std::thread::scope(|scope| -> crate::Result<(Vec<f32>, usize, f64, f64)> {
             scope.spawn(move || {
-                let mut past_k = vec![0u16; a * f.p * kvd];
-                let mut past_v = vec![0u16; a * f.p * kvd];
+                // One master past at the widest rung's stride; a narrower rung gets
+                // the first p rows of each layer staged into its own layout.
+                let mut past_k = vec![0u16; a * p_max * kvd];
+                let mut past_v = vec![0u16; a * p_max * kvd];
+                let (mut stage_k, mut stage_v) = (Vec::new(), Vec::new());
                 let mut pos = 0;
                 while pos < ane_total {
-                    let n = (ane_total - pos).min(f.s);
+                    let n = (ane_total - pos).min(s);
                     let t_chunk = Instant::now();
-                    let (k, v, x) = match f.predict(
-                        &ids[pos..pos + n], pos, &past_k, &past_v, kvd, head_dim, theta,
+                    let g = ladder.iter().find(|g| g.p >= pos).unwrap_or(&ladder[ladder.len() - 1]);
+                    let narrow = g.p != p_max;
+                    if narrow {
+                        let span = g.p * kvd;
+                        stage_k.resize(a * span, 0);
+                        stage_v.resize(a * span, 0);
+                        for l in 0..a {
+                            let src = l * p_max * kvd;
+                            let dst = l * span;
+                            stage_k[dst..dst + span].copy_from_slice(&past_k[src..src + span]);
+                            stage_v[dst..dst + span].copy_from_slice(&past_v[src..src + span]);
+                        }
+                    }
+                    let (kin, vin) = if narrow {
+                        (&stage_k[..], &stage_v[..])
+                    } else {
+                        (&past_k[..], &past_v[..])
+                    };
+                    let (k, v, x) = match g.predict(
+                        &ids[pos..pos + n], pos, kin, vin, kvd, head_dim, theta,
                     ) {
                         Ok(out) => out,
                         Err(e) => {
@@ -589,19 +649,19 @@ impl AneSession<'_> {
                             return;
                         }
                     };
+                    // K/V arrive as the cache's own f16 bits — take the real rows out
+                    // of each layer's s-row slab, no conversion anywhere.
                     let rows = n * kvd;
                     let (mut kb, mut vb) = (vec![0u16; a * rows], vec![0u16; a * rows]);
                     for l in 0..a {
-                        let src = l * f.s * kvd;
-                        for i in 0..rows {
-                            kb[l * rows + i] = f16::from_f32(k[src + i]).to_bits();
-                            vb[l * rows + i] = f16::from_f32(v[src + i]).to_bits();
-                        }
+                        let src = l * g.s * kvd;
+                        kb[l * rows..(l + 1) * rows].copy_from_slice(&k[src..src + rows]);
+                        vb[l * rows..(l + 1) * rows].copy_from_slice(&v[src..src + rows]);
                     }
-                    // Rows at index ≥ p can never be attended to again — skip them.
-                    let keep = rows.min(f.p.saturating_sub(pos) * kvd);
+                    // Rows at index ≥ p_max can never be attended to again — skip them.
+                    let keep = rows.min(p_max.saturating_sub(pos) * kvd);
                     for l in 0..a {
-                        let dst = l * f.p * kvd + pos * kvd;
+                        let dst = l * p_max * kvd + pos * kvd;
                         past_k[dst..dst + keep].copy_from_slice(&kb[l * rows..l * rows + keep]);
                         past_v[dst..dst + keep].copy_from_slice(&vb[l * rows..l * rows + keep]);
                     }
@@ -642,10 +702,9 @@ impl AneSession<'_> {
         // The balance of the two sides is the whole story: a pipeline is only worth
         // its complexity while neither engine is waiting much on the other.
         eprintln!(
-            "  ANE split prefill: {ane_total} tokens ({chunks} chunks of {}, layers 0..{a} on ANE ‖ {a}.. on Metal, P={}) \
+            "  ANE split prefill: {ane_total} tokens ({chunks} chunks of {s}, layers 0..{a} on ANE ‖ {a}.. on Metal, windows {:?}) \
              in {:.3}s [ANE {:.3}s, Metal {:.3}s, {:.0}% overlapped]",
-            f.s,
-            f.p,
+            rungs.iter().map(|g| g.p).collect::<Vec<_>>(),
             t.elapsed().as_secs_f64(),
             ane_s,
             metal_s,
