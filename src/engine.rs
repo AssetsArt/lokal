@@ -84,10 +84,12 @@ pub fn create(
         #[cfg(target_os = "macos")]
         "metal" => Ok(Box::new(crate::gpu::metal::MetalEngine::new(model)?)),
         #[cfg(target_os = "macos")]
-        "ane" => Ok(Box::new(crate::ane::AneEngine::new(model, model_dir)?)),
+        // "ane" is the old name for this backend, kept so existing scripts run.
+        #[cfg(target_os = "macos")]
+        "hybrid" | "ane" => Ok(Box::new(crate::ane::AneEngine::new(model, model_dir)?)),
         other => Err(format!(
             "unknown backend \"{other}\" — available: cpu{}",
-            if cfg!(target_os = "macos") { ", metal, ane" } else { "" }
+            if cfg!(target_os = "macos") { ", metal, hybrid" } else { "" }
         )
         .into()),
     }

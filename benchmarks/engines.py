@@ -71,9 +71,9 @@ def _lokal_cli(backend):
 
 ENGINES = {
     "lokal-metal": _lokal_http("metal"),
-    "lokal-ane": _lokal_http("ane"),
+    "lokal-ane": _lokal_http("hybrid"),
     "lokal-metal-cli": _lokal_cli("metal"),
-    "lokal-ane-cli": _lokal_cli("ane"),
+    "lokal-ane-cli": _lokal_cli("hybrid"),
     "llamacpp": {
         # llama.cpp splits one KV allocation across its parallel slots, so a
         # 4-way run at N tokens needs 4x the context a single-stream run does.

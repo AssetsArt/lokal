@@ -25,13 +25,14 @@ ones lokal loses — they exist to steer the roadmap, not to advertise.
   row in `results.jsonl` carries the machine state it was measured under.
   All four engines below were measured back-to-back in one quiet session.
 
-## Results (2026-08-30, after the flash-prefill rewrite)
+## Results (2026-08-30, after the flash-prefill rewrite and split prefill)
 
 | engine | version | prefill (~500 tok) | prefill tok/s | decode | 4x concurrent aggregate |
 |---|---|---|---|---|---|
-| lokal `-b ane` | main | **0.06 s** | 8,517 | 232 tok/s | **341 tok/s** |
+| lokal `-b hybrid` + split | main | **0.05 s** | **9,920** | 232 tok/s | **343 tok/s** |
+| lokal `-b hybrid` | main | 0.06 s | 8,517 | 232 tok/s | 341 tok/s |
 | lokal `-b metal` | main | 0.06 s | 7,863 | 232 tok/s | 338 tok/s |
-| llama.cpp | b9960 | **0.06 s** | **8,921** | 176 tok/s | 325 tok/s |
+| llama.cpp | b9960 | 0.06 s | 8,749 | 205 tok/s | 326 tok/s |
 | oMLX | 0.6.3 | 0.12 s | 4,332 | **255 tok/s** | 324 tok/s |
 
 vLLM Metal 0.1.0 measured 253 tok/s decode / 217 aggregate on 2026-08-29
@@ -44,15 +45,21 @@ gaps in that column as a tie.
 
 ## Reading
 
-- **Prefill**: llama.cpp, lokal-ane and lokal-metal are now within ~12% of
-  each other at ~500 tokens. lokal-metal's 7,863 tok/s is the 2026-08-30
-  flash-attention + Metal 4 tensor-ops rewrite (from 1,461 the same
-  morning) — the same matmul mechanism llama.cpp's Metal backend uses. The
-  ane number is the Neural Engine doing the same work off-GPU.
-- **Decode**: oMLX leads single-stream (255), lokal holds 232 on both
-  backends, llama.cpp trails at 176 (its own number moved 215 → 176 across
-  our two measurement days with the same binary; server flags differ, so
-  read that spread as configuration sensitivity, not a ranking).
+- **Prefill**: the three single-device numbers sit within ~12% of each other
+  — lokal-metal's 7,863 tok/s is the 2026-08-30 flash-attention + Metal 4
+  tensor-ops rewrite (from 1,461 the same morning), the same matmul
+  mechanism llama.cpp's Metal backend uses, and lokal-ane is the Neural
+  Engine doing that work off-GPU. The top row is what neither competitor
+  can do: **split prefill** runs the front layers of each chunk on the ANE
+  while the GPU works the back layers of the previous chunk, so one prompt
+  uses both engines at once — 9,920 tok/s, measured back-to-back against
+  llama.cpp's 8,749 in the same session. It is opt-in
+  (`LOKAL_SPLIT_PREFILL=1`) because it needs its own exported graph ladder;
+  see the ANE setup notes in the root README.
+- **Decode**: oMLX leads single-stream (255) and lokal holds 232 on every
+  backend — split prefill does not touch decode. llama.cpp's own decode
+  number moved 176 → 205 between two runs of the same binary an hour apart,
+  which is the honest size of run-to-run spread in this column.
 - **Concurrency**: continuous batching (one weight read serves every active
   request) puts both lokal backends at the top of the aggregate column. The
   historic gap between them is gone: metal's admission stall was prompt
