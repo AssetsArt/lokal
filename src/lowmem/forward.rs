@@ -13,21 +13,6 @@
 use super::pool::{Admit, Bind, PagedTensor, PendingConvert, PoolStats, WeightPool};
 use super::{dequant_row_ref, AttnWeights, Fam, FullAttn, LayerWeights, LowMemEngine, SrcType};
 
-/// The attention half of a layer, for the paths that only handle full
-/// attention. qwen35's gated-deltanet blocks take a different route entirely
-/// (different tensors, different state), so they are dispatched before these
-/// paths are reached rather than being folded in behind an Option.
-fn full_attn(a: &AttnWeights) -> &FullAttn {
-    match a {
-        AttnWeights::Full(f) => f,
-        // Unreachable today: qwen35 construction is still refused in main.rs,
-        // so no linear block can reach here. The deltanet encoder replaces this
-        // arm in the next commit of this lane.
-        AttnWeights::Linear(_) => {
-            panic!("qwen35 gated-deltanet block reached the full-attention path — not wired yet")
-        }
-    }
-}
 use crate::engine::Session;
 use crate::gpu::metal as gpu;
 use half::{bf16, f16};
@@ -122,13 +107,53 @@ pub(super) struct LowMemSession<'a> {
     /// read-modify-written once per step by the kernel lane. ONE live state
     /// per sequence — no rollback in v1: a session serves exactly one prompt
     /// and serve builds a fresh session per request, so nothing ever rewinds.
-    #[allow(dead_code)] // read-modify-write lands with the qwen35 kernel lane
     q35: Option<crate::gpu::metal::Qwen35States>,
+    /// qwen35 only: the deltanet block's working buffers. `None` on every other
+    /// architecture, so nothing else pays for them.
+    ds: Option<DeltaScratch>,
     /// Pool counters as they stood when prefill finished, so the drop line can
     /// report decode's staging on its own. Decode is where residency is proved:
     /// prefill always stages the model once, decode must stage nothing.
     mark: PoolStats,
     decode_steps: u64,
+}
+
+/// The gated-deltanet block's scratch. Sized from the deltanet geometry, not
+/// from hidden_size: conv_channels (6144 on the 2B) is WIDER than hidden (2048)
+/// and wider than q_proj_dim, so none of the existing buffers can be borrowed
+/// for it — the same width-confusion that has already cost this repo two
+/// overruns, avoided here by giving the block its own buffers.
+struct DeltaScratch {
+    /// [chunk x conv_channels] — the joint qkv projection, conv's input.
+    qkv: Buffer,
+    /// [chunk x d_inner] — the `z` gate, pre-silu.
+    z: Buffer,
+    /// [chunk x n_v_heads] each — the two tiny per-head projections.
+    alpha: Buffer,
+    beta_p: Buffer,
+    /// [n_v_heads] each — one token's activated gates.
+    g: Buffer,
+    beta: Buffer,
+    /// [conv_channels] — one token's post-silu conv output, split into q|k|v.
+    conv_out: Buffer,
+    /// [chunk x d_inner] — the block's output, before the out projection.
+    dout: Buffer,
+}
+
+impl DeltaScratch {
+    fn new(d: &metal::Device, dims: crate::lowmem::qwen35_ref::DeltaDims, chunk: usize) -> Self {
+        let (c, inner, hv) = (dims.conv_channels(), dims.d_inner(), dims.n_v_heads);
+        Self {
+            qkv: gpu::f32_buffer(d, chunk * c),
+            z: gpu::f32_buffer(d, chunk * inner),
+            alpha: gpu::f32_buffer(d, chunk * hv),
+            beta_p: gpu::f32_buffer(d, chunk * hv),
+            g: gpu::f32_buffer(d, hv),
+            beta: gpu::f32_buffer(d, hv),
+            conv_out: gpu::f32_buffer(d, c),
+            dout: gpu::f32_buffer(d, chunk * inner),
+        }
+    }
 }
 
 impl<'a> LowMemSession<'a> {
@@ -170,6 +195,7 @@ impl<'a> LowMemSession<'a> {
                 .q35_layout
                 .as_ref()
                 .map(|l| crate::gpu::metal::Qwen35States::new(d, l)),
+            ds: e.delta_dims().map(|dd| DeltaScratch::new(d, dd, chunk)),
             partials: gpu::f32_buffer(
                 d,
                 cfg.num_attention_heads * (cap / gpu::ATTN_SPLIT) * (e.dims.head_dim + 2),
@@ -439,24 +465,169 @@ impl<'a> LowMemSession<'a> {
     /// decode's reach at n_rows == 1). Mirrors MetalSession::run_from's prefill
     /// arm minus the tensor-ops staging; K/V land in the sink+ring store, in at
     /// most three contiguous spans, and RoPE runs with TRUE absolute positions.
+    /// qwen35's gated-deltanet block, for `n` tokens already projected into the
+    /// deltanet scratch. Token by token, because this is the DECODE form — plan
+    /// v1 runs prefill through it one position at a time (the chunked form with
+    /// solve_tri/cumsum is a later lane). Both recurrent states roll across the
+    /// loop, so the token order here is load-bearing.
+    ///
+    /// Op order is llama.cpp's (src/models/qwen35.cpp build_linear_attn), and
+    /// the whole chain is verified against lane B's reference on real weights by
+    /// gpu::metal's `deltanet_block_matches_reference_on_real_weights`. Dispatches
+    /// inside one compute encoder are serial, so the chain needs no barriers.
+    fn enc_delta_block(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        la: &super::LinearAttn,
+        l: usize,
+        n: usize,
+    ) {
+        let e = self.e;
+        let d = e.delta_dims().expect("deltanet dims on a qwen35 checkpoint");
+        let ds = self.ds.as_ref().expect("deltanet scratch on a qwen35 session");
+        let st = self.q35.as_ref().expect("qwen35 states").layers[l]
+            .as_ref()
+            .expect("every linear layer owns recurrent state");
+        let eps = e.cfg.rms_norm_eps;
+        let (s_dim, hv, hk) = (d.d_state, d.n_v_heads, d.n_k_heads);
+        let (key_dim, inner, c_all) = (s_dim * hk, d.d_inner(), d.conv_channels());
+
+        for t in 0..n {
+            let (goff, coff, zoff) = ((t * hv * 4) as u64, (t * c_all * 4) as u64, (t * inner * 4) as u64);
+
+            // 1. the two per-head scalars. beta is SIGMOIDED inside the kernel.
+            enc.set_compute_pipeline_state(&e.pipes.delta_gates);
+            enc.set_buffer(0, Some(&ds.alpha), goff);
+            enc.set_buffer(1, Some(&ds.beta_p), goff);
+            enc.set_buffer(2, Some(&la.a), 0);
+            enc.set_buffer(3, Some(&la.dt_bias), 0);
+            enc.set_buffer(4, Some(&ds.g), 0);
+            enc.set_buffer(5, Some(&ds.beta), 0);
+            set_bytes(enc, 6, &(hv as u32));
+            gpu::dispatch_grid(enc, hv);
+
+            // 2. depthwise conv + silu, rolling the conv state in place.
+            #[repr(C)]
+            struct ConvP {
+                channels: u32,
+                d_conv: u32,
+            }
+            enc.set_compute_pipeline_state(&e.pipes.ssm_conv_decode);
+            enc.set_buffer(0, Some(&st.conv), 0);
+            enc.set_buffer(1, Some(&ds.qkv), coff);
+            enc.set_buffer(2, Some(&la.conv1d), 0);
+            enc.set_buffer(3, Some(&ds.conv_out), 0);
+            set_bytes(enc, 4, &ConvP { channels: c_all as u32, d_conv: d.d_conv as u32 });
+            gpu::dispatch_grid(enc, c_all);
+
+            // 3. l2-normalise q and k per K head, in place on their slices.
+            for off in [0u64, (key_dim * 4) as u64] {
+                enc.set_compute_pipeline_state(&e.pipes.l2norm_rows);
+                enc.set_buffer(0, Some(&ds.conv_out), off);
+                set_bytes(enc, 1, &(s_dim as u32));
+                set_bytes(enc, 2, &eps);
+                enc.dispatch_thread_groups(MTLSize::new(hk as u64, 1, 1), MTLSize::new(256, 1, 1));
+            }
+
+            // 4. the delta rule. q/k/v are three views of the conv output.
+            #[repr(C)]
+            struct DeltaP {
+                d_state: u32,
+                n_v_heads: u32,
+                group: u32,
+            }
+            enc.set_compute_pipeline_state(&e.pipes.delta_decode_step);
+            enc.set_buffer(0, Some(&st.delta), 0);
+            enc.set_buffer(1, Some(&ds.conv_out), 0);
+            enc.set_buffer(2, Some(&ds.conv_out), (key_dim * 4) as u64);
+            enc.set_buffer(3, Some(&ds.conv_out), (2 * key_dim * 4) as u64);
+            enc.set_buffer(4, Some(&ds.g), 0);
+            enc.set_buffer(5, Some(&ds.beta), 0);
+            enc.set_buffer(6, Some(&ds.dout), zoff);
+            set_bytes(
+                enc,
+                7,
+                &DeltaP { d_state: s_dim as u32, n_v_heads: hv as u32, group: (hv / hk) as u32 },
+            );
+            gpu::dispatch_grid(enc, s_dim * hv);
+
+            // 5. per-head RMSNorm gated by silu(z), in place on this row.
+            enc.set_compute_pipeline_state(&e.pipes.gated_output_norm);
+            enc.set_buffer(0, Some(&ds.dout), zoff);
+            enc.set_buffer(1, Some(&la.ssm_norm), 0);
+            enc.set_buffer(2, Some(&ds.z), zoff);
+            set_bytes(enc, 3, &(s_dim as u32));
+            set_bytes(enc, 4, &eps);
+            enc.dispatch_thread_groups(MTLSize::new(hv as u64, 1, 1), MTLSize::new(256, 1, 1));
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn encode_layer_prefill(
+    /// qwen35's linear block, prefill form: the four projections, the deltanet
+    /// chain token by token, then the output projection and the residual add.
+    /// Mirrors what the attention half does around it, so the caller's shared
+    /// norms and MLP need no special case.
+    fn enc_delta_prefill(
         &self,
         enc: &ComputeCommandEncoderRef,
         pool: &WeightPool,
-        lw: &LayerWeights,
+        la: &super::LinearAttn,
+        l: usize,
+        n: usize,
+    ) {
+        let e = self.e;
+        let h = e.cfg.hidden_size;
+        let d = e.delta_dims().expect("deltanet dims on a qwen35 checkpoint");
+        let ds = self.ds.as_ref().expect("deltanet scratch on a qwen35 session");
+        let (hv, inner, c_all) = (d.n_v_heads, d.d_inner(), d.conv_channels());
+        self.enc_matmul_paged(enc, pool, &la.qkv, &self.xn, &ds.qkv, n, 0, c_all);
+        self.enc_matmul_paged(enc, pool, &la.z_gate, &self.xn, &ds.z, n, 0, inner);
+        self.enc_matmul_paged(enc, pool, &la.alpha, &self.xn, &ds.alpha, n, 0, hv);
+        self.enc_matmul_paged(enc, pool, &la.beta, &self.xn, &ds.beta_p, n, 0, hv);
+        self.enc_delta_block(enc, la, l, n);
+        self.enc_matmul_paged(enc, pool, &la.out, &ds.dout, &self.xb, n, 0, h);
+        self.enc_elem(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
+    }
+
+    /// The same block in decode form: matvec-family projections against the
+    /// bound pages, one token, and the output projection ACCUMULATED straight
+    /// into x — exactly how the attention path spends its o_proj.
+    fn enc_delta_decode(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        plan: &AttnPlan,
+        la: &super::LinearAttn,
+        l: usize,
+    ) {
+        let ds = self.ds.as_ref().expect("deltanet scratch on a qwen35 session");
+        let (p_qkv, p_z, p_out, p_alpha, p_beta) = plan.linear();
+        self.enc_matvec_bound(enc, Fam::Mv, &la.qkv, p_qkv, &self.xn, &ds.qkv, 0, 4);
+        self.enc_matvec_bound(enc, Fam::Mv, &la.z_gate, p_z, &self.xn, &ds.z, 0, 4);
+        self.enc_matvec_bound(enc, Fam::Mv, &la.alpha, p_alpha, &self.xn, &ds.alpha, 0, 4);
+        self.enc_matvec_bound(enc, Fam::Mv, &la.beta, p_beta, &self.xn, &ds.beta_p, 0, 4);
+        self.enc_delta_block(enc, la, l, 1);
+        self.enc_matvec_bound(enc, Fam::MvA, &la.out, p_out, &ds.dout, &self.x, 0, 4);
+    }
+
+    /// The full-attention half of a layer: the Q/K/V projections through the
+    /// output projection's residual add. Split out so qwen35's linear blocks can
+    /// take their own route BETWEEN the two norms, which both kinds share.
+    #[allow(clippy::too_many_arguments)]
+    fn enc_attn_prefill(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        pool: &WeightPool,
+        fa: &FullAttn,
         l: usize,
         pos0: usize,
         n: usize,
     ) {
         let e = self.e;
         let cfg = &e.cfg;
-        let fa = full_attn(&lw.attn);
         let (h, hd, kvd) = (cfg.hidden_size, self.e.dims.head_dim, self.e.dims.kv_dim);
         let v_base = (self.chunk * kvd * 4) as u64; // V's half of the kvs staging
 
         // Attention half.
-        self.enc_rmsnorm(enc, &self.x, 0, &lw.input_ln, &self.xn, n);
         self.enc_matmul_paged(enc, pool, &fa.q, &self.xn, &self.q, n, 0, self.e.dims.q_proj_dim);
         self.enc_matmul_paged(enc, pool, &fa.k, &self.xn, &self.kvs, n, 0, kvd);
         self.enc_matmul_paged(enc, pool, &fa.v, &self.xn, &self.kvs, n, v_base, kvd);
@@ -538,6 +709,28 @@ impl<'a> LowMemSession<'a> {
         }
         self.enc_matmul_paged(enc, pool, &fa.o, &self.att, &self.xb, n, 0, h);
         self.enc_elem(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_layer_prefill(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        pool: &WeightPool,
+        lw: &LayerWeights,
+        l: usize,
+        pos0: usize,
+        n: usize,
+    ) {
+        let e = self.e;
+        let cfg = &e.cfg;
+        let h = cfg.hidden_size;
+        // Both block kinds share the two norms and the SwiGLU MLP; only what
+        // sits between them differs.
+        self.enc_rmsnorm(enc, &self.x, 0, &lw.input_ln, &self.xn, n);
+        match &lw.attn {
+            AttnWeights::Full(fa) => self.enc_attn_prefill(enc, pool, fa, l, pos0, n),
+            AttnWeights::Linear(la) => self.enc_delta_prefill(enc, pool, la, l, n),
+        }
 
         // SwiGLU MLP half.
         self.enc_rmsnorm(enc, &self.x, 0, &lw.post_ln, &self.xn, n);
@@ -551,24 +744,25 @@ impl<'a> LowMemSession<'a> {
     /// One decode step (n == 1): matvec-family kernels, flash-decoding attention
     /// over the WHOLE bounded store (every split dispatched; masks sort validity
     /// — the split count is a constant, which is what makes decode cost flat).
-    fn encode_layer_decode(
+    /// The full-attention half of a decode step: projections, qk-norm, rope,
+    /// flash-decoding attention, and the output projection accumulated into x.
+    fn enc_attn_decode(
         &self,
         enc: &ComputeCommandEncoderRef,
-        plan: &LayerPlan,
-        lw: &LayerWeights,
+        plan: &AttnPlan,
+        fa: &FullAttn,
         l: usize,
         pos: usize,
     ) {
+        let (pq, pk, pv, po) = plan.full();
         let e = self.e;
         let cfg = &e.cfg;
-        let fa = full_attn(&lw.attn);
         let hd = e.dims.head_dim;
         let kv_byte_off = (e.win.slot_of(pos) * e.dims.kv_dim * 2) as u64;
 
-        self.enc_rmsnorm(enc, &self.x, 0, &lw.input_ln, &self.xn, 1);
-        self.enc_matvec_bound(enc, Fam::Mv, &fa.q, &plan.q, &self.xn, &self.q, 0, 4);
-        self.enc_matvec_bound(enc, Fam::MvH, &fa.k, &plan.k, &self.xn, &self.k_cache[l], kv_byte_off, 2);
-        self.enc_matvec_bound(enc, Fam::MvH, &fa.v, &plan.v, &self.xn, &self.v_cache[l], kv_byte_off, 2);
+        self.enc_matvec_bound(enc, Fam::Mv, &fa.q, pq, &self.xn, &self.q, 0, 4);
+        self.enc_matvec_bound(enc, Fam::MvH, &fa.k, pk, &self.xn, &self.k_cache[l], kv_byte_off, 2);
+        self.enc_matvec_bound(enc, Fam::MvH, &fa.v, pv, &self.xn, &self.v_cache[l], kv_byte_off, 2);
         if let (Some(qn), Some(kn)) = (&fa.q_norm, &fa.k_norm) {
             self.enc_rmsnorm_dim(enc, &self.q, 0, qn, cfg.num_attention_heads, hd);
             self.enc_rmsnorm_h(enc, &self.k_cache[l], kv_byte_off, kn, cfg.num_key_value_heads, hd);
@@ -619,7 +813,25 @@ impl<'a> LowMemSession<'a> {
                 MTLSize::new(hd as u64, 1, 1),
             );
         }
-        self.enc_matvec_bound(enc, Fam::MvA, &fa.o, &plan.o, &self.att, &self.x, 0, 4);
+        self.enc_matvec_bound(enc, Fam::MvA, &fa.o, po, &self.att, &self.x, 0, 4);
+    }
+
+    fn encode_layer_decode(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        plan: &LayerPlan,
+        lw: &LayerWeights,
+        l: usize,
+        pos: usize,
+    ) {
+        let e = self.e;
+        let cfg = &e.cfg;
+        // Shared with the linear block: the two norms and the MLP.
+        self.enc_rmsnorm(enc, &self.x, 0, &lw.input_ln, &self.xn, 1);
+        match &lw.attn {
+            AttnWeights::Full(fa) => self.enc_attn_decode(enc, &plan.attn, fa, l, pos),
+            AttnWeights::Linear(la) => self.enc_delta_decode(enc, &plan.attn, la, l),
+        }
 
         self.enc_rmsnorm(enc, &self.x, 0, &lw.post_ln, &self.xn, 1);
         // SwiGLU: gate and up share [inter, h], so their pages split identically.
@@ -817,13 +1029,37 @@ fn layer_pages(lw: &LayerWeights) -> Vec<(&PagedTensor, usize)> {
 
 /// Where each decode dispatch reads a layer's weights from.
 struct LayerPlan {
-    q: Vec<Bind>,
-    k: Vec<Bind>,
-    v: Vec<Bind>,
-    o: Vec<Bind>,
+    attn: AttnPlan,
     gate: Vec<Bind>,
     up: Vec<Bind>,
     down: Vec<Bind>,
+}
+
+/// Page bindings for the attention half, mirroring `AttnWeights` arm for arm.
+/// Kept an enum for the same reason the weights are: the arms bind disjoint
+/// tensor sets, and a plan that silently held the wrong arm's pages would
+/// underfeed the layer at dispatch time rather than fail to compile.
+enum AttnPlan {
+    Full { q: Vec<Bind>, k: Vec<Bind>, v: Vec<Bind>, o: Vec<Bind> },
+    Linear { qkv: Vec<Bind>, z_gate: Vec<Bind>, out: Vec<Bind>, alpha: Vec<Bind>, beta: Vec<Bind> },
+}
+
+impl AttnPlan {
+    /// The linear block's bindings.
+    fn linear(&self) -> (&[Bind], &[Bind], &[Bind], &[Bind], &[Bind]) {
+        match self {
+            AttnPlan::Linear { qkv, z_gate, out, alpha, beta } => (qkv, z_gate, out, alpha, beta),
+            AttnPlan::Full { .. } => unreachable!("attention block dispatched to the linear path"),
+        }
+    }
+
+    /// The full-attention bindings, for the paths that only handle them.
+    fn full(&self) -> (&[Bind], &[Bind], &[Bind], &[Bind]) {
+        match self {
+            AttnPlan::Full { q, k, v, o } => (q, k, v, o),
+            AttnPlan::Linear { .. } => unreachable!("linear block dispatched to the attention path"),
+        }
+    }
 }
 
 /// Bind one tensor's blocks for a decode-style dispatch, waiting out in-flight
@@ -864,7 +1100,6 @@ fn plan_decode(
     lw: &LayerWeights,
     inflight: &mut Vec<(metal::CommandBuffer, u64)>,
 ) -> crate::Result<(u64, LayerPlan)> {
-    let fa = full_attn(&lw.attn);
     let ep = pool.begin_cb();
     let mut bind_all = |t: &PagedTensor| -> crate::Result<Vec<Bind>> {
         let mut binds = Vec::with_capacity(t.n_pages);
@@ -888,13 +1123,25 @@ fn plan_decode(
         }
         Ok(binds)
     };
+    let attn = match &lw.attn {
+        AttnWeights::Full(f) => AttnPlan::Full {
+            q: bind_all(&f.q)?,
+            k: bind_all(&f.k)?,
+            v: bind_all(&f.v)?,
+            o: bind_all(&f.o)?,
+        },
+        AttnWeights::Linear(l) => AttnPlan::Linear {
+            qkv: bind_all(&l.qkv)?,
+            z_gate: bind_all(&l.z_gate)?,
+            out: bind_all(&l.out)?,
+            alpha: bind_all(&l.alpha)?,
+            beta: bind_all(&l.beta)?,
+        },
+    };
     Ok((
         ep,
         LayerPlan {
-            q: bind_all(&fa.q)?,
-            k: bind_all(&fa.k)?,
-            v: bind_all(&fa.v)?,
-            o: bind_all(&fa.o)?,
+            attn,
             gate: bind_all(&lw.gate)?,
             up: bind_all(&lw.up)?,
             down: bind_all(&lw.down)?,

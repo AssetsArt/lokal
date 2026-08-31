@@ -208,6 +208,14 @@ pub(crate) struct Pipes {
     pub attn_dec_reduce: ComputePipelineState,
     pub silu_mul: ComputePipelineState,
     pub add_inplace: ComputePipelineState,
+    /// qwen35's gated-deltanet block. Built unconditionally (they compile from
+    /// the same source as everything else and cost only pipeline objects) so
+    /// the encoder never has to unwrap an Option mid-dispatch.
+    pub ssm_conv_decode: ComputePipelineState,
+    pub delta_decode_step: ComputePipelineState,
+    pub delta_gates: ComputePipelineState,
+    pub l2norm_rows: ComputePipelineState,
+    pub gated_output_norm: ComputePipelineState,
 }
 
 /// The matvec family specialized with LM_W_BF16: weight buffers are RAW bf16
@@ -427,6 +435,14 @@ fn qwen35_hf_name(gguf: &str) -> Option<String> {
     match mid {
         "ssm_a" => Some(format!("model.layers.{i}.gguf.ssm_a")),
         _ => None,
+    }
+}
+
+impl LowMemEngine {
+    /// The deltanet geometry, in the form the kernels and the reference both
+    /// speak. None on every non-qwen35 checkpoint.
+    pub(crate) fn delta_dims(&self) -> Option<qwen35_ref::DeltaDims> {
+        self.q35_dims
     }
 }
 
@@ -715,6 +731,12 @@ pub struct LowMemEngine {
     /// qwen35 only: what sessions allocate their recurrent state from.
     /// None on every other architecture (existing paths untouched).
     q35_layout: Option<crate::gpu::metal::Qwen35Layout>,
+    /// qwen35 only: the deltanet geometry the kernels take as parameters.
+    /// Stored as DeltaDims rather than the raw Qwen35Meta because that is what
+    /// both the kernels and lane B's reference speak, it is Copy, and it avoids
+    /// this file depending on a `Clone` that gguf.rs (the loader lane's file)
+    /// does not derive.
+    q35_dims: Option<qwen35_ref::DeltaDims>,
     /// LOKAL_LOWMEM_SYNC=1: wait out every command buffer before the next —
     /// the bisect mode for anything that smells like an eviction race.
     sync: bool,
@@ -882,6 +904,11 @@ impl LowMemEngine {
             attn_dec_reduce: pipe("attention_decode_reduce")?,
             silu_mul: pipe("silu_mul")?,
             add_inplace: pipe("add_inplace")?,
+            ssm_conv_decode: pipe("ssm_conv_decode")?,
+            delta_decode_step: pipe("delta_decode_step")?,
+            delta_gates: pipe("delta_gates")?,
+            l2norm_rows: pipe("l2norm_rows")?,
+            gated_output_norm: pipe("gated_output_norm")?,
         };
         let direct = DirectPipes {
             matvec: qtype_pipe("matvec", 1)?,
@@ -1059,6 +1086,12 @@ impl LowMemEngine {
             sync: std::env::var("LOKAL_LOWMEM_SYNC").is_ok_and(|v| v == "1"),
             win,
             q35_layout,
+            q35_dims: q35_meta.as_ref().map(|m| qwen35_ref::DeltaDims {
+                d_state: m.d_state,
+                n_v_heads: m.dt_rank,
+                n_k_heads: m.n_group,
+                d_conv: m.d_conv,
+            }),
             clip_flag,
             clip_warned: std::sync::atomic::AtomicBool::new(false),
             cfg,
