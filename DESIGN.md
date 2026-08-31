@@ -213,6 +213,10 @@ publish a number that hides this asymmetry.
 
 Four pieces (all in `src/lowmem/`):
 
+- **LowMemSource** (mod.rs): the checkpoint, in whichever format it arrived.
+  Safetensors and GGUF differ in how a row is found and what it holds, and in
+  nothing else the pool cares about, so the difference is confined to this one
+  type rather than smeared through the pager.
 - **WeightManifest** (manifest.rs): every safetensors shard mmapped once,
   headers parsed to a name → {dtype, shape, byte range} table. Nothing is read
   up front; the mmap is the source of truth and the OS is free to drop clean
@@ -242,6 +246,91 @@ Four pieces (all in `src/lowmem/`):
   The kernels are the same flash/GQA-decode kernels the metal backend runs,
   specialized through function constants; unspecialized they compile to
   exactly the metal code.
+
+**GGUF checkpoints.** `-b lowmem` reads the ecosystem's pre-quantized files
+directly, and this is the backend where that matters most: quantized weights
+are held in the pool **raw**, exactly as the file stores them, so a Q4 model
+occupies about a quarter of what its bf16 twin would and a 14B Q4_K_M becomes
+fully resident on a 16 GB machine. Dequantizing at stage time would hand that
+entire factor back, so a page is a whole number of quantized blocks and the
+kernels dequantize at read time instead. Consequences worth knowing:
+
+- **Two shader libraries.** The quantized matvec family compiles from a second
+  library with fast math OFF. Metal's default contracts `a*b+c` into an fma
+  whose intermediate carries extra precision, and the dequant path has to agree
+  with a strict-IEEE CPU reference to the last ulp — the values a quantizer
+  produces are exactly where the two disagree. Everything else keeps the fast
+  library, so the metal backend's numerics are untouched.
+- **Pipelines are per type PRESENT, and selected per TENSOR.** The encoding is
+  a function constant, so each type multiplies the whole family; building the
+  six supported types when a file mentions three would spend startup seconds
+  for nothing. Selection cannot be per layer either — Q4_K_M genuinely mixes
+  encodings inside one layer (a 0.5B file carries Q4_K, Q6_K, Q8_0 and 133
+  Q5_0 tensors), so each tensor is read by the pipeline for its own type.
+- **llama-arch q/k are un-permuted at materialization.** llama.cpp's converter
+  stores those rows rotated to suit GGML's adjacent-pair RoPE, while lokal
+  rotates halves. The inverse is applied as the page is built, where it is a
+  pure row reorder that works on quantized blocks untouched. Deliberately not
+  compensated inside the dequant kernels: a shuffle buried there would make
+  every future llama-arch GGUF silently wrong, and it is only detectable
+  against a safetensors twin — a GGUF-vs-GGUF check shares the loader and
+  passes either way.
+- **qwen3** states `head_dim` explicitly and does not satisfy
+  `hidden_size / n_heads` (0.6B is hidden 1024 across 16 heads of 128), so
+  every attention width comes from the checkpoint rather than that derivation.
+  It also normalizes each head of q and k before RoPE; prefill does that on the
+  f32 buffers before K converts into the cache, decode does it in place on the
+  f16 cache row.
+- **A quantized embedding table stays quantized**, gathered and dequantized one
+  row per token — the same reasoning that keeps the f16 table off the GPU.
+
+Correctness rests on a bit-for-bit oracle rather than on output looking
+reasonable: GPU dequantization is compared against the CPU reference on
+adversarial blocks (subnormal scales, all-zero, max-magnitude) for every type,
+and against a second reference transcribed independently from `ggml-quants.c`,
+because two references catch a shared misreading of ggml that one cannot.
+End to end, an F16 GGUF must generate **byte-identical** text to the same
+weights in safetensors — same values, same math, no quantization noise to hide
+behind — and a real quantized file is checked against llama.cpp on the same
+file, where agreement rather than identity is the bar.
+
+**Residency is asserted, not assumed.** `LOKAL_LOWMEM_STATS=1` prints one line
+per session splitting stage-ins at the prefill/decode boundary, because prefill
+always stages the model once and only decode proves residency. It counts direct
+checkpoint reads beside staged pages: an over-budget page does not stage at
+all, so a stage-in count alone would call a run that streamed 1.5 GB in eight
+decode steps "resident". A checkpoint that fits shows zeros in both.
+
+Those counters prove the POOL did not restage, which is **not** the same claim
+as the pages being in RAM. A pool that fits `--memory-budget` but not the
+machine reports perfect residency while the OS swaps it: a 14B Q4 at budget
+12000 on a box with 3.2 GB free showed zero stage-ins beside 1.7 million
+swapins in six decode tokens. Residency is therefore asserted at both levels —
+the gate samples `vm_stat` around the run and fails with "pool is resident but
+the MACHINE is not". The tell is a U-curve: if a SMALLER budget runs faster,
+the right arm is swap thrash, not streaming.
+
+**Streaming, and one path deliberately left off.** A page that does not fit the
+budget is not staged at all: it is read straight from the checkpoint's mmap
+through a no-copy Metal view, so streamed bytes cross the bus once. For bf16
+that needs its own pipeline (the pool holds f16, the file holds bf16); for
+quantized weights it needs none, because a pool page and a file span hold the
+same blocks and the staged pipeline reads either.
+
+Quantized direct-read nonetheless ships **off by default**, behind
+`LOKAL_LOWMEM_QDIRECT=1`. Spans admitted at 4- or 16-byte alignment decode into
+garbage, while 64 and 128 are exact; Q4_K alone reproduces it, and since every
+offset here is already 32-aligned (GGUF aligns tensor data to 32, the view base
+to a page), what fails is precisely the 32-mod-64 spans. That is a bound, not a
+mechanism. The obvious suspect — a widened `u16`/`u32` load over Q4_K's
+`d`/`dmin`/packed-scale area, which Metal leaves undefined when misaligned —
+has been **ruled out**: `lm_f16_at` assembles halves byte-wise
+(`p[0] | (p[1] << 8)`) and the 6-bit scales are read a byte at a time, so no
+load in the dequant path is wider than one byte. The remaining suspect is
+`setBuffer:offset:` semantics against a `newBufferWithBytesNoCopy` view.
+Whoever picks this up: reproduce with Qwen3-0.6B-Q4_K_M at a 200 MB pool, and
+do not flip the default until the mechanism is named — the staged fallback is
+exact and always available, so the only thing at stake is streaming speed.
 
 **Budget.** `--memory-budget` (4096 MB) splits closed-form: KV and activation
 scratch are computed exactly, a fixed overhead estimate covers the runtime,
@@ -306,6 +395,31 @@ Metal's — the ANE changes time-to-first-token only, and at chat latencies
 grows (attention's cost is linear in cached positions), but flash-decoding
 flattened the slide dramatically: before it, the same run decoded at
 ~76 tok/s; the remaining per-position cost is mostly the f32 KV cache reads.
+
+## GGUF: what runs today (M1 Pro, 16 GB, greedy)
+
+Capability first, because on a 16 GB machine that is the claim that matters:
+
+| checkpoint | file | result |
+|---|---|---|
+| Qwen3-32B Q4_K_M | 19.76 GB | opens and answers correctly — a 32B on a 16 GB box |
+| Qwen2.5-14B Q4_K_M | 8.99 GB | pool-resident, answers correctly |
+| Qwen3-0.6B Q4_K_M | 0.46 GB | **5/5 prompts byte-identical to llama.cpp** over 48 greedy tokens |
+| SmolLM2-135M F16 | — | byte-identical to the same weights in safetensors |
+
+Decode throughput, models small enough to be genuinely resident on this box:
+
+| checkpoint | decode |
+|---|---|
+| Qwen2.5-0.5B Q4_K_M | ~120 tok/s |
+| Qwen2.5-0.5B Q8_0 | ~114 tok/s |
+
+The 14B and 32B decode rows are **pending a memory-quiet window** and are
+deliberately absent rather than estimated. Both were measured, and both are
+contaminated: with only ~3 GB free the box swapped through the run, so the
+figure describes what else was resident on the machine rather than what the
+engine does. A reader on an idle 16 GB M1 Pro would not reproduce it, which is
+the only test a published row has to pass.
 
 ## Where the time goes
 

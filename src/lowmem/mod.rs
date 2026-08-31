@@ -19,9 +19,11 @@ mod pool;
 use crate::config::ModelConfig;
 use crate::engine::{Engine, Session};
 use crate::gpu::metal as gpu;
-use manifest::WeightManifest;
-use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, FunctionConstantValues, MTLDataType};
+use manifest::{dequant_row_ref, GgmlType, WeightManifest};
+use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, FunctionConstantValues, MTLDataType, MTLResourceOptions};
 use pool::{PagedTensor, WeightPool, PAGE_BYTES};
+use safetensors::Dtype;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -44,8 +46,41 @@ struct MemoryPlan {
     pool_bytes: usize,
 }
 
-fn memory_plan(cfg: &ModelConfig, win: &WindowCfg, budget_mb: usize) -> crate::Result<MemoryPlan> {
-    let (h, hd, kvd) = (cfg.hidden_size, cfg.head_dim(), cfg.kv_dim());
+/// Attention widths, taken from the checkpoint rather than derived.
+///
+/// ModelConfig::head_dim() computes hidden_size / n_heads, which qwen3 breaks:
+/// it states head_dim explicitly and it does NOT satisfy that identity
+/// (Qwen3-0.6B is hidden 1024, 16 heads, head_dim 128, so q_proj is
+/// [2048, 1024], not [1024, 1024]). Every width inside lowmem comes from here.
+#[derive(Clone, Copy)]
+pub(crate) struct Dims {
+    pub hidden: usize,
+    pub head_dim: usize,
+    /// n_heads * head_dim — the q and o projections' outer width.
+    pub q_dim: usize,
+    /// n_kv_heads * head_dim.
+    pub kv_dim: usize,
+}
+
+impl Dims {
+    fn new(cfg: &ModelConfig, head_dim: Option<usize>) -> Self {
+        let head_dim = head_dim.unwrap_or_else(|| cfg.head_dim());
+        Dims {
+            hidden: cfg.hidden_size,
+            head_dim,
+            q_dim: cfg.num_attention_heads * head_dim,
+            kv_dim: cfg.num_key_value_heads * head_dim,
+        }
+    }
+}
+
+fn memory_plan(
+    cfg: &ModelConfig,
+    dims: Dims,
+    win: &WindowCfg,
+    budget_mb: usize,
+) -> crate::Result<MemoryPlan> {
+    let (h, hd, kvd) = (dims.hidden, dims.head_dim, dims.kv_dim);
     let chunk = gpu::PREFILL_CHUNK;
     // KV store: K and V, f16, cap slots per layer — closed-form in the window.
     let kv_bytes = cfg.num_hidden_layers * win.cap * kvd * 2 * 2;
@@ -116,6 +151,8 @@ impl WindowCfg {
 /// compiled from the same source string as the metal backend's.
 pub(crate) struct Pipes {
     pub rmsnorm: ComputePipelineState,
+    /// qwen3 qk-norm on the f16 KV cache, in place.
+    pub rmsnorm_h_inplace: ComputePipelineState,
     pub matvec: ComputePipelineState,
     pub matvec_h: ComputePipelineState,
     pub matvec_acc: ComputePipelineState,
@@ -146,10 +183,36 @@ pub(crate) struct DirectPipes {
     pub matvec_swiglu: ComputePipelineState,
 }
 
+/// The matvec family plus the prefill GEMM, specialized for ONE quantized
+/// weight encoding. Built from the PRECISE library: Metal's fast math contracts
+/// multiply-add pairs, which silently breaks bit-for-bit agreement with the
+/// strict-IEEE Rust reference the oracle gate compares against. The existing
+/// f16/bf16 pipelines keep the fast library, so -b metal's numerics never move.
+pub(crate) struct QuantPipes {
+    pub matvec: ComputePipelineState,
+    pub matvec_h: ComputePipelineState,
+    pub matvec_acc: ComputePipelineState,
+    pub matvec_swiglu: ComputePipelineState,
+    pub matmul_pg: ComputePipelineState,
+}
+
+/// Which member of the matvec family a call site wants; the weight's own type
+/// picks the specialization.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fam {
+    Mv,
+    MvH,
+    MvA,
+}
+
 /// One transformer block: eagerly-resident norms, paged projection matrices.
 pub(crate) struct LayerWeights {
     pub input_ln: Buffer,
     pub post_ln: Buffer,
+    /// qwen3's per-head q/k RMSNorm weights (head_dim each), applied to every
+    /// head of q and k before RoPE. None on architectures without qk-norm.
+    pub q_norm: Option<Buffer>,
+    pub k_norm: Option<Buffer>,
     pub q: PagedTensor,
     pub k: PagedTensor,
     pub v: PagedTensor,
@@ -159,13 +222,320 @@ pub(crate) struct LayerWeights {
     pub down: PagedTensor,
 }
 
+/// What a weight's elements are, across both checkpoint formats. Safetensors
+/// gives f32/f16/bf16; GGUF adds the quantized block types, whose rows are not
+/// element-addressable — a row is a whole number of blocks, and the pool holds
+/// those blocks RAW (dequantizing at stage time would forfeit the 4x residency
+/// that is this backend's reason to exist).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SrcType {
+    F32,
+    F16,
+    BF16,
+    Quant(GgmlType),
+}
+
+impl SrcType {
+    /// Bytes one row of `cols` elements occupies in the checkpoint.
+    pub fn row_bytes(self, cols: usize) -> usize {
+        match self {
+            SrcType::F32 => cols * 4,
+            SrcType::F16 | SrcType::BF16 => cols * 2,
+            SrcType::Quant(t) => t.row_bytes(cols),
+        }
+    }
+
+    pub fn is_quant(self) -> bool {
+        matches!(self, SrcType::Quant(_))
+    }
+
+    /// The LM_W_QTYPE function-constant selector this type builds pipelines
+    /// under. Kept beside row_bytes so the two never drift apart.
+    pub fn qtype(self) -> u32 {
+        match self {
+            SrcType::F32 | SrcType::F16 => 0,
+            SrcType::BF16 => 1,
+            SrcType::Quant(GgmlType::Q8_0) => 2,
+            SrcType::Quant(GgmlType::Q4_0) => 3,
+            SrcType::Quant(GgmlType::Q4_K) => 4,
+            SrcType::Quant(GgmlType::Q6_K) => 5,
+            SrcType::Quant(GgmlType::Q5_K) => 6,
+            SrcType::Quant(GgmlType::Q5_0) => 7,
+            SrcType::Quant(_) => u32::MAX, // refused at PagedTensor::new
+        }
+    }
+}
+
+/// The checkpoint behind the pool. Safetensors and GGUF differ in how a row is
+/// found and what it holds, and in nothing else the pool cares about, so the
+/// difference is confined here rather than smeared through pool.rs.
+///
+/// This lives in lowmem's own module, not in the seam: manifest.rs belongs to
+/// the loader lane, and the abstraction the seam ruling named never landed
+/// (challenge on gguf-kernels). Both variants are built from public seam items.
+pub(crate) enum LowMemSource {
+    Safetensors(WeightManifest),
+    Gguf(Box<GgufSource>),
+}
+
+/// A GGUF file plus the HF-name index lowmem addresses tensors by. The rest of
+/// the backend speaks HF names (`model.layers.0.self_attn.q_proj.weight`); the
+/// file speaks `blk.0.attn_q.weight`.
+pub(crate) struct GgufSource {
+    file: gguf::GgufFile,
+    /// One no-copy Metal view over the file's mmap, plus the page-aligned host
+    /// address it starts at, so a tensor's span becomes (view, byte offset).
+    view: Option<Buffer>,
+    base: usize,
+    /// HF name -> the GGUF name that carries it.
+    by_hf: HashMap<String, String>,
+    arch: gguf::GgufArch,
+    n_params: usize,
+}
+
+impl LowMemSource {
+    pub fn open(path: &Path) -> crate::Result<Self> {
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
+            let file = gguf::GgufFile::open(path)?;
+            let (_, arch) = gguf::model_config(&file)?;
+            let mut by_hf = HashMap::new();
+            let mut n_params = 0;
+            for t in file.tensors() {
+                n_params += t.dims.iter().product::<usize>();
+                if let Some(hf) = gguf::hf_name(&t.name) {
+                    by_hf.insert(hf, t.name.clone());
+                }
+            }
+            Ok(LowMemSource::Gguf(Box::new(GgufSource {
+                file,
+                by_hf,
+                arch,
+                n_params,
+                view: None,
+                base: 0,
+            })))
+        } else {
+            Ok(LowMemSource::Safetensors(WeightManifest::open(path)?))
+        }
+    }
+
+    pub fn make_gpu_views(&mut self, device: &Device) {
+        const PAGE: usize = 16384;
+        match self {
+            LowMemSource::Safetensors(mf) => mf.make_gpu_views(device),
+            LowMemSource::Gguf(g) => {
+                // The mmap base is not exposed, but every tensor points into
+                // it, so the lowest tensor address rounded DOWN to a page is a
+                // mapped, page-aligned address — which is all Metal needs.
+                let (mut lo, mut hi) = (usize::MAX, 0usize);
+                for t in g.file.tensors() {
+                    let p = t.data.as_ptr() as usize;
+                    lo = lo.min(p);
+                    hi = hi.max(p + t.data.len());
+                }
+                if lo == usize::MAX {
+                    return;
+                }
+                let base = lo & !(PAGE - 1);
+                g.base = base;
+                g.view = Some(device.new_buffer_with_bytes_no_copy(
+                    base as *const _,
+                    (hi - base).next_multiple_of(PAGE) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                ));
+            }
+        }
+    }
+
+    pub fn n_tensors(&self) -> usize {
+        match self {
+            LowMemSource::Safetensors(mf) => mf.n_tensors(),
+            LowMemSource::Gguf(g) => g.file.n_tensors(),
+        }
+    }
+
+    /// Bytes the pool holds for the whole model — the checkpoint's own encoding
+    /// for GGUF (quant blocks stay quantized), f16 for safetensors.
+    pub fn staged_bytes(&self) -> usize {
+        match self {
+            LowMemSource::Safetensors(mf) => mf.n_params * 2,
+            LowMemSource::Gguf(g) => g.file.tensors().map(|t| t.data.len()).sum(),
+        }
+    }
+
+    pub fn n_params(&self) -> usize {
+        match self {
+            LowMemSource::Safetensors(mf) => mf.n_params,
+            LowMemSource::Gguf(g) => g.n_params,
+        }
+    }
+
+    pub fn is_gguf(&self) -> bool {
+        matches!(self, LowMemSource::Gguf(_))
+    }
+
+    /// The distinct quantized types this checkpoint actually uses. Pipelines
+    /// are built per type PRESENT, never per type supported: a dtype selector
+    /// as a function constant multiplies pipeline builds, and compiling the
+    /// whole matvec family for six types a file never mentions costs seconds
+    /// of startup for nothing.
+    pub fn quant_types(&self) -> Vec<GgmlType> {
+        let LowMemSource::Gguf(g) = self else { return Vec::new() };
+        let mut v: Vec<GgmlType> = Vec::new();
+        for t in g.file.tensors() {
+            if !matches!(t.ty, GgmlType::F32 | GgmlType::F16) && !v.contains(&t.ty) {
+                v.push(t.ty);
+            }
+        }
+        v
+    }
+
+    /// Explicit head dim when the checkpoint states one (GGUF always does).
+    /// None means "derive it", which is right for every safetensors model here.
+    pub fn head_dim(&self) -> Option<usize> {
+        match self {
+            LowMemSource::Safetensors(_) => None,
+            LowMemSource::Gguf(g) => Some(g.arch.head_dim),
+        }
+    }
+
+    /// qwen3-style per-head q/k norm, straight from the file's metadata.
+    pub fn qk_norm(&self) -> bool {
+        match self {
+            LowMemSource::Safetensors(mf) => mf.has("model.layers.0.self_attn.q_norm.weight"),
+            LowMemSource::Gguf(g) => g.arch.qk_norm,
+        }
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        match self {
+            LowMemSource::Safetensors(mf) => mf.has(name),
+            LowMemSource::Gguf(g) => g.by_hf.contains_key(name),
+        }
+    }
+
+    pub fn shape(&self, name: &str) -> crate::Result<Vec<usize>> {
+        match self {
+            LowMemSource::Safetensors(mf) => Ok(mf.meta(name)?.shape.clone()),
+            LowMemSource::Gguf(g) => Ok(g.tensor(name)?.dims.clone()),
+        }
+    }
+
+    pub fn src_type(&self, name: &str) -> crate::Result<SrcType> {
+        match self {
+            LowMemSource::Safetensors(mf) => Ok(match mf.meta(name)?.dtype {
+                Dtype::F32 => SrcType::F32,
+                Dtype::F16 => SrcType::F16,
+                Dtype::BF16 => SrcType::BF16,
+                other => return Err(format!("unsupported dtype {other:?} in {name}").into()),
+            }),
+            LowMemSource::Gguf(g) => Ok(match g.tensor(name)?.ty {
+                GgmlType::F32 => SrcType::F32,
+                GgmlType::F16 => SrcType::F16,
+                t => SrcType::Quant(t),
+            }),
+        }
+    }
+
+    /// Rows `r0..r1` as the checkpoint stores them. Rows are contiguous in both
+    /// formats, so this is a slice, never a copy.
+    pub fn read_rows(&self, name: &str, r0: usize, r1: usize) -> crate::Result<&[u8]> {
+        match self {
+            LowMemSource::Safetensors(mf) => Ok(mf.read_rows(name, r0, r1)?.0),
+            LowMemSource::Gguf(g) => {
+                let t = g.tensor(name)?;
+                let cols = *t.dims.last().ok_or("gguf tensor has no dims")?;
+                let rb = t.ty.row_bytes(cols);
+                let rows = t.dims[0];
+                if r1 > rows || r0 >= r1 {
+                    return Err(format!("read_rows({name}, {r0}..{r1}): tensor has {rows} rows").into());
+                }
+                Ok(&t.data[r0 * rb..r1 * rb])
+            }
+        }
+    }
+
+    pub fn gpu_span(
+        &self,
+        name: &str,
+        r0: usize,
+        r1: usize,
+    ) -> crate::Result<Option<(&Buffer, usize)>> {
+        match self {
+            LowMemSource::Safetensors(mf) => mf.gpu_span(name, r0, r1),
+            LowMemSource::Gguf(g) => {
+                let Some(view) = &g.view else { return Ok(None) };
+                let t = g.tensor(name)?;
+                let cols = *t.dims.last().ok_or("gguf tensor has no dims")?;
+                if r1 > t.dims[0] || r0 >= r1 {
+                    return Err(format!("gpu_span({name}, {r0}..{r1})").into());
+                }
+                // A permuted tensor's rows are not contiguous in the file, so
+                // there is no single span to hand the GPU — those stage.
+                if self.unpermute_head_dim(name).is_some() {
+                    return Ok(None);
+                }
+                Ok(Some((view, t.data.as_ptr() as usize - g.base + r0 * t.ty.row_bytes(cols))))
+            }
+        }
+    }
+
+    /// Whole tensor as f32 — for the eagerly-resident small tensors (norms,
+    /// biases) and the embedding gather. llama-arch q/k come back UNPERMUTED:
+    /// llama.cpp stores them rotated for GGML's adjacent-pair RoPE, and lokal
+    /// rotates halves (kernels.metal rope pairs head[i] with head[i+half_dim]).
+    pub fn read_f32(&self, name: &str) -> crate::Result<Vec<f32>> {
+        match self {
+            LowMemSource::Safetensors(mf) => mf.read_f32(name),
+            LowMemSource::Gguf(g) => {
+                let t = g.tensor(name)?;
+                let cols = *t.dims.last().unwrap_or(&1);
+                let rows = t.dims.iter().product::<usize>() / cols.max(1);
+                let mut out = vec![0f32; rows * cols];
+                for r in 0..rows {
+                    let rb = t.ty.row_bytes(cols);
+                    dequant_row_ref(t.ty, &t.data[r * rb..(r + 1) * rb], &mut out[r * cols..(r + 1) * cols]);
+                }
+                if let Some(hd) = self.unpermute_head_dim(name) {
+                    gguf::unpermute_llama_qk(&mut out, rows, cols, hd);
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Some(head_dim) when this tensor is a llama-arch GGUF q/k that must have
+    /// llama.cpp's RoPE permute undone as it materializes. None everywhere else
+    /// — safetensors is never permuted, and neither is any non-q/k tensor.
+    pub fn unpermute_head_dim(&self, name: &str) -> Option<usize> {
+        let LowMemSource::Gguf(g) = self else { return None };
+        if g.arch.arch != "llama" {
+            return None;
+        }
+        (name.ends_with("self_attn.q_proj.weight") || name.ends_with("self_attn.k_proj.weight"))
+            .then_some(g.arch.head_dim)
+    }
+}
+
+impl GgufSource {
+    fn tensor(&self, hf: &str) -> crate::Result<manifest::GgufTensor<'_>> {
+        let gg = self.by_hf.get(hf).ok_or_else(|| format!("{hf}: not in this GGUF"))?;
+        self.file.tensor(gg)
+    }
+}
+
 pub struct LowMemEngine {
     cfg: ModelConfig,
-    manifest: WeightManifest,
+    dims: Dims,
+    source: LowMemSource,
     device: Device,
     queue: CommandQueue,
     pipes: Pipes,
     direct: DirectPipes,
+    /// Quant pipelines by LM_W_QTYPE selector, built only for the types this
+    /// checkpoint actually contains.
+    quant: HashMap<u32, QuantPipes>,
     layers: Vec<LayerWeights>,
     final_norm: Buffer,
     lm_head: PagedTensor,
@@ -196,19 +566,22 @@ impl LowMemEngine {
     /// materializes the full model in RAM.
     pub fn new(dir: &Path, cfg: ModelConfig, opts: &LowMemOpts) -> crate::Result<Self> {
         let t0 = Instant::now();
-        let mut manifest = WeightManifest::open(dir)?;
+        let mut source = LowMemSource::open(dir)?;
         eprintln!(
-            "lowmem: manifest {} tensors | {:.1}M params (headers parsed in {:.2}s)",
-            manifest.n_tensors(),
-            manifest.n_params as f64 / 1e6,
+            "lowmem: {} {} tensors | {:.1}M params (headers parsed in {:.2}s)",
+            if source.is_gguf() { "gguf" } else { "manifest" },
+            source.n_tensors(),
+            source.n_params() as f64 / 1e6,
             t0.elapsed().as_secs_f64(),
         );
 
+        let dims = Dims::new(&cfg, source.head_dim());
         let device = Device::system_default().ok_or("no Metal-capable GPU found")?;
-        manifest.make_gpu_views(&device);
+        source.make_gpu_views(&device);
         let queue = device.new_command_queue();
+        let shader = gpu::shader_source(dims.kv_dim);
         let lib = device
-            .new_library_with_source(&gpu::shader_source(cfg.kv_dim()), &CompileOptions::new())
+            .new_library_with_source(&shader, &CompileOptions::new())
             .map_err(|e| format!("failed to compile kernels.metal: {e}"))?;
         // Every build goes through the specialization API: kernels that
         // reference function constants (the matvec family via dot_wx, the
@@ -222,13 +595,18 @@ impl LowMemEngine {
                 .new_compute_pipeline_state_with_function(&f)
                 .map_err(|e| format!("kernel {name}: {e}").into())
         };
-        let bf16_pipe = |name: &str| -> crate::Result<ComputePipelineState> {
+        // Weight-encoding selector (LM_W_QTYPE at index 25): 1 = raw bf16 over
+        // the mmap views; 2..7 = the GGUF quant types, which build from the
+        // PRECISE library below.
+        let build = |lib: &metal::Library,
+                     name: &str,
+                     qtype: u32|
+         -> crate::Result<ComputePipelineState> {
             let consts = FunctionConstantValues::new();
-            let yes = true;
             consts.set_constant_value_at_index(
-                &yes as *const bool as *const _,
-                MTLDataType::Bool,
-                24,
+                &qtype as *const u32 as *const _,
+                MTLDataType::UInt,
+                25,
             );
             let f = lib
                 .get_function(name, Some(consts))
@@ -237,6 +615,48 @@ impl LowMemEngine {
                 .new_compute_pipeline_state_with_function(&f)
                 .map_err(|e| format!("kernel {name}: {e}").into())
         };
+        let qtype_pipe =
+            |name: &str, qtype: u32| -> crate::Result<ComputePipelineState> { build(&lib, name, qtype) };
+
+        // Dequant math must match dequant_row_ref BIT-FOR-BIT, and Metal's
+        // default fast math contracts a*b+c into an fma whose intermediate
+        // keeps extra precision — the two then disagree in the last ulp on
+        // exactly the values a quantizer produces. Only the quant pipelines
+        // pay for this; everything else stays on the fast library.
+        let quant_types = source.quant_types();
+        let mut quant: HashMap<u32, QuantPipes> = HashMap::new();
+        if !quant_types.is_empty() {
+            let precise = CompileOptions::new();
+            precise.set_fast_math_enabled(false);
+            let plib = device
+                .new_library_with_source(&shader, &precise)
+                .map_err(|e| format!("failed to compile kernels.metal (precise): {e}"))?;
+            let t_pipes = Instant::now();
+            for ty in &quant_types {
+                let sel = SrcType::Quant(*ty).qtype();
+                // A type with no selector has no GPU path; PagedTensor::new
+                // refuses it by tensor name, which is the useful message.
+                if sel == u32::MAX || quant.contains_key(&sel) {
+                    continue;
+                }
+                quant.insert(
+                    sel,
+                    QuantPipes {
+                        matvec: build(&plib, "matvec", sel)?,
+                        matvec_h: build(&plib, "matvec_h", sel)?,
+                        matvec_acc: build(&plib, "matvec_acc", sel)?,
+                        matvec_swiglu: build(&plib, "matvec_swiglu", sel)?,
+                        matmul_pg: build(&plib, "matmul_pg", sel)?,
+                    },
+                );
+            }
+            eprintln!(
+                "lowmem: {} quant pipeline set(s) for {:?} (precise, fast-math off) in {:.2}s",
+                quant.len(),
+                quant_types,
+                t_pipes.elapsed().as_secs_f64(),
+            );
+        }
         let env_usize = |k: &str, d: usize| {
             std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
         };
@@ -277,6 +697,7 @@ impl LowMemEngine {
         };
         let pipes = Pipes {
             rmsnorm: pipe("rmsnorm")?,
+            rmsnorm_h_inplace: pipe("rmsnorm_h_inplace")?,
             matvec: pipe("matvec")?,
             matvec_h: pipe("matvec_h")?,
             matvec_acc: pipe("matvec_acc")?,
@@ -295,27 +716,27 @@ impl LowMemEngine {
             add_inplace: pipe("add_inplace")?,
         };
         let direct = DirectPipes {
-            matvec: bf16_pipe("matvec")?,
-            matvec_h: bf16_pipe("matvec_h")?,
-            matvec_acc: bf16_pipe("matvec_acc")?,
-            matvec_swiglu: bf16_pipe("matvec_swiglu")?,
+            matvec: qtype_pipe("matvec", 1)?,
+            matvec_h: qtype_pipe("matvec_h", 1)?,
+            matvec_acc: qtype_pipe("matvec_acc", 1)?,
+            matvec_swiglu: qtype_pipe("matvec_swiglu", 1)?,
         };
 
         // Small weights (norms, biases): eagerly resident, a few hundred KB —
         // they land in D9's fixed-overhead term, not the pool.
         let small = |name: String| -> crate::Result<Buffer> {
-            Ok(gpu::f16_buffer(&device, &manifest.read_f32(&name)?))
+            Ok(gpu::f16_buffer(&device, &source.read_f32(&name)?))
         };
         let mut next_id = 0u32;
         let mut mk = |prefix: String, in_dim: usize, out_dim: usize| -> crate::Result<PagedTensor> {
             let bias_name = format!("{prefix}.bias");
-            let bias = if manifest.has(&bias_name) {
-                Some(gpu::f16_buffer(&device, &manifest.read_f32(&bias_name)?))
+            let bias = if source.has(&bias_name) {
+                Some(gpu::f16_buffer(&device, &source.read_f32(&bias_name)?))
             } else {
                 None
             };
             let t = PagedTensor::new(
-                &manifest,
+                &source,
                 next_id,
                 format!("{prefix}.weight"),
                 in_dim,
@@ -326,17 +747,26 @@ impl LowMemEngine {
             Ok(t)
         };
 
-        let (h, kv) = (cfg.hidden_size, cfg.kv_dim());
+        let (h, kv) = (cfg.hidden_size, dims.kv_dim);
+        let qk_norm = source.qk_norm();
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{i}");
             layers.push(LayerWeights {
                 input_ln: small(format!("{p}.input_layernorm.weight"))?,
                 post_ln: small(format!("{p}.post_attention_layernorm.weight"))?,
-                q: mk(format!("{p}.self_attn.q_proj"), h, h)?,
+                q_norm: match qk_norm {
+                    true => Some(small(format!("{p}.self_attn.q_norm.weight"))?),
+                    false => None,
+                },
+                k_norm: match qk_norm {
+                    true => Some(small(format!("{p}.self_attn.k_norm.weight"))?),
+                    false => None,
+                },
+                q: mk(format!("{p}.self_attn.q_proj"), h, dims.q_dim)?,
                 k: mk(format!("{p}.self_attn.k_proj"), h, kv)?,
                 v: mk(format!("{p}.self_attn.v_proj"), h, kv)?,
-                o: mk(format!("{p}.self_attn.o_proj"), h, h)?,
+                o: mk(format!("{p}.self_attn.o_proj"), dims.q_dim, h)?,
                 gate: mk(format!("{p}.mlp.gate_proj"), h, cfg.intermediate_size)?,
                 up: mk(format!("{p}.mlp.up_proj"), h, cfg.intermediate_size)?,
                 down: mk(format!("{p}.mlp.down_proj"), cfg.intermediate_size, h)?,
@@ -346,7 +776,7 @@ impl LowMemEngine {
         // Tied weights: no lm_head tensor means the pager reads the embedding
         // table's rows — same bytes, no copy anywhere.
         let lm_name =
-            if manifest.has("lm_head.weight") { "lm_head" } else { "model.embed_tokens" };
+            if source.has("lm_head.weight") { "lm_head" } else { "model.embed_tokens" };
         let lm_head = mk(lm_name.into(), h, cfg.vocab_size)?;
 
         let max_rows = layers
@@ -361,13 +791,18 @@ impl LowMemEngine {
         // The budget split (D9). LOKAL_LOWMEM_POOL_MB stays as a debug override
         // that pins the pool directly, bypassing the arithmetic.
         let budget_mb = opts.memory_budget_mb.unwrap_or(BUDGET_MB_DEFAULT);
-        let plan = memory_plan(&cfg, &win, budget_mb)?;
+        let plan = memory_plan(&cfg, dims, &win, budget_mb)?;
         let pool_bytes = match std::env::var("LOKAL_LOWMEM_POOL_MB") {
             Ok(v) => v.parse::<usize>().map(|mb| mb << 20).unwrap_or(plan.pool_bytes),
             Err(_) => plan.pool_bytes,
         };
         let pool = WeightPool::new(&device, pool_bytes);
-        let staged_bytes = manifest.n_params * 2; // f16 in the pool, whatever the disk dtype
+        // What the pool would actually hold. NOT params*2: that assumes every
+        // weight stages as f16, which is the whole thing a quantized checkpoint
+        // is not — it reported a 19.8 GB Q4 file as needing 61 GB, and turned
+        // the disk-bound estimate into fiction on exactly the models this
+        // backend exists for.
+        let staged_bytes = source.staged_bytes();
         if staged_bytes > pool_bytes {
             // The ANE-compile lesson: long silent work must announce itself. And
             // the decode line pre-answers "why is the GPU idle": past the budget
@@ -414,7 +849,9 @@ impl LowMemEngine {
             clip_flag,
             clip_warned: std::sync::atomic::AtomicBool::new(false),
             cfg,
-            manifest,
+            source,
+            dims,
+            quant,
             device,
             queue,
             pipes,
@@ -425,6 +862,52 @@ impl LowMemEngine {
             zero_bias,
             pool: Mutex::new(pool),
         })
+    }
+}
+
+impl LowMemEngine {
+    /// The pipeline that reads THIS tensor's encoding. Quant weights land on
+    /// the precise library's specialization; everything else keeps the f16
+    /// pipelines the safetensors path has always used, so those numerics are
+    /// untouched by construction.
+    pub(crate) fn staged_pipe(&self, ty: SrcType, fam: Fam) -> &ComputePipelineState {
+        match self.quant.get(&ty.qtype()).filter(|_| ty.is_quant()) {
+            Some(q) => match fam {
+                Fam::Mv => &q.matvec,
+                Fam::MvH => &q.matvec_h,
+                Fam::MvA => &q.matvec_acc,
+            },
+            None => match fam {
+                Fam::Mv => &self.pipes.matvec,
+                Fam::MvH => &self.pipes.matvec_h,
+                Fam::MvA => &self.pipes.matvec_acc,
+            },
+        }
+    }
+
+    /// The direct-read (mmap) sibling. Only bf16 has one today: a quant span
+    /// bound direct would need its own view plumbing, and until that lands a
+    /// quant page always goes through the pool.
+    pub(crate) fn direct_pipe(&self, fam: Fam) -> &ComputePipelineState {
+        match fam {
+            Fam::Mv => &self.direct.matvec,
+            Fam::MvH => &self.direct.matvec_h,
+            Fam::MvA => &self.direct.matvec_acc,
+        }
+    }
+
+    pub(crate) fn matmul_pipe(&self, ty: SrcType) -> &ComputePipelineState {
+        match self.quant.get(&ty.qtype()).filter(|_| ty.is_quant()) {
+            Some(q) => &q.matmul_pg,
+            None => &self.pipes.matmul_pg,
+        }
+    }
+
+    pub(crate) fn swiglu_pipe(&self, ty: SrcType) -> &ComputePipelineState {
+        match self.quant.get(&ty.qtype()).filter(|_| ty.is_quant()) {
+            Some(q) => &q.matvec_swiglu,
+            None => &self.pipes.matvec_swiglu,
+        }
     }
 }
 
@@ -469,13 +952,13 @@ mod tests {
     fn budget_arithmetic_refuses_impossible_budgets() {
         let cfg = qwen05b_cfg();
         let win = WindowCfg::new(2048, 4).unwrap();
-        let err = match memory_plan(&cfg, &win, 300) {
+        let err = match memory_plan(&cfg, Dims::new(&cfg, None), &win, 300) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("a 300 MB budget must be refused"),
         };
         assert!(err.contains("--memory-budget 300"), "{err}");
         assert!(err.contains("weight-pool floor"), "{err}");
-        let plan = memory_plan(&cfg, &win, 4096).unwrap();
+        let plan = memory_plan(&cfg, Dims::new(&cfg, None), &win, 4096).unwrap();
         let total = plan.kv_bytes + plan.act_bytes + (OVERHEAD_MB << 20) + plan.pool_bytes;
         assert_eq!(total, 4096 << 20);
         assert!(plan.pool_bytes >= 4 * PAGE_BYTES);

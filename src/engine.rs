@@ -123,18 +123,10 @@ pub fn create_lowmem(
 ) -> crate::Result<Box<dyn Engine>> {
     #[cfg(target_os = "macos")]
     {
-        if model_dir.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
-            // Parses clean today; EXECUTION (quant blocks resident in the pool,
-            // GPU dequant-on-read) lands with lane gguf-kernels — at integration
-            // this arm flips to the GGUF-aware constructor (challenge 257267d0).
-            let g = crate::lowmem::gguf::GgufFile::open(model_dir)?;
-            return Err(format!(
-                "{} — parsed clean, but -b lowmem cannot execute GGUF weights yet: \
-                 the GPU dequant kernels land with lane gguf-kernels",
-                crate::lowmem::gguf::summary(&g)
-            )
-            .into());
-        }
+        // GGUF and safetensors both go to the same constructor: which format a
+        // path holds is LowMemSource's question, not this function's (ruling
+        // f02ebab2 — the refusal that used to live here now guards the exact
+        // capability gap, inside lowmem, where it can name what is missing).
         return Ok(Box::new(crate::lowmem::LowMemEngine::new(model_dir, cfg, opts)?));
     }
     #[cfg(not(target_os = "macos"))]

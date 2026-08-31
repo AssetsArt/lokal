@@ -41,6 +41,305 @@ kernel void embed(
     }
 }
 
+// ---------- GGUF quant dequantization (-b lowmem) ----------
+// Block layouts follow ggml (llama.cpp, MIT — studied and reimplemented; the
+// structs live in ggml-common.h, the reference walks in ggml-quants.c). Every
+// value dequantizes to f32 in registers with the SAME expression shapes as the
+// CPU reference dequant_row_ref, and the quant pipelines are built from the
+// engine's PRECISE (fast-math-off) library so multiplies and subtracts stay
+// un-fused IEEE f32 — the oracle gate demands bit-for-bit, not "close".
+//
+// LM_W_QTYPE selects the weight encoding at pipeline build (the switch folds):
+//   0 = staged f16 (default; every existing pipeline)
+//   1 = raw bf16 through the mmap view (supersedes the old LM_W_BF16 flag)
+//   2 = Q8_0   34 B / 32 elems : f16 d, int8 qs[32]         → q*d
+//   3 = Q4_0   18 B / 32 elems : f16 d, nibbles lo|hi       → (q-8)*d
+//   4 = Q4_K  144 B / 256      : f16 d,dmin, 6-bit packed scales/mins ×8, nibbles
+//   5 = Q6_K  210 B / 256      : ql nibbles + qh 2-bit highs, int8 scales ×16, f16 d
+//   6 = Q5_K  176 B / 256      : Q4_K plus one high bit per element (qh[32])
+//   7 = Q5_0   22 B / 32       : Q4_0 plus one high bit per element (qh u32) → (q-16)*d
+constant uint LM_W_QTYPE_FC [[function_constant(25)]];
+constant uint LM_W_QTYPE = is_function_constant_defined(LM_W_QTYPE_FC) ? LM_W_QTYPE_FC : 0;
+
+// f16 scale at an arbitrary (unaligned) byte offset — 18/34/210-byte blocks
+// put half the scales on odd addresses.
+inline float lm_f16_at(device const uchar *p) {
+    return (float)as_type<half>((ushort)(p[0] | (p[1] << 8)));
+}
+
+inline float lm_dequant_q8_0(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 5) * 34;
+    float d = lm_f16_at(b);
+    return (float)(char)b[2 + (col & 31)] * d;
+}
+
+inline float lm_dequant_q4_0(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 5) * 18;
+    float d = lm_f16_at(b);
+    uint j = col & 31;
+    uchar byte = b[2 + (j & 15)];
+    int q = (int)((j < 16) ? (byte & 0x0F) : (byte >> 4)) - 8;
+    return (float)q * d;
+}
+
+inline float lm_dequant_q5_0(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 5) * 22;
+    float d = lm_f16_at(b);
+    // qh is a little-endian u32 of per-element fifth bits; assembled byte-wise
+    // because 22-byte blocks leave it unaligned half the time.
+    uint qh = (uint)b[2] | ((uint)b[3] << 8) | ((uint)b[4] << 16) | ((uint)b[5] << 24);
+    uint j = col & 31;
+    uchar byte = b[6 + (j & 15)];
+    uint xh = (j < 16) ? (((qh >> j) << 4) & 0x10) : ((qh >> (j - 16 + 12)) & 0x10);
+    uint nib = (j < 16) ? (byte & 0x0F) : (byte >> 4);
+    return (float)((int)(nib | xh) - 16) * d;
+}
+
+// The 6-bit packed scale/min unpack — THE classic silent-rot spot. Mirrors
+// ggml's get_scale_min_k4 exactly, including the j-th (not j+4-th) byte
+// donating the top bits of the MIN in the second half.
+inline void lm_scale_min_k4(uint j, device const uchar *q, thread uint &sc, thread uint &mn) {
+    if (j < 4) {
+        sc = q[j] & 63;
+        mn = q[j + 4] & 63;
+    } else {
+        sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        mn = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+inline float lm_dequant_q4_K(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 8) * 144;
+    float d = lm_f16_at(b);
+    float dmin = lm_f16_at(b + 2);
+    device const uchar *scales = b + 4;
+    device const uchar *qs = b + 16;
+    uint ib = col & 255;
+    uint sc, mn;
+    lm_scale_min_k4(ib >> 5, scales, sc, mn);
+    float d1 = d * (float)sc;
+    float m1 = dmin * (float)mn;
+    // qs: per 64-element group, 32 bytes — low nibbles first 32, high next 32.
+    uchar byte = qs[(ib >> 6) * 32 + (ib & 31)];
+    uint q = (ib & 32) ? (byte >> 4) : (byte & 0xF);
+    return d1 * (float)q - m1;
+}
+
+inline float lm_dequant_q5_K(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 8) * 176;
+    float d = lm_f16_at(b);
+    float dmin = lm_f16_at(b + 2);
+    device const uchar *scales = b + 4;
+    device const uchar *qh = b + 16;
+    device const uchar *qs = b + 48;
+    uint ib = col & 255;
+    uint g = ib >> 6;             // 64-element group; nibbles like Q4_K
+    uint hi_half = (ib >> 5) & 1; // low or high nibbles of the group
+    uint l = ib & 31;
+    uint sc, mn;
+    lm_scale_min_k4(ib >> 5, scales, sc, mn);
+    float d1 = d * (float)sc;
+    float m1 = dmin * (float)mn;
+    uchar byte = qs[g * 32 + l];
+    uint nib = hi_half ? (byte >> 4) : (byte & 0xF);
+    uint hi = ((qh[l] >> (2 * g + hi_half)) & 1) << 4; // the fifth bit
+    return d1 * (float)(nib + hi) - m1;
+}
+
+inline float lm_dequant_q6_K(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 8) * 210;
+    uint ib = col & 255;
+    uint h = ib >> 7; // which 128-element half
+    uint r = ib & 127;
+    uint grp = r >> 5; // the reference's q1..q4 lanes
+    uint l = r & 31;
+    device const uchar *ql = b + h * 64;
+    device const uchar *qh = b + 128 + h * 32;
+    device const char *sc = (device const char *)(b + 192) + h * 8;
+    float d = lm_f16_at(b + 208);
+    uchar lowbyte = ql[l + (grp & 1) * 32];
+    uint low = (grp < 2) ? (lowbyte & 0xF) : (lowbyte >> 4);
+    uint hi2 = (qh[l] >> (2 * grp)) & 3;
+    int q = (int)(low | (hi2 << 4)) - 32;
+    return d * (float)sc[(l >> 4) + 2 * grp] * (float)q;
+}
+
+// ---- Per-run dequant: the same arithmetic, hoisted ----
+//
+// The per-element helpers above are the readable reference and the oracle's
+// subject, but calling one per weight costs ~10 scattered byte loads for every
+// element: the block base, the f16 scale and the 6-bit scale/min are all
+// re-derived each time. On a fully-resident 14B Q4_K_M that was 17.5 s/token.
+//
+// Every run below covers 32 CONTIGUOUS, 32-ALIGNED elements, which is exactly
+// the granularity at which the block-invariant work stops changing: for the
+// 32-element types a run is one whole block, and for the K-quants the
+// sub-block index, the 64-element group and the nibble half are all constant
+// across it. So the scales are decoded ONCE and the loop reads only payload.
+// Per-element values are unchanged; only the order of the SUM differs, which
+// no gate promises and the oracle (which compares dequantized values, not
+// dot products) still pins.
+
+inline float lm_dot_run_q8_0(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 5) * 34;
+    float d = lm_f16_at(b);
+    float s = 0.0f;
+    for (uint j = 0; j < 32; j++) {
+        s += (float)(char)b[2 + j] * x[e0 + j];
+    }
+    return s * d;
+}
+
+inline float lm_dot_run_q4_0(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 5) * 18;
+    float d = lm_f16_at(b);
+    float s = 0.0f;
+    for (uint j = 0; j < 16; j++) {
+        uchar by = b[2 + j];
+        s += (float)((int)(by & 0x0F) - 8) * x[e0 + j];
+        s += (float)((int)(by >> 4) - 8) * x[e0 + j + 16];
+    }
+    return s * d;
+}
+
+inline float lm_dot_run_q5_0(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 5) * 22;
+    float d = lm_f16_at(b);
+    uint qh = (uint)b[2] | ((uint)b[3] << 8) | ((uint)b[4] << 16) | ((uint)b[5] << 24);
+    float s = 0.0f;
+    for (uint j = 0; j < 16; j++) {
+        uchar by = b[6 + j];
+        uint xl = ((qh >> j) << 4) & 0x10;
+        uint xh = (qh >> (j + 12)) & 0x10;
+        s += (float)((int)((by & 0x0F) | xl) - 16) * x[e0 + j];
+        s += (float)((int)((by >> 4) | xh) - 16) * x[e0 + j + 16];
+    }
+    return s * d;
+}
+
+inline float lm_dot_run_q4_K(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 8) * 144;
+    float d = lm_f16_at(b);
+    float dmin = lm_f16_at(b + 2);
+    uint ib0 = e0 & 255;
+    uint sc, mn;
+    lm_scale_min_k4(ib0 >> 5, b + 4, sc, mn);
+    float d1 = d * (float)sc;
+    float m1 = dmin * (float)mn;
+    device const uchar *qs = b + 16 + (ib0 >> 6) * 32;
+    bool hi = (ib0 & 32) != 0;
+    // y = d1*q - m1 per element, so the run is d1*sum(q*x) - m1*sum(x).
+    float sq = 0.0f, sx = 0.0f;
+    for (uint j = 0; j < 32; j++) {
+        uchar by = qs[j];
+        uint q = hi ? (by >> 4) : (by & 0x0F);
+        float xv = x[e0 + j];
+        sq += (float)q * xv;
+        sx += xv;
+    }
+    return d1 * sq - m1 * sx;
+}
+
+inline float lm_dot_run_q5_K(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 8) * 176;
+    float d = lm_f16_at(b);
+    float dmin = lm_f16_at(b + 2);
+    uint ib0 = e0 & 255;
+    uint g = ib0 >> 6;
+    uint hi_half = (ib0 >> 5) & 1;
+    uint sc, mn;
+    lm_scale_min_k4(ib0 >> 5, b + 4, sc, mn);
+    float d1 = d * (float)sc;
+    float m1 = dmin * (float)mn;
+    device const uchar *qh = b + 16;
+    device const uchar *qs = b + 48 + g * 32;
+    float sq = 0.0f, sx = 0.0f;
+    for (uint l = 0; l < 32; l++) {
+        uchar by = qs[l];
+        uint nib = hi_half ? (by >> 4) : (by & 0x0F);
+        uint hi = ((qh[l] >> (2 * g + hi_half)) & 1) << 4;
+        float xv = x[e0 + l];
+        sq += (float)(nib + hi) * xv;
+        sx += xv;
+    }
+    return d1 * sq - m1 * sx;
+}
+
+inline float lm_dot_run_q6_K(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 8) * 210;
+    uint ib0 = e0 & 255;
+    uint h = ib0 >> 7;
+    uint grp = (ib0 & 127) >> 5;
+    device const uchar *ql = b + h * 64 + (grp & 1) * 32;
+    device const uchar *qh = b + 128 + h * 32;
+    device const char *sc = (device const char *)(b + 192) + h * 8;
+    float d = lm_f16_at(b + 208);
+    // Q6_K's scales change every 16 elements, so a 32-run spans exactly two.
+    float s0 = d * (float)sc[2 * grp];
+    float s1 = d * (float)sc[1 + 2 * grp];
+    float a0 = 0.0f, a1 = 0.0f;
+    for (uint l = 0; l < 32; l++) {
+        uchar lowbyte = ql[l];
+        uint low = (grp < 2) ? (lowbyte & 0x0F) : (lowbyte >> 4);
+        uint hi2 = (qh[l] >> (2 * grp)) & 3;
+        float q = (float)((int)(low | (hi2 << 4)) - 32);
+        if (l < 16) {
+            a0 += q * x[e0 + l];
+        } else {
+            a1 += q * x[e0 + l];
+        }
+    }
+    return s0 * a0 + s1 * a1;
+}
+
+/// Dot product of one 32-element aligned run of a quantized row with x.
+inline float lm_dot_run(device const uchar *row, uint e0, device const float *x) {
+    switch (LM_W_QTYPE) {
+        case 2: return lm_dot_run_q8_0(row, e0, x);
+        case 3: return lm_dot_run_q4_0(row, e0, x);
+        case 4: return lm_dot_run_q4_K(row, e0, x);
+        case 5: return lm_dot_run_q6_K(row, e0, x);
+        case 6: return lm_dot_run_q5_K(row, e0, x);
+        case 7: return lm_dot_run_q5_0(row, e0, x);
+        default: return 0.0f;
+    }
+}
+
+inline float lm_dequant(device const uchar *row, uint col) {
+    switch (LM_W_QTYPE) {
+        case 2: return lm_dequant_q8_0(row, col);
+        case 3: return lm_dequant_q4_0(row, col);
+        case 4: return lm_dequant_q4_K(row, col);
+        case 5: return lm_dequant_q6_K(row, col);
+        case 6: return lm_dequant_q5_K(row, col);
+        case 7: return lm_dequant_q5_0(row, col);
+        default: return 0.0f;
+    }
+}
+
+// The oracle gate's kernel: dequantize whole rows through the SAME inline
+// functions the matvec/matmul paths use, so the bit-for-bit comparison against
+// dequant_row_ref covers the production math.
+struct LmDeqParams {
+    uint cols;
+    uint row_bytes;
+    uint n_rows;
+};
+
+kernel void lm_dequant_oracle(
+    device const uchar *src [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    constant LmDeqParams &p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]) // x = column, y = row
+{
+    if (gid.x >= p.cols || gid.y >= p.n_rows) {
+        return;
+    }
+    out[(ulong)gid.y * p.cols + gid.x] =
+        lm_dequant(src + (ulong)gid.y * p.row_bytes, gid.x);
+}
+
+
 // ---------- matvec: y = W·x + bias (math.rs::matvec) — used during decode ----------
 // One simdgroup (32 threads executing in lockstep) owns one row of W: adjacent
 // threads read adjacent elements (coalesced), then combine with simd_sum, a
@@ -50,18 +349,43 @@ kernel void embed(
 // memory-bandwidth-bound, and wide loads are what gets a small kernel near peak
 // bandwidth. A scalar tail handles in_dim % 4 (zero for every supported model).
 
-// -b lowmem direct-read specialization: with LM_W_BF16 set, the matvec family
-// reads its weight buffer as RAW bf16 checkpoint bytes (bound over the mmap's
-// no-copy view — pages the pool has no room for stream straight from the page
-// cache, touching the bus once instead of thrice). Every value still rounds
-// through f16 on the way into the dot product, so results are bit-identical
-// to the staged path. Unspecialized pipelines fold the branch away.
-constant bool LM_W_BF16_FC [[function_constant(24)]];
-constant bool LM_W_BF16 = is_function_constant_defined(LM_W_BF16_FC) && LM_W_BF16_FC;
+// The matvec family's weight read, switched by LM_W_QTYPE (folds at pipeline
+// build). `w` is bound as half* but is really: staged f16 (0), raw bf16 over
+// the mmap view (1 — values round through f16 so results are bit-identical to
+// the staged path), or raw GGUF quant blocks (2..5 — dequant to f32 through
+// the SAME lm_dequant_* the oracle gate verifies; those pipelines compile in
+// the precise fast-math-off library so the gate's bit equality holds here too).
+// Rows of quant blocks aren't element-addressable, so the row index comes in
+// and each arm does its own row arithmetic.
+inline ulong lm_row_bytes(uint in_dim) {
+    switch (LM_W_QTYPE) {
+        case 2: return (ulong)(in_dim / 32) * 34;   // Q8_0
+        case 3: return (ulong)(in_dim / 32) * 18;   // Q4_0
+        case 4: return (ulong)(in_dim / 256) * 144; // Q4_K
+        case 5: return (ulong)(in_dim / 256) * 210; // Q6_K
+        case 6: return (ulong)(in_dim / 256) * 176; // Q5_K
+        case 7: return (ulong)(in_dim / 32) * 22;   // Q5_0
+        default: return 0; // unused for element-addressable types
+    }
+}
 
-inline float dot_wx(device const half *w_row, device const float *x, uint in_dim, uint lane) {
+inline float dot_wx(device const half *w, uint row, device const float *x, uint in_dim, uint lane) {
     float acc = 0.0f;
-    if (LM_W_BF16) {
+    if (LM_W_QTYPE >= 2) {
+        device const uchar *row_base =
+            (device const uchar *)w + (ulong)row * lm_row_bytes(in_dim);
+        // One 32-element run per lane, striding by the simdgroup: the block
+        // scales are decoded once per run instead of once per weight. Every
+        // quantized in_dim is a multiple of 32 (blocks are 32 or 256 elements
+        // and PagedTensor::new refuses a row that is not whole blocks).
+        uint runs = in_dim >> 5;
+        for (uint r = lane; r < runs; r += 32) {
+            acc += lm_dot_run(row_base, r << 5, x);
+        }
+        return acc;
+    }
+    device const half *w_row = w + (ulong)row * in_dim;
+    if (LM_W_QTYPE == 1) {
         // ushort2 keeps 4-byte alignment for any 4-aligned tensor offset
         // (the host falls back to staging when a span is odder than that).
         device const ushort2 *w2 = (device const ushort2 *)w_row;
@@ -115,7 +439,7 @@ kernel void matvec(
     if (row >= p.out_dim) {
         return;
     }
-    float sum = simd_sum(dot_wx(w + (ulong)row * p.in_dim, x, p.in_dim, lane));
+    float sum = simd_sum(dot_wx(w, row, x, p.in_dim, lane));
     if (lane == 0) {
         y[row] = sum + (float)bias[row];
     }
@@ -139,7 +463,7 @@ kernel void matvec_acc(
     if (row >= p.out_dim) {
         return;
     }
-    float sum = simd_sum(dot_wx(w + (ulong)row * p.in_dim, x, p.in_dim, lane));
+    float sum = simd_sum(dot_wx(w, row, x, p.in_dim, lane));
     if (lane == 0) {
         y[row] += sum + (float)bias[row];
     }
@@ -163,8 +487,8 @@ kernel void matvec_swiglu(
     if (row >= p.out_dim) {
         return;
     }
-    float g = simd_sum(dot_wx(w_gate + (ulong)row * p.in_dim, x, p.in_dim, lane));
-    float u = simd_sum(dot_wx(w_up + (ulong)row * p.in_dim, x, p.in_dim, lane));
+    float g = simd_sum(dot_wx(w_gate, row, x, p.in_dim, lane));
+    float u = simd_sum(dot_wx(w_up, row, x, p.in_dim, lane));
     if (lane == 0) {
         y[row] = (g / (1.0f + exp(-g))) * u; // silu(g) * u — gate/up have no bias in this family
     }
@@ -213,7 +537,7 @@ kernel void matvec_qkv(
         r = row - p.q_dim - p.kv_dim;
         w = w_v; bias = b_v;
     }
-    float sum = simd_sum(dot_wx(w + (ulong)r * p.in_dim, x, p.in_dim, lane));
+    float sum = simd_sum(dot_wx(w, r, x, p.in_dim, lane));
     if (lane == 0) {
         float val = sum + (float)bias[r];
         if (row < p.q_dim) {
@@ -431,7 +755,16 @@ kernel void matmul_pg(
         for (uint i = 0; i < 16; i++) {
             uint gk = k0 + w_strip * 16 + i;
             uint go = out0 + w_row;
-            half v = (go < p.out_dim && gk < p.in_dim) ? w[(ulong)go * p.in_dim + gk] : 0.0h;
+            // Quant specializations dequant the tile on the way into the f16
+            // staging (a GEMM re-reads each weight tile per 32-token slice, so
+            // staged-once f16 wins over per-read dequant; prefill numerics are
+            // therefore f16-rounded quant values — logged in the lane notes).
+            half v = 0.0h;
+            if (go < p.out_dim && gk < p.in_dim) {
+                v = (LM_W_QTYPE >= 2)
+                    ? (half)lm_dequant((device const uchar *)w + (ulong)go * lm_row_bytes(p.in_dim), gk)
+                    : w[(ulong)go * p.in_dim + gk];
+            }
             uint ib = 8 * (2 * w_strip + i / 8) + w_row / 8;
             sa[64 * ib + 8 * (i % 8) + w_row % 8] = v;
         }
@@ -748,7 +1081,7 @@ kernel void matvec_h(
     if (row >= p.out_dim) {
         return;
     }
-    float sum = simd_sum(dot_wx(w + (ulong)row * p.in_dim, x, p.in_dim, lane));
+    float sum = simd_sum(dot_wx(w, row, x, p.in_dim, lane));
     if (lane == 0) {
         y[row] = (half)(sum + (float)bias[row]);
     }
@@ -800,6 +1133,45 @@ kernel void rmsnorm(
     float scale = rsqrt(partial[0] / (float)p.dim + p.eps);
     for (uint i = tid; i < p.dim; i += NORM_TG) {
         yr[i] = xr[i] * scale * (float)weight[i];
+    }
+}
+
+// qwen3 qk-norm (-b lowmem, D4): RMSNorm one f16 row of `dim` elements IN
+// PLACE — decode's freshly written K row is normalized per kv head (dim =
+// head_dim, one dispatched "row" per head) before RoPE. Same math and
+// reduction as rmsnorm above: f32 accumulation, f16 storage. Prefill needs no
+// f16 variant — it norms the f32 staging rows with the plain rmsnorm before
+// they convert into the cache.
+kernel void rmsnorm_h_inplace(
+    device half *x [[buffer(0)]],
+    device const half *weight [[buffer(1)]],
+    constant NormParams &p [[buffer(2)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    device half *xr = x + (ulong)row * p.dim;
+    threadgroup float partial[NORM_TG / 32];
+    float acc = 0.0f;
+    for (uint i = tid; i < p.dim; i += NORM_TG) {
+        float v = (float)xr[i];
+        acc += v * v;
+    }
+    float sg = simd_sum(acc);
+    if (tid % 32 == 0) {
+        partial[tid / 32] = sg;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint j = 0; j < NORM_TG / 32; j++) {
+            total += partial[j];
+        }
+        partial[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float scale = rsqrt(partial[0] / (float)p.dim + p.eps);
+    for (uint i = tid; i < p.dim; i += NORM_TG) {
+        xr[i] = (half)((float)xr[i] * scale * (float)weight[i]);
     }
 }
 
@@ -1727,7 +2099,7 @@ kernel void matvec_qkv_batch(
         r = row - p.q_dim - p.kv_dim;
         w = w_v; bias = b_v;
     }
-    float sum = simd_sum(dot_wx(w + (ulong)r * p.in_dim, xb, p.in_dim, lane));
+    float sum = simd_sum(dot_wx(w, r, xb, p.in_dim, lane));
     if (lane == 0) {
         float val = sum + (float)bias[r];
         ulong kv_off = ((ulong)meta[b].slot * p.max_seq + meta[b].pos) * p.kv_dim;
@@ -1758,7 +2130,7 @@ kernel void matvec_acc_batch(
         return;
     }
     uint b = tgid.y;
-    float sum = simd_sum(dot_wx(w + (ulong)row * p.in_dim, x + (ulong)b * p.in_dim, p.in_dim, lane));
+    float sum = simd_sum(dot_wx(w, row, x + (ulong)b * p.in_dim, p.in_dim, lane));
     if (lane == 0) {
         y[(ulong)b * p.out_dim + row] += sum + (float)bias[row];
     }
@@ -1782,8 +2154,8 @@ kernel void matvec_swiglu_batch(
     }
     uint b = tgid.y;
     device const float *xb = x + (ulong)b * p.in_dim;
-    float g = simd_sum(dot_wx(w_gate + (ulong)row * p.in_dim, xb, p.in_dim, lane));
-    float u = simd_sum(dot_wx(w_up + (ulong)row * p.in_dim, xb, p.in_dim, lane));
+    float g = simd_sum(dot_wx(w_gate, row, xb, p.in_dim, lane));
+    float u = simd_sum(dot_wx(w_up, row, xb, p.in_dim, lane));
     if (lane == 0) {
         y[(ulong)b * p.out_dim + row] = (g / (1.0f + exp(-g))) * u;
     }

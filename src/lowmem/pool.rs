@@ -14,11 +14,10 @@
 //! one opens. The epoch machinery for overlapped submission arrives with the
 //! per-layer pipeline phase.
 
-use super::manifest::WeightManifest;
+use super::{LowMemSource, SrcType};
 use half::f16;
 use metal::{Buffer, Device, MTLResourceOptions};
 use rayon::prelude::*;
-use safetensors::Dtype;
 use std::collections::HashMap;
 
 /// Upper bound on one page's staged f16 bytes — row blocks are sized to it.
@@ -30,6 +29,10 @@ pub(super) struct PagedTensor {
     pub name: String,
     pub in_dim: usize,
     pub out_dim: usize,
+    /// What the CHECKPOINT holds. Quant pages stay quantized in the pool — the
+    /// 4x residency is the whole point — so this drives page sizing, the
+    /// pipeline selector, and whether a page can be bound direct.
+    pub ty: SrcType,
     pub rows_per_page: usize,
     pub n_pages: usize,
     /// Eagerly-resident f16 bias; encode binds the engine's shared zero buffer
@@ -39,27 +42,47 @@ pub(super) struct PagedTensor {
 
 impl PagedTensor {
     pub fn new(
-        mf: &WeightManifest,
+        src: &LowMemSource,
         id: u32,
         name: String,
         in_dim: usize,
         out_dim: usize,
         bias: Option<Buffer>,
     ) -> crate::Result<Self> {
-        let m = mf.meta(&name)?;
-        if m.shape != [out_dim, in_dim] {
+        let shape = src.shape(&name)?;
+        if shape != [out_dim, in_dim] {
             return Err(format!(
-                "{name} has shape {:?} but the config implies [{out_dim}, {in_dim}]",
-                m.shape
+                "{name} has shape {shape:?} but the config implies [{out_dim}, {in_dim}]"
             )
             .into());
         }
-        let rows_per_page = (PAGE_BYTES / (in_dim * 2)).clamp(1, out_dim);
+        let ty = src.src_type(&name)?;
+        if let SrcType::Quant(t) = ty {
+            // A row must be a whole number of blocks: rows are the unit the pool
+            // pages and the kernels index, and a block straddling two rows has
+            // no meaning. K-quants block by 256, and every real checkpoint's
+            // in_dim is a multiple of it — name the tensor when one is not.
+            let be = t.blk_elems();
+            if in_dim % be != 0 {
+                return Err(format!(
+                    "{name}: {t:?} blocks {be} elements but the row is {in_dim} wide \
+                     ({in_dim} % {be} != 0) — this checkpoint cannot be paged"
+                )
+                .into());
+            }
+            if ty.qtype() == u32::MAX {
+                return Err(format!("{name}: {t:?} has no GPU dequant path yet").into());
+            }
+        }
+        // Pages are sized in CHECKPOINT bytes, so a Q4 page carries ~4x the rows
+        // a bf16 page does at the same byte cost — which is the residency win.
+        let rows_per_page = (PAGE_BYTES / ty.row_bytes(in_dim).max(1)).clamp(1, out_dim);
         Ok(Self {
             id,
             name,
             in_dim,
             out_dim,
+            ty,
             rows_per_page,
             n_pages: out_dim.div_ceil(rows_per_page),
             bias,
@@ -72,9 +95,10 @@ impl PagedTensor {
         (r0, self.rows_per_page.min(self.out_dim - r0))
     }
 
-    /// Staged f16 bytes of one block.
+    /// Pool bytes of one block. Quant blocks are stored raw, so this is the
+    /// checkpoint's own row size, not an f16 expansion.
     fn block_bytes(&self, block: usize) -> usize {
-        self.block_rows(block).1 * self.in_dim * 2
+        self.block_rows(block).1 * self.ty.row_bytes(self.in_dim)
     }
 }
 
@@ -145,6 +169,29 @@ pub(super) struct WeightPool {
     /// f32→f16 clips past 65504 — flag an overflowing checkpoint once, at the
     /// first page that actually clips (cheaper than a full scan at open).
     overflow_warned: bool,
+    /// LOKAL_LOWMEM_QDIRECT=1: let over-budget QUANT pages read straight from
+    /// the checkpoint instead of staging. Correct in every run measured at the
+    /// alignment gate below, but the gate's threshold is empirical rather than
+    /// explained, so the default keeps quant pages on the staged path.
+    qdirect: bool,
+    /// Staging counters. A model that fits the pool must stage every page once
+    /// and never again — the residency promise is exactly "zero stage-ins per
+    /// decode step", and a gate cannot assert that from free text.
+    stats: PoolStats,
+}
+
+/// What the pool has moved since it was built. Cheap to copy, so a caller can
+/// snapshot it at a phase boundary and diff the two.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct PoolStats {
+    pub stage_ins: u64,
+    pub stage_bytes: u64,
+    pub evictions: u64,
+    /// Over-budget decode reads that bypassed the pool and streamed straight
+    /// from the checkpoint. These move bus bytes without ever staging a page,
+    /// so a stage-in count alone would call a streaming run resident.
+    pub direct_binds: u64,
+    pub direct_bytes: u64,
 }
 
 impl WeightPool {
@@ -161,7 +208,14 @@ impl WeightPool {
             free: HashMap::new(),
             free_bytes: 0,
             overflow_warned: false,
+            qdirect: std::env::var("LOKAL_LOWMEM_QDIRECT").is_ok_and(|v| v == "1"),
+            stats: PoolStats::default(),
         }
+    }
+
+    /// Staging counters so far — diff two snapshots to get one phase's traffic.
+    pub fn stats(&self) -> PoolStats {
+        self.stats
     }
 
     /// Stage-ins queued since the last call — the caller encodes them before
@@ -194,7 +248,7 @@ impl WeightPool {
     /// only eviction candidates belong to in-flight command buffers.
     pub fn make_resident(
         &mut self,
-        mf: &WeightManifest,
+        src: &LowMemSource,
         pages: &[(&PagedTensor, usize)],
         epoch: u64,
     ) -> crate::Result<Admit> {
@@ -255,7 +309,9 @@ impl WeightPool {
                     .device
                     .new_buffer(need as u64, MTLResourceOptions::StorageModeShared),
             };
-            self.stage(mf, t, *b, &buf)?;
+            self.stage(src, t, *b, &buf)?;
+            self.stats.stage_ins += 1;
+            self.stats.stage_bytes += need as u64;
             self.clock += 1;
             self.used += need;
             self.pages.insert(
@@ -277,7 +333,7 @@ impl WeightPool {
     /// path (with eviction) when the span has no usable GPU view.
     pub fn bind_decode(
         &mut self,
-        mf: &WeightManifest,
+        src: &LowMemSource,
         t: &PagedTensor,
         block: usize,
         epoch: u64,
@@ -292,16 +348,32 @@ impl WeightPool {
         }
         let need = t.block_bytes(block);
         if self.used + self.free_bytes + need > self.budget
-            && mf.meta(&t.name)?.dtype == Dtype::BF16 // the direct pipes read raw bf16
+            // bf16 needs its own pipeline to read raw checkpoint bytes; a QUANT
+            // page needs nothing special, because the pool page and the file
+            // span hold the SAME quant blocks — the staged pipeline reads
+            // either one. That is the streaming promise: over-budget quant
+            // weights cross the bus as quant bytes, once.
+            && (t.ty == SrcType::BF16 || (t.ty.is_quant() && self.qdirect))
         {
             let (r0, rows) = t.block_rows(block);
-            if let Some((view, off)) = mf.gpu_span(&t.name, r0, r0 + rows)? {
-                if off % 4 == 0 {
+            if let Some((view, off)) = src.gpu_span(&t.name, r0, r0 + rows)? {
+                // 64, not 4, for quant. MEASURED, not derived: on Qwen3-0.6B
+                // Q4_K_M at a 200 MB pool, spans admitted at 4- or 16-byte
+                // alignment decode into garbage while the SAME code at 64 and
+                // 128 is exact, and Q4_K alone reproduces it, so it is not a
+                // per-type bug. Every offset here is already 32-aligned (GGUF
+                // aligns tensor data to 32 and the view base to a page), so
+                // what fails is precisely the 32-mod-64 spans. Until the reason
+                // is understood this path stays OFF by default — see qdirect.
+                let need_align = if t.ty.is_quant() { 64 } else { 4 };
+                if off % need_align == 0 {
+                    self.stats.direct_binds += 1;
+                    self.stats.direct_bytes += need as u64;
                     return Ok(Ok(Bind::Direct(view.clone(), off)));
                 }
             }
         }
-        match self.make_resident(mf, &[(t, block)], epoch)? {
+        match self.make_resident(src, &[(t, block)], epoch)? {
             Admit::Ready => Ok(Ok(Bind::Pool(self.get(t, block).clone()))),
             Admit::NeedWait => Ok(Err(Admit::NeedWait)),
         }
@@ -343,6 +415,7 @@ impl WeightPool {
                 self.used -= p.bytes;
                 self.free_bytes += p.bytes;
                 self.free.entry(p.bytes).or_default().push(p.buf);
+                self.stats.evictions += 1;
                 Evict::Done
             }
             None if in_flight_only => Evict::AllInFlight,
@@ -350,36 +423,80 @@ impl WeightPool {
         }
     }
 
-    /// Read the block's rows from the mmap and convert into the buffer — the
+    /// Which GGUF row holds HF row `r`, undoing llama.cpp's q/k permute.
+///
+/// The converter reshapes (n_head, 2, hd/2, cols) and swaps the middle axes, so
+/// the file's row h*hd + d*2 + p carries HF's row h*hd + p*(hd/2) + d. We need
+/// that read backwards — given the HF row we are filling, which file row holds
+/// it — and the map is NOT an involution (it is one only at hd == 2), so
+/// applying the forward direction here scrambles q/k into fluent nonsense.
+/// The mapping never leaves its head.
+fn unpermuted_src_row(r: usize, head_dim: usize) -> usize {
+    let (h, q) = (r / head_dim, r % head_dim);
+    let half = head_dim / 2;
+    let (p, d) = (q / half, q % half);
+    h * head_dim + d * 2 + p
+}
+
+/// Read the block's rows from the mmap and convert into the buffer — the
     /// ONLY place weight bytes are copied, and only ever one page's worth.
     fn stage(
         &mut self,
-        mf: &WeightManifest,
+        src: &LowMemSource,
         t: &PagedTensor,
         block: usize,
         dst: &Buffer,
     ) -> crate::Result<()> {
         let (r0, rows) = t.block_rows(block);
-        let (src, dtype) = mf.read_rows(&t.name, r0, r0 + rows)?;
+        // llama.cpp stores llama-arch q/k under a row permute that matches
+        // GGML's adjacent-pair RoPE; lokal rotates halves, so the permute is
+        // undone HERE, as the page materializes. It is a pure row reorder, so
+        // it works on quant blocks untouched — and it keeps the kernels clean,
+        // which is the point: a compensating shuffle inside dequant would make
+        // every future llama-arch GGUF silently wrong.
+        let gathered;
+        let bytes: &[u8] = match src.unpermute_head_dim(&t.name) {
+            Some(hd) => {
+                let rb = t.ty.row_bytes(t.in_dim);
+                let mut v = Vec::with_capacity(rows * rb);
+                for i in 0..rows {
+                    let sr = Self::unpermuted_src_row(r0 + i, hd);
+                    v.extend_from_slice(src.read_rows(&t.name, sr, sr + 1)?);
+                }
+                gathered = v;
+                &gathered
+            }
+            None => src.read_rows(&t.name, r0, r0 + rows)?,
+        };
         let dp = dst.contents() as *mut u16;
+        // Quantized pages are stored EXACTLY as the checkpoint holds them: the
+        // pool's whole reason to exist is that a Q4 model needs a quarter of the
+        // bytes, and dequantizing at stage time would hand all of it back.
+        if t.ty.is_quant() {
+            assert_eq!(bytes.len(), t.block_bytes(block), "quant page size mismatch");
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dp as *mut u8, bytes.len());
+            }
+            return Ok(());
+        }
         // The mmap slice can be unaligned (safetensors headers are arbitrary
         // lengths), so conversion walks byte pairs/quads — never typed pointers.
         // Rows convert in parallel: staging is the disk-side "CPU load" bar of
         // the overlap diagram, and a serial convert would cap it at ~2 GB/s.
         let out = unsafe { std::slice::from_raw_parts_mut(dp, rows * t.in_dim) };
-        let clipped = match dtype {
-            Dtype::F16 => {
+        let clipped = match t.ty {
+            SrcType::F16 => {
                 unsafe {
-                    std::ptr::copy_nonoverlapping(src.as_ptr(), dp as *mut u8, src.len());
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), dp as *mut u8, bytes.len());
                 }
                 false
             }
-            Dtype::BF16 => {
+            SrcType::BF16 => {
                 // The GPU stages the page itself, reading the checkpoint bytes
                 // through the mmap's no-copy view — zero CPU bytes moved. The
                 // CPU fallback (view missing or an unaligned span) converts in
                 // parallel like the F32 path.
-                if let Some((view, off)) = mf.gpu_span(&t.name, r0, r0 + rows)? {
+                if let Some((view, off)) = src.gpu_span(&t.name, r0, r0 + rows)? {
                     self.pending_convert.push(PendingConvert {
                         src: view.clone(),
                         src_off: off,
@@ -389,7 +506,7 @@ impl WeightPool {
                     false
                 } else {
                     out.par_chunks_mut(t.in_dim)
-                        .zip(src.par_chunks(t.in_dim * 2))
+                        .zip(bytes.par_chunks(t.in_dim * 2))
                         .map(|(d, s)| {
                             let mut c = false;
                             for (o, b) in d.iter_mut().zip(s.chunks_exact(2)) {
@@ -402,9 +519,9 @@ impl WeightPool {
                         .reduce(|| false, |a, b| a | b)
                 }
             }
-            Dtype::F32 => out
+            SrcType::F32 => out
                 .par_chunks_mut(t.in_dim)
-                .zip(src.par_chunks(t.in_dim * 4))
+                .zip(bytes.par_chunks(t.in_dim * 4))
                 .map(|(d, s)| {
                     let mut c = false;
                     for (o, b) in d.iter_mut().zip(s.chunks_exact(4)) {
@@ -415,7 +532,7 @@ impl WeightPool {
                     c
                 })
                 .reduce(|| false, |a, b| a | b),
-            other => return Err(format!("unsupported dtype {other:?} in {}", t.name).into()),
+            SrcType::Quant(_) => unreachable!("quant pages return above"),
         };
         if clipped && !self.overflow_warned {
             self.overflow_warned = true;
@@ -425,5 +542,392 @@ impl WeightPool {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod permute_tests {
+    use super::*;
+
+    /// llama.cpp's forward permute, straight from convert_hf_to_gguf.py's
+    /// reshape/swapaxes: file row `r` carries this HF row.
+    fn forward(r: usize, hd: usize) -> usize {
+        let (h, rem) = (r / hd, r % hd);
+        let (d, p) = (rem / 2, rem % 2);
+        h * hd + p * (hd / 2) + d
+    }
+
+    /// The two must compose to the identity. They did not once — the forward
+    /// map was used for both directions, and a 135M model answered that the
+    /// capital of Thailand is a city in the United States.
+    #[test]
+    fn unpermute_inverts_llama_cpp_permute() {
+        for hd in [2usize, 4, 64, 128] {
+            for r in 0..hd * 3 {
+                assert_eq!(forward(WeightPool::unpermuted_src_row(r, hd), hd), r, "hd={hd} r={r}");
+            }
+        }
+    }
+
+    /// Every row maps somewhere distinct inside its own head — a permutation,
+    /// not a collapse.
+    #[test]
+    fn unpermute_is_a_within_head_bijection() {
+        let hd = 64;
+        for h in 0..3 {
+            let mut seen: Vec<usize> =
+                (h * hd..(h + 1) * hd).map(|r| WeightPool::unpermuted_src_row(r, hd)).collect();
+            seen.sort_unstable();
+            assert_eq!(seen, (h * hd..(h + 1) * hd).collect::<Vec<_>>());
+        }
+    }
+}
+
+#[cfg(test)]
+mod quant_oracle {
+    //! The oracle gate (gguf-kernels D2, written FIRST per the lane order):
+    //! GPU dequantization must match the CPU reference BIT-FOR-BIT on
+    //! adversarial blocks. Until gguf-loader's seam freezes, `ref_dequant_row`
+    //! below is a placeholder implementing exact ggml semantics (transcribed
+    //! from ggml-quants.c); at seam-freeze it is swapped for
+    //! `manifest::dequant_row_ref` in one line — and because this shim was
+    //! derived independently of Tiësto's, the swap also cross-checks HIS
+    //! implementation against ggml.
+    //!
+    //! Negative control (run once, 2026-08-31): planting the classic
+    //! get_scale_min_k4 bug (q[j+4] instead of q[j] donating the min's top
+    //! bits) fails the gate at Q4_K block 1 elem 128 — the gate can fail.
+
+    use crate::gpu::metal as gpu;
+    use half::f16;
+    use metal::{CompileOptions, Device, FunctionConstantValues, MTLDataType, MTLResourceOptions, MTLSize};
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum QType {
+        Q8_0 = 2,
+        Q4_0 = 3,
+        Q4K = 4,
+        Q6K = 5,
+        Q5K = 6,
+        Q5_0 = 7,
+    }
+
+    impl QType {
+        /// The seam's enum for the same encoding. The oracle keys types by the
+        /// kernel's LM_W_QTYPE selector, which is deliberately not ggml's id.
+        fn seam(self) -> super::super::manifest::GgmlType {
+            use super::super::manifest::GgmlType as G;
+            match self {
+                QType::Q8_0 => G::Q8_0,
+                QType::Q4_0 => G::Q4_0,
+                QType::Q4K => G::Q4_K,
+                QType::Q6K => G::Q6_K,
+                QType::Q5K => G::Q5_K,
+                QType::Q5_0 => G::Q5_0,
+            }
+        }
+
+        fn blk_elems(self) -> usize {
+            match self {
+                QType::Q8_0 | QType::Q4_0 | QType::Q5_0 => 32,
+                QType::Q4K | QType::Q6K | QType::Q5K => 256,
+            }
+        }
+        fn blk_bytes(self) -> usize {
+            match self {
+                QType::Q8_0 => 34,
+                QType::Q4_0 => 18,
+                QType::Q5_0 => 22,
+                QType::Q4K => 144,
+                QType::Q6K => 210,
+                QType::Q5K => 176,
+            }
+        }
+    }
+
+    fn f16_at(b: &[u8]) -> f32 {
+        f16::from_le_bytes([b[0], b[1]]).to_f32()
+    }
+
+    // ggml's get_scale_min_k4, exactly — including q[j] (not q[j+4]) donating
+    // the min's top bits in the second half.
+    fn scale_min_k4(j: usize, q: &[u8]) -> (u32, u32) {
+        if j < 4 {
+            ((q[j] & 63) as u32, (q[j + 4] & 63) as u32)
+        } else {
+            (
+                ((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4)) as u32,
+                ((q[j + 4] >> 4) | ((q[j] >> 6) << 4)) as u32,
+            )
+        }
+    }
+
+    /// Placeholder for the seam's dequant_row_ref (exact ggml semantics,
+    /// strict IEEE f32 — no fma, same expression shapes as ggml-quants.c).
+    fn ref_dequant_row(ty: QType, src: &[u8], out: &mut [f32]) {
+        let (be, bb) = (ty.blk_elems(), ty.blk_bytes());
+        assert_eq!(out.len() % be, 0);
+        assert_eq!(src.len(), out.len() / be * bb);
+        for (blk, y) in src.chunks_exact(bb).zip(out.chunks_exact_mut(be)) {
+            match ty {
+                QType::Q8_0 => {
+                    let d = f16_at(blk);
+                    for j in 0..32 {
+                        y[j] = (blk[2 + j] as i8) as f32 * d;
+                    }
+                }
+                QType::Q4_0 => {
+                    let d = f16_at(blk);
+                    for j in 0..16 {
+                        let x0 = (blk[2 + j] & 0x0F) as i32 - 8;
+                        let x1 = (blk[2 + j] >> 4) as i32 - 8;
+                        y[j] = x0 as f32 * d;
+                        y[j + 16] = x1 as f32 * d;
+                    }
+                }
+                QType::Q4K => {
+                    let d = f16_at(blk);
+                    let min = f16_at(&blk[2..]);
+                    let scales = &blk[4..16];
+                    let qs = &blk[16..144];
+                    let mut yy = 0usize;
+                    let mut is = 0usize;
+                    let mut qoff = 0usize;
+                    for _ in (0..256).step_by(64) {
+                        let (sc, m) = scale_min_k4(is, scales);
+                        let d1 = d * sc as f32;
+                        let m1 = min * m as f32;
+                        let (sc, m) = scale_min_k4(is + 1, scales);
+                        let d2 = d * sc as f32;
+                        let m2 = min * m as f32;
+                        for l in 0..32 {
+                            y[yy] = d1 * (qs[qoff + l] & 0xF) as f32 - m1;
+                            yy += 1;
+                        }
+                        for l in 0..32 {
+                            y[yy] = d2 * (qs[qoff + l] >> 4) as f32 - m2;
+                            yy += 1;
+                        }
+                        qoff += 32;
+                        is += 2;
+                    }
+                }
+                QType::Q5_0 => {
+                    let d = f16_at(blk);
+                    let qh = u32::from_le_bytes(blk[2..6].try_into().unwrap());
+                    for j in 0..16 {
+                        let xh_0 = ((qh >> j) << 4) & 0x10;
+                        let xh_1 = (qh >> (j + 12)) & 0x10;
+                        let x0 = ((blk[6 + j] & 0x0F) as u32 | xh_0) as i32 - 16;
+                        let x1 = ((blk[6 + j] >> 4) as u32 | xh_1) as i32 - 16;
+                        y[j] = x0 as f32 * d;
+                        y[j + 16] = x1 as f32 * d;
+                    }
+                }
+                QType::Q5K => {
+                    let d = f16_at(blk);
+                    let min = f16_at(&blk[2..]);
+                    let scales = &blk[4..16];
+                    let qh = &blk[16..48];
+                    let qs = &blk[48..176];
+                    let mut is = 0usize;
+                    let (mut u1, mut u2) = (1u8, 2u8);
+                    for j in (0..256).step_by(64) {
+                        let ql = &qs[j / 2..j / 2 + 32];
+                        let (sc, m) = scale_min_k4(is, scales);
+                        let d1 = d * sc as f32;
+                        let m1 = min * m as f32;
+                        let (sc, m) = scale_min_k4(is + 1, scales);
+                        let d2 = d * sc as f32;
+                        let m2 = min * m as f32;
+                        for l in 0..32 {
+                            let hi1: u32 = if qh[l] & u1 != 0 { 16 } else { 0 };
+                            let hi2: u32 = if qh[l] & u2 != 0 { 16 } else { 0 };
+                            y[j + l] = d1 * ((ql[l] & 0x0F) as u32 + hi1) as f32 - m1;
+                            y[j + 32 + l] = d2 * ((ql[l] >> 4) as u32 + hi2) as f32 - m2;
+                        }
+                        is += 2;
+                        u1 <<= 2;
+                        u2 <<= 2;
+                    }
+                }
+                QType::Q6K => {
+                    let d = f16_at(&blk[208..]);
+                    for n in (0..256).step_by(128) {
+                        let ql = &blk[n / 2..];
+                        let qh = &blk[128 + n / 4..];
+                        let sc = &blk[192 + n / 16..];
+                        for l in 0..32 {
+                            let is = l / 16;
+                            let q1 = ((ql[l] & 0xF) as i32 | (((qh[l] >> 0) & 3) as i32) << 4) - 32;
+                            let q2 = ((ql[l + 32] & 0xF) as i32 | (((qh[l] >> 2) & 3) as i32) << 4) - 32;
+                            let q3 = ((ql[l] >> 4) as i32 | (((qh[l] >> 4) & 3) as i32) << 4) - 32;
+                            let q4 = ((ql[l + 32] >> 4) as i32 | (((qh[l] >> 6) & 3) as i32) << 4) - 32;
+                            y[n + l] = d * (sc[is] as i8) as f32 * q1 as f32;
+                            y[n + l + 32] = d * (sc[is + 2] as i8) as f32 * q2 as f32;
+                            y[n + l + 64] = d * (sc[is + 4] as i8) as f32 * q3 as f32;
+                            y[n + l + 96] = d * (sc[is + 6] as i8) as f32 * q4 as f32;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Adversarial rows: all-zero, subnormal scales with extreme quants, max
+    /// f16 scale with max-magnitude quants, and dense LCG-patterned bytes that
+    /// exercise every scale high-bit combination. Inf/NaN f16 scales are out
+    /// of domain (no real checkpoint carries them; NaN payloads differ across
+    /// engines) and deliberately excluded.
+    fn adversarial_rows(ty: QType, n_blocks: usize, n_rows: usize) -> Vec<u8> {
+        let bb = ty.blk_bytes();
+        let mut out = Vec::with_capacity(n_rows * n_blocks * bb);
+        let mut lcg: u32 = 0x2545_F491;
+        let mut next = || {
+            lcg = lcg.wrapping_mul(1664525).wrapping_add(1013904223);
+            (lcg >> 16) as u8
+        };
+        let scale_bytes: [[u8; 2]; 4] = [
+            f16::from_f32(0.0).to_le_bytes(),
+            [0x01, 0x00],                       // smallest positive subnormal
+            [0xFF, 0x83],                       // negative subnormal
+            f16::MAX.to_le_bytes(),             // 65504
+        ];
+        for row in 0..n_rows {
+            for blk in 0..n_blocks {
+                let variant = (row * n_blocks + blk) % 4;
+                let mut b = vec![0u8; bb];
+                match variant {
+                    0 => {} // all-zero block
+                    _ => {
+                        for x in b.iter_mut() {
+                            *x = next();
+                        }
+                        let sb = scale_bytes[variant];
+                        match ty {
+                            QType::Q8_0 | QType::Q4_0 | QType::Q5_0 => b[0..2].copy_from_slice(&sb),
+                            QType::Q4K | QType::Q5K => {
+                                b[0..2].copy_from_slice(&sb);
+                                b[2..4].copy_from_slice(&scale_bytes[3 - variant + 1]);
+                            }
+                            QType::Q6K => b[208..210].copy_from_slice(&sb),
+                        }
+                        if variant == 3 {
+                            // max-magnitude quants under the max scale
+                            match ty {
+                                QType::Q8_0 => b[2..34].fill(0x80),
+                                QType::Q4_0 => b[2..18].fill(0x0F),
+                                QType::Q5_0 => b[2..22].fill(0xFF), // qh + nibbles all set
+                                QType::Q4K => {
+                                    b[4..16].fill(0xFF); // all scale/min bits set
+                                    b[16..144].fill(0xFF);
+                                }
+                                QType::Q5K => {
+                                    b[4..176].fill(0xFF); // scales, high bits, nibbles
+                                }
+                                QType::Q6K => {
+                                    b[0..192].fill(0xFF);
+                                    b[192..208].fill(0x80); // scales = -128
+                                }
+                            }
+                        }
+                    }
+                }
+                out.extend_from_slice(&b);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn gpu_dequant_matches_reference_bit_for_bit() {
+        let device = Device::system_default().expect("Metal device required for the oracle");
+        // PRECISE library: fast-math would license fma fusion and reordering,
+        // and the gate is bit equality with strict-IEEE Rust — the shipped
+        // quant pipelines are built from this same fast-math-off source.
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+
+        for ty in [QType::Q8_0, QType::Q4_0, QType::Q5_0, QType::Q4K, QType::Q6K, QType::Q5K] {
+            let (n_blocks, n_rows) = (8usize, 3usize);
+            let cols = n_blocks * ty.blk_elems();
+            let row_bytes = n_blocks * ty.blk_bytes();
+            let src = adversarial_rows(ty, n_blocks, n_rows);
+
+            // THREE-way, on purpose. `want` is the SEAM's reference — the one
+            // production actually calls — while the shim below was written
+            // independently from ggml-quants.c before the seam existed. GPU vs
+            // seam catches a kernel bug; shim vs seam catches a shared
+            // misreading of ggml, which no single reference can catch alone.
+            let mut want = vec![0f32; n_rows * cols];
+            let mut shim = vec![0f32; n_rows * cols];
+            for r in 0..n_rows {
+                let row = &src[r * row_bytes..(r + 1) * row_bytes];
+                super::super::manifest::dequant_row_ref(
+                    ty.seam(),
+                    row,
+                    &mut want[r * cols..(r + 1) * cols],
+                );
+                ref_dequant_row(ty, row, &mut shim[r * cols..(r + 1) * cols]);
+            }
+            for (i, (a, b)) in want.iter().zip(&shim).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{ty:?}: seam dequant_row_ref and the independent shim disagree at elem {i} \
+                     ({a} vs {b}) — one of them misreads ggml-quants.c"
+                );
+            }
+
+            let consts = FunctionConstantValues::new();
+            let tyv = ty as u32;
+            consts.set_constant_value_at_index(&tyv as *const u32 as *const _, MTLDataType::UInt, 25);
+            let f = lib.get_function("lm_dequant_oracle", Some(consts)).expect("oracle fn");
+            let pipe = device.new_compute_pipeline_state_with_function(&f).expect("oracle pipe");
+
+            let src_buf = device.new_buffer_with_data(
+                src.as_ptr() as *const _,
+                src.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let out_buf = device.new_buffer(
+                (want.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let queue = device.new_command_queue();
+            let cb = queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipe);
+            enc.set_buffer(0, Some(&src_buf), 0);
+            enc.set_buffer(1, Some(&out_buf), 0);
+            let p: [u32; 3] = [cols as u32, row_bytes as u32, n_rows as u32];
+            enc.set_bytes(2, 12, p.as_ptr() as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(cols.div_ceil(32) as u64, n_rows as u64, 1),
+                MTLSize::new(32, 1, 1),
+            );
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            let got = unsafe {
+                std::slice::from_raw_parts(out_buf.contents() as *const f32, want.len())
+            };
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    g.to_bits() == w.to_bits(),
+                    "{ty:?}: col {} row {} (block {}, elem {}): gpu {g:e} ({:#010x}) != ref {w:e} ({:#010x})",
+                    i % cols,
+                    i / cols,
+                    (i % cols) / ty.blk_elems(),
+                    (i % cols) % ty.blk_elems(),
+                    g.to_bits(),
+                    w.to_bits(),
+                );
+            }
+        }
     }
 }
