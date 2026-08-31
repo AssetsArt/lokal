@@ -673,6 +673,50 @@ constant int lm_kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
 };
 
+// ggml's IQ1S_DELTA / IQ1M_DELTA, both 0.125f.
+constant float LM_IQ1_DELTA = 0.125f;
+
+// IQ1_S: d | qs[32] | qh[8 u16] (50 B). Grid bytes are SIGNED here, unlike
+// every IQ2/IQ3 grid, and each value carries a +/-0.125 delta from qh's top bit.
+inline float lm_dequant_iq1_s(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 8) * 50;
+    float d = lm_f16_at(b);
+    uint i = col & 255;
+    uint ib = i >> 5, r = i & 31;
+    uint l = r >> 3, j = r & 7;
+    uint qh = (uint)b[34 + 2 * ib] | ((uint)b[35 + 2 * ib] << 8);
+    float dl = d * (float)(2 * ((qh >> 12) & 7) + 1);
+    float delta = (qh & 0x8000) ? -LM_IQ1_DELTA : LM_IQ1_DELTA;
+    uint gi = (uint)b[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8);
+    char g = (char)((lm_iq1s_grid[gi] >> (8 * j)) & 0xFF);
+    return dl * ((float)g + delta);
+}
+
+// IQ1_M: qs[32] | qh[16] | scales[8] (56 B). There is NO d field — the
+// super-block scale is assembled from four nibbles spread across the four
+// scale u16s and only then read as an f16.
+inline float lm_dequant_iq1_m(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 8) * 56;
+    uint s0 = (uint)b[48] | ((uint)b[49] << 8);
+    uint s1 = (uint)b[50] | ((uint)b[51] << 8);
+    uint s2 = (uint)b[52] | ((uint)b[53] << 8);
+    uint s3 = (uint)b[54] | ((uint)b[55] << 8);
+    ushort bits = (ushort)((s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000));
+    float d = (float)as_type<half>(bits);
+    uint i = col & 255;
+    uint ib = i >> 5, r = i & 31;
+    uint l = r >> 3, j = r & 7;
+    uint scw = (ib / 2 == 0) ? s0 : ((ib / 2 == 1) ? s1 : ((ib / 2 == 2) ? s2 : s3));
+    uint shift = 6 * (ib % 2) + ((l < 2) ? 0 : 3);
+    float dl = d * (float)(2 * ((scw >> shift) & 7) + 1);
+    uint qh = b[32 + 2 * ib + (l >> 1)];
+    uint gi = (uint)b[4 * ib + l] | ((qh << ((l % 2 == 0) ? 8 : 4)) & 0x700);
+    uint mask = (l % 2 == 0) ? 0x08 : 0x80;
+    float delta = (qh & mask) ? -LM_IQ1_DELTA : LM_IQ1_DELTA;
+    char g = (char)((lm_iq1s_grid[gi] >> (8 * j)) & 0xFF);
+    return dl * ((float)g + delta);
+}
+
 // IQ2_XXS: d | qs[32 u16] (66 B). Per 32-element group two u32: the first
 // four bytes are grid indices, the second holds a 4-bit scale on top and four
 // 7-bit sign selectors below.
@@ -1226,6 +1270,24 @@ inline float lm_dot_run(device const uchar *row, uint e0, device const float *x)
         case 14: return lm_dot_run_iq2_xxs(row, e0, x);
         case 15: return lm_dot_run_iq2_xs(row, e0, x);
         case 16: return lm_dot_run_iq2_s(row, e0, x);
+        // The IQ1 pair has no bespoke run variant: its per-element path already
+        // decodes one grid entry per 8 outputs, and these types appear on the
+        // smallest tensors of the smallest files, where the win would not pay
+        // for a fourth hand-derived index mapping.
+        case 17: {
+            float a = 0.0f;
+            for (uint t = 0; t < 32; t++) {
+                a += lm_dequant_iq1_s(row, e0 + t) * x[e0 + t];
+            }
+            return a;
+        }
+        case 18: {
+            float a = 0.0f;
+            for (uint t = 0; t < 32; t++) {
+                a += lm_dequant_iq1_m(row, e0 + t) * x[e0 + t];
+            }
+            return a;
+        }
         default: return 0.0f;
     }
 }
@@ -1247,6 +1309,8 @@ inline float lm_dequant(device const uchar *row, uint col) {
         case 14: return lm_dequant_iq2_xxs(row, col);
         case 15: return lm_dequant_iq2_xs(row, col);
         case 16: return lm_dequant_iq2_s(row, col);
+        case 17: return lm_dequant_iq1_s(row, col);
+        case 18: return lm_dequant_iq1_m(row, col);
         default: return 0.0f;
     }
 }
@@ -1308,6 +1372,8 @@ inline ulong lm_row_bytes(uint in_dim) {
         case 14: return (ulong)(in_dim / 256) * 66;  // IQ2_XXS
         case 15: return (ulong)(in_dim / 256) * 74;  // IQ2_XS
         case 16: return (ulong)(in_dim / 256) * 82;  // IQ2_S
+        case 17: return (ulong)(in_dim / 256) * 50;  // IQ1_S
+        case 18: return (ulong)(in_dim / 256) * 56;  // IQ1_M
         default: return 0; // unused for element-addressable types
     }
 }

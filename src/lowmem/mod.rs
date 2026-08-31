@@ -272,6 +272,8 @@ impl SrcType {
             SrcType::Quant(GgmlType::IQ2_XXS) => 14,
             SrcType::Quant(GgmlType::IQ2_XS) => 15,
             SrcType::Quant(GgmlType::IQ2_S) => 16,
+            SrcType::Quant(GgmlType::IQ1_S) => 17,
+            SrcType::Quant(GgmlType::IQ1_M) => 18,
             SrcType::Quant(_) => u32::MAX, // refused at PagedTensor::new
         }
     }

@@ -616,6 +616,8 @@ mod quant_oracle {
         IQ4XS = 11,
         IQ3XXS = 12,
         IQ3S = 13,
+        IQ1S = 17,
+        IQ1M = 18,
         IQ2XXS = 14,
         IQ2XS = 15,
         IQ2S = 16,
@@ -629,6 +631,8 @@ mod quant_oracle {
             match self {
                 QType::Q8_0 => G::Q8_0,
                 QType::Q4_0 => G::Q4_0,
+                QType::IQ1S => G::IQ1_S,
+                QType::IQ1M => G::IQ1_M,
                 QType::IQ2XXS => G::IQ2_XXS,
                 QType::IQ2XS => G::IQ2_XS,
                 QType::IQ2S => G::IQ2_S,
@@ -650,7 +654,8 @@ mod quant_oracle {
                 QType::Q8_0 | QType::Q4_0 | QType::Q5_0 | QType::IQ4NL => 32,
                 QType::Q4K | QType::Q6K | QType::Q5K | QType::Q2K | QType::Q3K
                 | QType::IQ4XS | QType::IQ3XXS | QType::IQ3S
-                | QType::IQ2XXS | QType::IQ2XS | QType::IQ2S => 256,
+                | QType::IQ2XXS | QType::IQ2XS | QType::IQ2S
+                | QType::IQ1S | QType::IQ1M => 256,
             }
         }
         fn blk_bytes(self) -> usize {
@@ -667,6 +672,8 @@ mod quant_oracle {
                 QType::IQ4XS => 136,
                 QType::IQ3XXS => 98,
                 QType::IQ3S => 110,
+                QType::IQ1S => 50,
+                QType::IQ1M => 56,
                 QType::IQ2XXS => 66,
                 QType::IQ2XS => 74,
                 QType::IQ2S => 82,
@@ -678,7 +685,7 @@ mod quant_oracle {
     /// impossible by construction — the shim's independence is in how it
     /// INDEXES the table, not in retyping 16 magic numbers.
     use super::super::iq_grids::{
-        IQ2S_GRID as IQ2S, IQ2XS_GRID as IQ2XS, IQ2XXS_GRID as IQ2XXS, IQ3S_GRID as IQ3S,
+        IQ1S_GRID as IQ1S, IQ2S_GRID as IQ2S, IQ2XS_GRID as IQ2XS, IQ2XXS_GRID as IQ2XXS, IQ3S_GRID as IQ3S,
         IQ3XXS_GRID as IQ3XXS, KMASK_IQ2XS as KMASK, KSIGNS_IQ2XS as KSIGNS,
     };
     use super::super::manifest::KVALUES_IQ4NL as KV;
@@ -719,6 +726,58 @@ mod quant_oracle {
                 // forward writing y as it goes, rather than the seam's
                 // per-element index decomposition.
                 // The IQ2 trio in ggml's sequential order.
+                // The IQ1 pair in ggml's sequential order. Grid bytes are
+                // SIGNED, which is what separates these from every IQ2/IQ3 type.
+                QType::IQ1S => {
+                    let d = f16_at(blk);
+                    let mut o = 0usize;
+                    for ib in 0..8 {
+                        let qh = u16::from_le_bytes([blk[34 + 2 * ib], blk[35 + 2 * ib]]);
+                        let dl = d * (2 * ((qh >> 12) & 7) + 1) as f32;
+                        let delta = if qh & 0x8000 != 0 { -0.125f32 } else { 0.125f32 };
+                        for l in 0..4 {
+                            let gi = blk[2 + 4 * ib + l] as usize
+                                | ((((qh >> (3 * l)) & 7) as usize) << 8);
+                            let g = IQ1S[gi];
+                            for j in 0..8 {
+                                let v = ((g >> (8 * j)) & 0xFF) as u8 as i8;
+                                y[o + j] = dl * (v as f32 + delta);
+                            }
+                            o += 8;
+                        }
+                    }
+                }
+                QType::IQ1M => {
+                    let sc: Vec<u16> = (0..4)
+                        .map(|k| u16::from_le_bytes([blk[48 + 2 * k], blk[49 + 2 * k]]))
+                        .collect();
+                    let bits = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00)
+                        | (sc[3] & 0xf000);
+                    let d = f16::from_bits(bits).to_f32();
+                    let mut o = 0usize;
+                    for ib in 0..8 {
+                        let dl1 = d * (2 * ((sc[ib / 2] >> (6 * (ib % 2))) & 7) + 1) as f32;
+                        let dl2 = d * (2 * ((sc[ib / 2] >> (6 * (ib % 2) + 3)) & 7) + 1) as f32;
+                        let (qh0, qh1) = (blk[32 + 2 * ib] as usize, blk[33 + 2 * ib] as usize);
+                        let idx = [
+                            blk[4 * ib] as usize | ((qh0 << 8) & 0x700),
+                            blk[4 * ib + 1] as usize | ((qh0 << 4) & 0x700),
+                            blk[4 * ib + 2] as usize | ((qh1 << 8) & 0x700),
+                            blk[4 * ib + 3] as usize | ((qh1 << 4) & 0x700),
+                        ];
+                        let dq = [qh0 & 0x08, qh0 & 0x80, qh1 & 0x08, qh1 & 0x80];
+                        for l in 0..4 {
+                            let dl = if l < 2 { dl1 } else { dl2 };
+                            let delta = if dq[l] != 0 { -0.125f32 } else { 0.125f32 };
+                            let g = IQ1S[idx[l]];
+                            for j in 0..8 {
+                                let v = ((g >> (8 * j)) & 0xFF) as u8 as i8;
+                                y[o + j] = dl * (v as f32 + delta);
+                            }
+                            o += 8;
+                        }
+                    }
+                }
                 QType::IQ2XXS => {
                     let d = f16_at(blk);
                     let mut o = 0usize;
@@ -1056,8 +1115,18 @@ mod quant_oracle {
                             }
                             QType::Q3K => b[108..110].copy_from_slice(&sb),
                             QType::IQ4NL | QType::IQ4XS | QType::IQ3XXS | QType::IQ3S
-                            | QType::IQ2XXS | QType::IQ2XS | QType::IQ2S => {
+                            | QType::IQ2XXS | QType::IQ2XS | QType::IQ2S | QType::IQ1S => {
                                 b[0..2].copy_from_slice(&sb)
+                            }
+                            // IQ1_M has no d field: its f16 is assembled from
+                            // nibbles of the four scale u16s, so the adversarial
+                            // scale goes in through THOSE.
+                            QType::IQ1M => {
+                                let bits = u16::from_le_bytes(sb);
+                                b[49] = (b[49] & 0x0F) | ((bits as u8 & 0x0F) << 4);
+                                b[51] = (b[51] & 0x0F) | (((bits >> 4) as u8 & 0x0F) << 4);
+                                b[53] = (b[53] & 0x0F) | (((bits >> 8) as u8 & 0x0F) << 4);
+                                b[55] = (b[55] & 0x0F) | (((bits >> 12) as u8 & 0x0F) << 4);
                             }
                         }
                         if variant == 3 {
@@ -1085,6 +1154,8 @@ mod quant_oracle {
                                     }
                                 }
                                 QType::IQ2XS => b[66..74].fill(0xFF),
+                                QType::IQ1S => b[34..50].fill(0xFF),  // qh: max scale, negative delta
+                                QType::IQ1M => b[32..48].fill(0xFF),  // qh only; scales carry the f16
                                 QType::IQ2S => {
                                     b[34..66].fill(0xFF);  // the SIGN half of qs
                                     b[66..74].fill(0xFF);  // qh: both extra index bits
@@ -1151,6 +1222,8 @@ mod quant_oracle {
             QType::IQ2XXS,
             QType::IQ2XS,
             QType::IQ2S,
+            QType::IQ1S,
+            QType::IQ1M,
         ] {
             let (n_blocks, n_rows) = (8usize, 3usize);
             let cols = n_blocks * ty.blk_elems();

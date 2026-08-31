@@ -725,13 +725,15 @@ mod tests {
         put_str(&mut b, "general.architecture");
         b.extend_from_slice(&8u32.to_le_bytes());
         put_str(&mut b, "llama");
-        // (name, ggml type id): IQ1_M=29, IQ1_S=19, Q4_1=3, Q8_0=8.
+        // (name, ggml type id): Q8_1=9, Q5_1=7, Q4_1=3, Q8_0=8. The whole
+        // K and i-quant families run now, so the refused set is the legacy
+        // non-K types — this list has shrunk every time the lane landed one.
         // Deliberately types this build still refuses — as the lane implements
         // more, this list moves rather than the assertions weakening.
         for (name, ty) in [
-            ("token_embd.weight", 29u32),
-            ("blk.0.ffn_down.weight", 29),
-            ("blk.0.attn_q.weight", 19),
+            ("token_embd.weight", 9u32),
+            ("blk.0.ffn_down.weight", 9),
+            ("blk.0.attn_q.weight", 7),
             ("blk.1.attn_q.weight", 3),
             ("output_norm.weight", 8),
         ] {
@@ -760,12 +762,12 @@ mod tests {
             Err(e) => e.to_string(),
         };
         std::fs::remove_file(p).ok();
-        for want in ["IQ1_M", "IQ1_S", "Q4_1"] {
+        for want in ["Q8_1", "Q5_1", "Q4_1"] {
             assert!(err.contains(want), "error should name {want}: {err}");
         }
         // Counts and an example per type, so the reader can see which tensors.
-        assert!(err.contains("IQ1_M (2 tensors, e.g. token_embd.weight)"), "{err}");
-        assert!(err.contains("IQ1_S (1 tensor, e.g."), "singular reads right: {err}");
+        assert!(err.contains("Q8_1 (2 tensors, e.g. token_embd.weight)"), "{err}");
+        assert!(err.contains("Q5_1 (1 tensor, e.g."), "singular reads right: {err}");
         assert!(err.contains("3 quantization type(s)"), "{err}");
         assert!(err.contains("across 4 of 5 tensors"), "{err}");
         // The supported type must not be listed as a PROBLEM — it may still
