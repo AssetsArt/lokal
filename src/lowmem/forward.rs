@@ -11,7 +11,7 @@
 //!     keeping a vocab × hidden table resident.
 
 use super::pool::{Admit, Bind, PagedTensor, PendingConvert, PoolStats, WeightPool};
-use super::{dequant_row_ref, LayerWeights, LowMemEngine, SrcType};
+use super::{dequant_row_ref, Fam, LayerWeights, LowMemEngine, SrcType};
 use crate::engine::Session;
 use crate::gpu::metal as gpu;
 use half::{bf16, f16};
@@ -246,7 +246,7 @@ impl<'a> LowMemSession<'a> {
                 n_rows: n_rows as u32,
                 y_stride: y_stride as u32,
             };
-            enc.set_compute_pipeline_state(&self.e.pipes.matmul_pg);
+            enc.set_compute_pipeline_state(self.e.matmul_pipe(t.ty));
             enc.set_buffer(0, Some(pool.get(t, blk)), 0);
             match &t.bias {
                 Some(b) => enc.set_buffer(1, Some(b), (r0 * 2) as u64),
@@ -271,7 +271,7 @@ impl<'a> LowMemSession<'a> {
     fn enc_matvec_bound(
         &self,
         enc: &ComputeCommandEncoderRef,
-        pipes: (&ComputePipelineState, &ComputePipelineState), // (staged f16, direct bf16)
+        fam: Fam,
         t: &PagedTensor,
         binds: &[Bind],
         x: &Buffer,
@@ -284,11 +284,11 @@ impl<'a> LowMemSession<'a> {
             let p = MatvecParams { in_dim: t.in_dim as u32, out_dim: rows as u32 };
             match bind {
                 Bind::Pool(buf) => {
-                    enc.set_compute_pipeline_state(pipes.0);
+                    enc.set_compute_pipeline_state(self.e.staged_pipe(t.ty, fam));
                     enc.set_buffer(0, Some(buf), 0);
                 }
                 Bind::Direct(view, off) => {
-                    enc.set_compute_pipeline_state(pipes.1);
+                    enc.set_compute_pipeline_state(self.e.direct_pipe(fam));
                     enc.set_buffer(0, Some(view), *off as u64);
                 }
             }
@@ -475,12 +475,9 @@ impl<'a> LowMemSession<'a> {
         let kv_byte_off = (e.win.slot_of(pos) * cfg.kv_dim() * 2) as u64;
 
         self.enc_rmsnorm(enc, &self.x, 0, &lw.input_ln, &self.xn, 1);
-        let mv = (&e.pipes.matvec, &e.direct.matvec);
-        let mvh = (&e.pipes.matvec_h, &e.direct.matvec_h);
-        let mva = (&e.pipes.matvec_acc, &e.direct.matvec_acc);
-        self.enc_matvec_bound(enc, mv, &lw.q, &plan.q, &self.xn, &self.q, 0, 4);
-        self.enc_matvec_bound(enc, mvh, &lw.k, &plan.k, &self.xn, &self.k_cache[l], kv_byte_off, 2);
-        self.enc_matvec_bound(enc, mvh, &lw.v, &plan.v, &self.xn, &self.v_cache[l], kv_byte_off, 2);
+        self.enc_matvec_bound(enc, Fam::Mv, &lw.q, &plan.q, &self.xn, &self.q, 0, 4);
+        self.enc_matvec_bound(enc, Fam::MvH, &lw.k, &plan.k, &self.xn, &self.k_cache[l], kv_byte_off, 2);
+        self.enc_matvec_bound(enc, Fam::MvH, &lw.v, &plan.v, &self.xn, &self.v_cache[l], kv_byte_off, 2);
         {
             let p = RopeQkParams {
                 head_dim: hd as u32,
@@ -527,7 +524,7 @@ impl<'a> LowMemSession<'a> {
                 MTLSize::new(hd as u64, 1, 1),
             );
         }
-        self.enc_matvec_bound(enc, mva, &lw.o, &plan.o, &self.att, &self.x, 0, 4);
+        self.enc_matvec_bound(enc, Fam::MvA, &lw.o, &plan.o, &self.att, &self.x, 0, 4);
 
         self.enc_rmsnorm(enc, &self.x, 0, &lw.post_ln, &self.xn, 1);
         // SwiGLU: gate and up share [inter, h], so their pages split identically.
@@ -539,8 +536,8 @@ impl<'a> LowMemSession<'a> {
             .zip(&plan.up)
             .any(|(g, u)| !matches!((g, u), (Bind::Pool(_), Bind::Pool(_)) | (Bind::Direct(..), Bind::Direct(..))));
         if mixed {
-            self.enc_matvec_bound(enc, mv, &lw.gate, &plan.gate, &self.xn, &self.gate, 0, 4);
-            self.enc_matvec_bound(enc, mv, &lw.up, &plan.up, &self.xn, &self.up, 0, 4);
+            self.enc_matvec_bound(enc, Fam::Mv, &lw.gate, &plan.gate, &self.xn, &self.gate, 0, 4);
+            self.enc_matvec_bound(enc, Fam::Mv, &lw.up, &plan.up, &self.xn, &self.up, 0, 4);
             self.enc_elem(enc, &e.pipes.silu_mul, &self.gate, &self.up, cfg.intermediate_size);
         } else {
             for (blk, (bg, bu)) in plan.gate.iter().zip(&plan.up).enumerate() {
@@ -548,7 +545,7 @@ impl<'a> LowMemSession<'a> {
                 let p = MatvecParams { in_dim: lw.gate.in_dim as u32, out_dim: rows as u32 };
                 match (bg, bu) {
                     (Bind::Pool(g), Bind::Pool(u)) => {
-                        enc.set_compute_pipeline_state(&e.pipes.matvec_swiglu);
+                        enc.set_compute_pipeline_state(e.swiglu_pipe(lw.gate.ty));
                         enc.set_buffer(0, Some(g), 0);
                         enc.set_buffer(1, Some(u), 0);
                     }
@@ -565,7 +562,7 @@ impl<'a> LowMemSession<'a> {
                 gpu::dispatch_simdgroup_rows(enc, rows as u32);
             }
         }
-        self.enc_matvec_bound(enc, mva, &lw.down, &plan.down, &self.gate, &self.x, 0, 4);
+        self.enc_matvec_bound(enc, Fam::MvA, &lw.down, &plan.down, &self.gate, &self.x, 0, 4);
     }
 
     /// Process `n` tokens at positions pos0.. — one command buffer per layer,
@@ -622,7 +619,7 @@ impl<'a> LowMemSession<'a> {
             self.enc_rmsnorm(enc, &self.x, ((n - 1) * h * 4) as u64, &e.final_norm, &self.xn, 1);
             self.enc_matvec_bound(
                 enc,
-                (&e.pipes.matvec, &e.direct.matvec),
+                Fam::Mv,
                 lm,
                 &binds,
                 &self.xn,

@@ -148,6 +148,28 @@ pub(crate) struct DirectPipes {
     pub matvec_swiglu: ComputePipelineState,
 }
 
+/// The matvec family plus the prefill GEMM, specialized for ONE quantized
+/// weight encoding. Built from the PRECISE library: Metal's fast math contracts
+/// multiply-add pairs, which silently breaks bit-for-bit agreement with the
+/// strict-IEEE Rust reference the oracle gate compares against. The existing
+/// f16/bf16 pipelines keep the fast library, so -b metal's numerics never move.
+pub(crate) struct QuantPipes {
+    pub matvec: ComputePipelineState,
+    pub matvec_h: ComputePipelineState,
+    pub matvec_acc: ComputePipelineState,
+    pub matvec_swiglu: ComputePipelineState,
+    pub matmul_pg: ComputePipelineState,
+}
+
+/// Which member of the matvec family a call site wants; the weight's own type
+/// picks the specialization.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fam {
+    Mv,
+    MvH,
+    MvA,
+}
+
 /// One transformer block: eagerly-resident norms, paged projection matrices.
 pub(crate) struct LayerWeights {
     pub input_ln: Buffer,
@@ -199,8 +221,7 @@ impl SrcType {
             SrcType::Quant(GgmlType::Q4_K) => 4,
             SrcType::Quant(GgmlType::Q6_K) => 5,
             SrcType::Quant(GgmlType::Q5_K) => 6,
-            // Q5_0 is selector 7 in the kernels already (95103e7); the seam
-            // enum gains the variant on task q5-0-seam, and this arm with it.
+            SrcType::Quant(GgmlType::Q5_0) => 7,
             SrcType::Quant(_) => u32::MAX, // refused at PagedTensor::new
         }
     }
@@ -409,6 +430,9 @@ pub struct LowMemEngine {
     queue: CommandQueue,
     pipes: Pipes,
     direct: DirectPipes,
+    /// Quant pipelines by LM_W_QTYPE selector, built only for the types this
+    /// checkpoint actually contains.
+    quant: HashMap<u32, QuantPipes>,
     layers: Vec<LayerWeights>,
     final_norm: Buffer,
     lm_head: PagedTensor,
@@ -440,18 +464,6 @@ impl LowMemEngine {
     pub fn new(dir: &Path, cfg: ModelConfig, opts: &LowMemOpts) -> crate::Result<Self> {
         let t0 = Instant::now();
         let mut source = LowMemSource::open(dir)?;
-        // The refusal that used to sit in engine.rs, narrowed to the real gap:
-        // an F16/F32 GGUF executes through the existing f16 pipelines today,
-        // while quantized weights still need their dequant pipelines. Better a
-        // named refusal than a build that half-runs a file.
-        let quant = source.quant_types();
-        if !quant.is_empty() {
-            return Err(format!(
-                "-b lowmem cannot execute {quant:?} weights yet: the GPU dequant \
-                 pipelines land with lane gguf-kernels. F16 GGUF files run today."
-            )
-            .into());
-        }
         eprintln!(
             "lowmem: {} {} tensors | {:.1}M params (headers parsed in {:.2}s)",
             if source.is_gguf() { "gguf" } else { "manifest" },
@@ -463,8 +475,9 @@ impl LowMemEngine {
         let device = Device::system_default().ok_or("no Metal-capable GPU found")?;
         source.make_gpu_views(&device);
         let queue = device.new_command_queue();
+        let shader = gpu::shader_source(cfg.kv_dim());
         let lib = device
-            .new_library_with_source(&gpu::shader_source(cfg.kv_dim()), &CompileOptions::new())
+            .new_library_with_source(&shader, &CompileOptions::new())
             .map_err(|e| format!("failed to compile kernels.metal: {e}"))?;
         // Every build goes through the specialization API: kernels that
         // reference function constants (the matvec family via dot_wx, the
@@ -479,9 +492,12 @@ impl LowMemEngine {
                 .map_err(|e| format!("kernel {name}: {e}").into())
         };
         // Weight-encoding selector (LM_W_QTYPE at index 25): 1 = raw bf16 over
-        // the mmap views; 2..6 = the GGUF quant types (those come from the
-        // precise fast-math-off library when the engine wires them).
-        let qtype_pipe = |name: &str, qtype: u32| -> crate::Result<ComputePipelineState> {
+        // the mmap views; 2..7 = the GGUF quant types, which build from the
+        // PRECISE library below.
+        let build = |lib: &metal::Library,
+                     name: &str,
+                     qtype: u32|
+         -> crate::Result<ComputePipelineState> {
             let consts = FunctionConstantValues::new();
             consts.set_constant_value_at_index(
                 &qtype as *const u32 as *const _,
@@ -495,6 +511,48 @@ impl LowMemEngine {
                 .new_compute_pipeline_state_with_function(&f)
                 .map_err(|e| format!("kernel {name}: {e}").into())
         };
+        let qtype_pipe =
+            |name: &str, qtype: u32| -> crate::Result<ComputePipelineState> { build(&lib, name, qtype) };
+
+        // Dequant math must match dequant_row_ref BIT-FOR-BIT, and Metal's
+        // default fast math contracts a*b+c into an fma whose intermediate
+        // keeps extra precision — the two then disagree in the last ulp on
+        // exactly the values a quantizer produces. Only the quant pipelines
+        // pay for this; everything else stays on the fast library.
+        let quant_types = source.quant_types();
+        let mut quant: HashMap<u32, QuantPipes> = HashMap::new();
+        if !quant_types.is_empty() {
+            let precise = CompileOptions::new();
+            precise.set_fast_math_enabled(false);
+            let plib = device
+                .new_library_with_source(&shader, &precise)
+                .map_err(|e| format!("failed to compile kernels.metal (precise): {e}"))?;
+            let t_pipes = Instant::now();
+            for ty in &quant_types {
+                let sel = SrcType::Quant(*ty).qtype();
+                // A type with no selector has no GPU path; PagedTensor::new
+                // refuses it by tensor name, which is the useful message.
+                if sel == u32::MAX || quant.contains_key(&sel) {
+                    continue;
+                }
+                quant.insert(
+                    sel,
+                    QuantPipes {
+                        matvec: build(&plib, "matvec", sel)?,
+                        matvec_h: build(&plib, "matvec_h", sel)?,
+                        matvec_acc: build(&plib, "matvec_acc", sel)?,
+                        matvec_swiglu: build(&plib, "matvec_swiglu", sel)?,
+                        matmul_pg: build(&plib, "matmul_pg", sel)?,
+                    },
+                );
+            }
+            eprintln!(
+                "lowmem: {} quant pipeline set(s) for {:?} (precise, fast-math off) in {:.2}s",
+                quant.len(),
+                quant_types,
+                t_pipes.elapsed().as_secs_f64(),
+            );
+        }
         let env_usize = |k: &str, d: usize| {
             std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
         };
@@ -673,6 +731,7 @@ impl LowMemEngine {
             clip_warned: std::sync::atomic::AtomicBool::new(false),
             cfg,
             source,
+            quant,
             device,
             queue,
             pipes,
@@ -683,6 +742,52 @@ impl LowMemEngine {
             zero_bias,
             pool: Mutex::new(pool),
         })
+    }
+}
+
+impl LowMemEngine {
+    /// The pipeline that reads THIS tensor's encoding. Quant weights land on
+    /// the precise library's specialization; everything else keeps the f16
+    /// pipelines the safetensors path has always used, so those numerics are
+    /// untouched by construction.
+    pub(crate) fn staged_pipe(&self, ty: SrcType, fam: Fam) -> &ComputePipelineState {
+        match self.quant.get(&ty.qtype()).filter(|_| ty.is_quant()) {
+            Some(q) => match fam {
+                Fam::Mv => &q.matvec,
+                Fam::MvH => &q.matvec_h,
+                Fam::MvA => &q.matvec_acc,
+            },
+            None => match fam {
+                Fam::Mv => &self.pipes.matvec,
+                Fam::MvH => &self.pipes.matvec_h,
+                Fam::MvA => &self.pipes.matvec_acc,
+            },
+        }
+    }
+
+    /// The direct-read (mmap) sibling. Only bf16 has one today: a quant span
+    /// bound direct would need its own view plumbing, and until that lands a
+    /// quant page always goes through the pool.
+    pub(crate) fn direct_pipe(&self, fam: Fam) -> &ComputePipelineState {
+        match fam {
+            Fam::Mv => &self.direct.matvec,
+            Fam::MvH => &self.direct.matvec_h,
+            Fam::MvA => &self.direct.matvec_acc,
+        }
+    }
+
+    pub(crate) fn matmul_pipe(&self, ty: SrcType) -> &ComputePipelineState {
+        match self.quant.get(&ty.qtype()).filter(|_| ty.is_quant()) {
+            Some(q) => &q.matmul_pg,
+            None => &self.pipes.matmul_pg,
+        }
+    }
+
+    pub(crate) fn swiglu_pipe(&self, ty: SrcType) -> &ComputePipelineState {
+        match self.quant.get(&ty.qtype()).filter(|_| ty.is_quant()) {
+            Some(q) => &q.matvec_swiglu,
+            None => &self.pipes.matvec_swiglu,
+        }
     }
 }
 

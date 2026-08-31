@@ -593,6 +593,20 @@ mod quant_oracle {
     }
 
     impl QType {
+        /// The seam's enum for the same encoding. The oracle keys types by the
+        /// kernel's LM_W_QTYPE selector, which is deliberately not ggml's id.
+        fn seam(self) -> super::super::manifest::GgmlType {
+            use super::super::manifest::GgmlType as G;
+            match self {
+                QType::Q8_0 => G::Q8_0,
+                QType::Q4_0 => G::Q4_0,
+                QType::Q4K => G::Q4_K,
+                QType::Q6K => G::Q6_K,
+                QType::Q5K => G::Q5_K,
+                QType::Q5_0 => G::Q5_0,
+            }
+        }
+
         fn blk_elems(self) -> usize {
             match self {
                 QType::Q8_0 | QType::Q4_0 | QType::Q5_0 => 32,
@@ -823,12 +837,28 @@ mod quant_oracle {
             let row_bytes = n_blocks * ty.blk_bytes();
             let src = adversarial_rows(ty, n_blocks, n_rows);
 
+            // THREE-way, on purpose. `want` is the SEAM's reference — the one
+            // production actually calls — while the shim below was written
+            // independently from ggml-quants.c before the seam existed. GPU vs
+            // seam catches a kernel bug; shim vs seam catches a shared
+            // misreading of ggml, which no single reference can catch alone.
             let mut want = vec![0f32; n_rows * cols];
+            let mut shim = vec![0f32; n_rows * cols];
             for r in 0..n_rows {
-                ref_dequant_row(
-                    ty,
-                    &src[r * row_bytes..(r + 1) * row_bytes],
+                let row = &src[r * row_bytes..(r + 1) * row_bytes];
+                super::super::manifest::dequant_row_ref(
+                    ty.seam(),
+                    row,
                     &mut want[r * cols..(r + 1) * cols],
+                );
+                ref_dequant_row(ty, row, &mut shim[r * cols..(r + 1) * cols]);
+            }
+            for (i, (a, b)) in want.iter().zip(&shim).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{ty:?}: seam dequant_row_ref and the independent shim disagree at elem {i} \
+                     ({a} vs {b}) — one of them misreads ggml-quants.c"
                 );
             }
 
