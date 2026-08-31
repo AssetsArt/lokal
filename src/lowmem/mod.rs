@@ -12,6 +12,7 @@
 //! windowed attention, and the --memory-budget arithmetic.
 
 mod forward;
+mod gguf;
 mod manifest;
 mod pool;
 
