@@ -198,13 +198,11 @@ impl GgufFile {
             let ty_id = rd.u32()?;
             let offset = rd.u64()? as usize;
             let ty = GgmlType::from_gguf(ty_id).map_err(|tyname| {
-                // Q4_K_M is NOT a safe recommendation here: llama.cpp's
-                // quantizer mixes Q5_0 into small models' Q4_K_M files
-                // (challenge daa86b0f) — Q8_0 is the one label that holds.
+                // With Q5_0 in the set (ruling daa86b0f), Q4_K_M is a safe
+                // recommendation again — small models' mixed files load.
                 format!(
                     "tensor {name} is {tyname}, which lokal does not run — \
-                     re-download the model as Q8_0 (small models' Q4_K_M files \
-                     can carry {tyname} tensors)"
+                     re-download the model as Q4_K_M or Q8_0"
                 )
             })?;
             if ne[0] % ty.blk_elems() != 0 {
