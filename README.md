@@ -136,8 +136,9 @@ dequantized to f32 up front, so the honest memory cost there is the EXPANDED
 size — a 4 GB Q4 file is ~28 GB of f32, refused with both numbers named.
 `-b lowmem` keeps quantized weights paged under a fixed budget with windowed
 attention. The hybrid backend cannot run GGUF (its ANE graphs are exported
-from safetensors). GGUF architectures: `llama`, `qwen2` (and `qwen3` on
-`-b lowmem`), byte-level BPE tokenizers.
+from safetensors). GGUF architectures: `llama`, `qwen2`, and `qwen3`
+(per-head q/k norm runs on cpu, metal, and lowmem — hybrid's ANE graphs
+cannot compute it), byte-level BPE tokenizers.
 
 ## Backends
 

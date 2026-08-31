@@ -42,6 +42,9 @@ pub(crate) struct Block {
     pub(crate) k_proj: Linear,
     pub(crate) v_proj: Linear,
     pub(crate) o_proj: Linear,
+    /// qwen3: per-head RMSNorm on q and k, applied before RoPE. None elsewhere.
+    pub(crate) q_norm: Option<Vec<f32>>,
+    pub(crate) k_norm: Option<Vec<f32>>,
     pub(crate) post_attention_layernorm: Vec<f32>, // norm before the MLP
     pub(crate) gate_proj: Linear,
     pub(crate) up_proj: Linear,
@@ -55,6 +58,11 @@ pub struct Model {
     pub(crate) norm: Vec<f32>,   // final RMSNorm before the logits
     pub(crate) lm_head: Linear,  // [vocab × hidden] hidden state → score per vocab entry
     pub n_params: usize,
+    /// Per-head width, DERIVED from q_proj's actual shape — qwen3 violates the
+    /// hidden/n_heads identity (128 vs 64 on the 0.6B), so cfg.head_dim() is
+    /// wrong there and every consumer reads these instead.
+    pub head_dim: usize,
+    pub kv_dim: usize,
 }
 
 /// Attention's memory: K and V for every past token, so they are never recomputed.
@@ -66,8 +74,7 @@ pub struct KvCache {
 }
 
 impl KvCache {
-    pub fn new(cfg: &ModelConfig, max_seq: usize) -> Self {
-        let kv_dim = cfg.kv_dim();
+    pub fn new(cfg: &ModelConfig, max_seq: usize, kv_dim: usize) -> Self {
         Self {
             k: vec![vec![0.0; max_seq * kv_dim]; cfg.num_hidden_layers],
             v: vec![vec![0.0; max_seq * kv_dim]; cfg.num_hidden_layers],
@@ -89,16 +96,26 @@ impl Model {
         let n_params = t.values().map(|v| v.len()).sum();
 
         let h = cfg.hidden_size;
-        let kv = cfg.kv_dim();
+        // Head width comes from the checkpoint itself: qwen3's q_proj is
+        // [n_heads*128, hidden] with hidden/n_heads = 64 — trusting the config
+        // identity would slice every head wrong.
+        let head_dim = t
+            .get("model.layers.0.self_attn.q_proj.weight")
+            .map(|w| w.len() / h / cfg.num_attention_heads)
+            .unwrap_or_else(|| cfg.head_dim());
+        let q_dim = cfg.num_attention_heads * head_dim;
+        let kv = cfg.num_key_value_heads * head_dim;
         let mut blocks = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{i}");
             blocks.push(Block {
                 input_layernorm: take(&mut t, &format!("{p}.input_layernorm.weight"))?,
-                q_proj: linear(&mut t, &format!("{p}.self_attn.q_proj"), h, h)?,
+                q_proj: linear(&mut t, &format!("{p}.self_attn.q_proj"), h, q_dim)?,
                 k_proj: linear(&mut t, &format!("{p}.self_attn.k_proj"), h, kv)?,
                 v_proj: linear(&mut t, &format!("{p}.self_attn.v_proj"), h, kv)?,
-                o_proj: linear(&mut t, &format!("{p}.self_attn.o_proj"), h, h)?,
+                o_proj: linear(&mut t, &format!("{p}.self_attn.o_proj"), q_dim, h)?,
+                q_norm: t.remove(&format!("{p}.self_attn.q_norm.weight")),
+                k_norm: t.remove(&format!("{p}.self_attn.k_norm.weight")),
                 post_attention_layernorm: take(&mut t, &format!("{p}.post_attention_layernorm.weight"))?,
                 gate_proj: linear(&mut t, &format!("{p}.mlp.gate_proj"), h, cfg.intermediate_size)?,
                 up_proj: linear(&mut t, &format!("{p}.mlp.up_proj"), h, cfg.intermediate_size)?,
@@ -111,13 +128,13 @@ impl Model {
         let lm_head_w = t.remove("lm_head.weight").unwrap_or_else(|| embed_tokens.clone());
         let lm_head = Linear { w: lm_head_w, bias: None, in_dim: h, out_dim: cfg.vocab_size };
 
-        Ok(Self { cfg, embed_tokens, blocks, norm, lm_head, n_params })
+        Ok(Self { cfg, embed_tokens, blocks, norm, lm_head, n_params, head_dim, kv_dim: kv })
     }
 
     /// Process one token at position `pos` → logits (raw scores over the whole vocabulary).
     pub fn forward(&self, token: u32, pos: usize, cache: &mut KvCache) -> Vec<f32> {
         let cfg = &self.cfg;
-        let (h, hd) = (cfg.hidden_size, cfg.head_dim());
+        let (h, hd) = (cfg.hidden_size, self.head_dim);
 
         // 1. Embedding lookup: token id → hidden_size vector.
         let tok = token as usize;
@@ -131,6 +148,18 @@ impl Model {
             let mut k = blk.k_proj.forward(&xn);
             let v = blk.v_proj.forward(&xn);
 
+            // qwen3 normalizes every head of q and k before RoPE.
+            if let (Some(qn), Some(kn)) = (&blk.q_norm, &blk.k_norm) {
+                for head in q.chunks_exact_mut(hd) {
+                    let normed = rmsnorm(head, qn, cfg.rms_norm_eps);
+                    head.copy_from_slice(&normed);
+                }
+                for head in k.chunks_exact_mut(hd) {
+                    let normed = rmsnorm(head, kn, cfg.rms_norm_eps);
+                    head.copy_from_slice(&normed);
+                }
+            }
+
             // RoPE encodes position by rotating q,k — no separate position embedding needed.
             rope(&mut q, pos, hd, cfg.rope_theta);
             rope(&mut k, pos, hd, cfg.rope_theta);
@@ -140,7 +169,7 @@ impl Model {
             cache.k[layer][pos * kvd..(pos + 1) * kvd].copy_from_slice(&k);
             cache.v[layer][pos * kvd..(pos + 1) * kvd].copy_from_slice(&v);
 
-            let att = attention(&q, &cache.k[layer], &cache.v[layer], pos, cfg);
+            let att = attention(&q, &cache.k[layer], &cache.v[layer], pos, cfg, hd, cache.kv_dim);
             let att = blk.o_proj.forward(&att);
             for i in 0..h {
                 x[i] += att[i]; // residual connection
@@ -186,9 +215,15 @@ fn rope(x: &mut [f32], pos: usize, head_dim: usize, theta: f32) {
 ///
 /// Supports GQA (Grouped-Query Attention): several query heads share one K/V head to
 /// shrink the KV cache — e.g. SmolLM2 has 9 query heads but only 3 K/V heads.
-fn attention(q: &[f32], k_cache: &[f32], v_cache: &[f32], pos: usize, cfg: &ModelConfig) -> Vec<f32> {
-    let hd = cfg.head_dim();
-    let kvd = cfg.kv_dim();
+fn attention(
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    pos: usize,
+    cfg: &ModelConfig,
+    hd: usize,
+    kvd: usize,
+) -> Vec<f32> {
     let group = cfg.num_attention_heads / cfg.num_key_value_heads; // query heads per kv head
     let scale = 1.0 / (hd as f32).sqrt(); // keeps dot products from growing with dimension
 
