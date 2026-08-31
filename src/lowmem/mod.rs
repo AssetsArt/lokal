@@ -430,6 +430,21 @@ fn qwen35_hf_name(gguf: &str) -> Option<String> {
     }
 }
 
+/// The cached Qwen3.5-2B, for the `--ignored` real-file gates in this crate.
+/// Shared with the GPU oracle so both sides of the identity gate name the same
+/// asset. Returns None when the file is absent so the caller can say so.
+#[cfg(test)]
+pub(crate) fn tests_qwen35_gguf() -> Option<std::path::PathBuf> {
+    let snaps = std::path::PathBuf::from(std::env::var("HOME").ok()?)
+        .join(".cache/huggingface/hub/models--unsloth--Qwen3.5-2B-GGUF/snapshots");
+    std::fs::read_dir(snaps)
+        .ok()?
+        .flatten()
+        .flat_map(|e| std::fs::read_dir(e.path()).into_iter().flatten().flatten())
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "gguf"))
+}
+
 impl LowMemSource {
     pub fn open(path: &Path) -> crate::Result<Self> {
         if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
@@ -1153,16 +1168,7 @@ mod tests {
 
     // ---- qwen35 real-file tests: run by the gates with `--ignored` ----
 
-    fn qwen35_gguf() -> Option<std::path::PathBuf> {
-        let snaps = std::path::PathBuf::from(std::env::var("HOME").ok()?)
-            .join(".cache/huggingface/hub/models--unsloth--Qwen3.5-2B-GGUF/snapshots");
-        std::fs::read_dir(snaps)
-            .ok()?
-            .flatten()
-            .flat_map(|e| std::fs::read_dir(e.path()).into_iter().flatten().flatten())
-            .map(|e| e.path())
-            .find(|p| p.extension().is_some_and(|x| x == "gguf"))
-    }
+    use super::tests_qwen35_gguf as qwen35_gguf;
 
     /// Every tensor the qwen35 forward pass will ask for must be ADDRESSABLE
     /// before any of it is written. The hybrid has two different block shapes
