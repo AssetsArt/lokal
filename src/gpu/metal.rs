@@ -3429,7 +3429,7 @@ mod qwen35_kernel_oracle {
         };
 
         // ggml_mrope_cache_init, non-interleaved branch.
-        let mrope_thetas = |bases: [f32; 4], indep_sects: bool| -> Vec<f32> {
+        let mrope_thetas = |bases: [f32; 4], indep_sects: bool, is_imrope: bool| -> Vec<f32> {
             let sect_dims: usize = sections.iter().sum();
             let sec_w = sections[1] + sections[0];
             let sec_e = sections[2] + sec_w;
@@ -3448,7 +3448,20 @@ mod qwen35_kernel_oracle {
                             th[3] = bases[3];
                         }
                     }
-                    let t = if sector >= sections[0] && sector < sec_w {
+                    let t = if is_imrope {
+                        // The branch qwen35 ACTUALLY takes: llama-model.cpp:2708
+                        // maps LLM_ARCH_QWEN35 to LLAMA_ROPE_TYPE_IMROPE, so the
+                        // interleaved selector runs, not the contiguous one.
+                        if sector % 3 == 1 && sector < 3 * sections[1] {
+                            th[1]
+                        } else if sector % 3 == 2 && sector < 3 * sections[2] {
+                            th[2]
+                        } else if sector % 3 == 0 && sector < 3 * sections[0] {
+                            th[0]
+                        } else {
+                            th[3]
+                        }
+                    } else if sector >= sections[0] && sector < sec_w {
                         th[1]
                     } else if sector >= sec_w && sector < sec_w + sections[2] {
                         th[2]
@@ -3470,17 +3483,26 @@ mod qwen35_kernel_oracle {
             let base = pos as f32;
             // A TEXT batch: one position broadcast into all four components.
             let plain = rope_thetas(base);
-            let m = mrope_thetas([base; 4], false);
-            for (i, (a, b)) in plain.iter().zip(&m).enumerate() {
+            // Both selectors, because the equivalence argument covers both and
+            // only one of them is the one qwen35 runs.
+            let m = mrope_thetas([base; 4], false, false);
+            let m_i = mrope_thetas([base; 4], false, true);
+            for (i, ((a, b), c)) in plain.iter().zip(&m).zip(&m_i).enumerate() {
                 assert_eq!(
                     a.to_bits(),
                     b.to_bits(),
                     "pos {pos} pair {i}: plain rope {a} vs mrope {b} — the equivalence this \
                      lane relies on to ship NO sectioned kernel does not hold"
                 );
+                assert_eq!(
+                    a.to_bits(),
+                    c.to_bits(),
+                    "pos {pos} pair {i}: plain rope {a} vs INTERLEAVED mrope {c} — this is the \
+                     selector qwen35 actually uses (LLAMA_ROPE_TYPE_IMROPE)"
+                );
             }
             // The control: the vision path must NOT agree, or this proves nothing.
-            let vision = mrope_thetas([base; 4], true);
+            let vision = mrope_thetas([base; 4], true, true);
             differing_pairs += plain.iter().zip(&vision).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
         }
         assert!(
