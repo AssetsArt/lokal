@@ -375,6 +375,106 @@ impl GgufFile {
 
 // ---------- architecture metadata (D4) ----------
 
+/// The qwen35 hybrid layout — everything lanes B/C/D consume, parsed from
+/// metadata alone (no tensor walk, so it works even before every quant type
+/// in a file is wired). docs/qwen35.md is the canon; formulas cited there.
+pub struct Qwen35Meta {
+    /// Trunk depth = block_count − nextn_predict_layers. ModelConfig's
+    /// num_hidden_layers is THIS, never the raw block_count.
+    pub trunk_layers: usize,
+    /// MTP blocks appended after the trunk — standard generation skips them.
+    pub nextn_layers: usize,
+    pub full_attention_interval: usize,
+    /// Per trunk layer: true = gated-deltanet linear block, false = full attention.
+    pub is_recurrent: Vec<bool>,
+    pub d_conv: usize,
+    pub d_state: usize,
+    pub n_group: usize,
+    pub dt_rank: usize,
+    /// dt_rank · d_state (head_v_dim == d_state in this family).
+    pub d_inner: usize,
+    /// MRoPE frequency sections (rope.dimension_sections; [11,11,10,0] on the 27B).
+    pub rope_sections: [usize; 4],
+    /// Conv state elements per linear layer: (d_conv−1)·(d_inner + 2·n_group·d_state).
+    pub conv_state_elems: usize,
+    /// Delta state elements per linear layer: d_state·d_inner.
+    pub delta_state_elems: usize,
+}
+
+impl Qwen35Meta {
+    /// True for any tensor standard generation must ignore: the nextn.* head
+    /// tensors and every block at or past the trunk (the MTP block carries its
+    /// own attention stack — the census's "17th attention layer").
+    pub fn is_mtp_tensor(&self, gguf_name: &str) -> bool {
+        if gguf_name.contains("nextn.") {
+            return true;
+        }
+        gguf_name
+            .strip_prefix("blk.")
+            .and_then(|r| r.split('.').next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .is_some_and(|i| i >= self.trunk_layers)
+    }
+}
+
+/// Parse the qwen35 hybrid metadata. Metadata-only on purpose (see the struct
+/// doc); call after model_config confirmed the arch.
+pub fn qwen35_meta(g: &GgufFile) -> crate::Result<Qwen35Meta> {
+    let k = |s: &str| format!("qwen35.{s}");
+    let block_count = g.get_usize(&k("block_count"))?;
+    let nextn_layers = g.get_usize(&k("nextn_predict_layers")).unwrap_or(0);
+    if nextn_layers >= block_count {
+        return Err(format!(
+            "qwen35: nextn_predict_layers {nextn_layers} >= block_count {block_count}"
+        )
+        .into());
+    }
+    let trunk_layers = block_count - nextn_layers;
+    let interval = g.get_usize(&k("full_attention_interval")).unwrap_or(4);
+    // Explicit per-layer array overrides the interval rule (llama.cpp's order;
+    // the human's files carry no array — interval 4, 16 attention layers).
+    let is_recurrent: Vec<bool> = match g.get_arr_i64(&k("attention.recurrent_layers")) {
+        Ok(arr) => {
+            let mut v: Vec<bool> = arr.iter().map(|&x| x != 0).collect();
+            v.truncate(trunk_layers);
+            if v.len() < trunk_layers {
+                return Err("qwen35: recurrent_layers array shorter than the trunk".into());
+            }
+            v
+        }
+        Err(_) => (0..trunk_layers).map(|i| (i + 1) % interval != 0).collect(),
+    };
+    let d_conv = g.get_usize(&k("ssm.conv_kernel"))?;
+    let d_state = g.get_usize(&k("ssm.state_size"))?;
+    let n_group = g.get_usize(&k("ssm.group_count"))?;
+    let dt_rank = g.get_usize(&k("ssm.time_step_rank"))?;
+    let d_inner = g.get_usize(&k("ssm.inner_size"))?;
+    if d_inner != dt_rank * d_state {
+        return Err(format!(
+            "qwen35: ssm.inner_size {d_inner} != time_step_rank {dt_rank} x state_size {d_state}"
+        )
+        .into());
+    }
+    let sec = g.get_arr_i64(&k("rope.dimension_sections"))?;
+    if sec.len() < 4 {
+        return Err("qwen35: rope.dimension_sections needs 4 entries".into());
+    }
+    Ok(Qwen35Meta {
+        trunk_layers,
+        nextn_layers,
+        full_attention_interval: interval,
+        is_recurrent,
+        d_conv,
+        d_state,
+        n_group,
+        dt_rank,
+        d_inner,
+        rope_sections: [sec[0] as usize, sec[1] as usize, sec[2] as usize, sec[3] as usize],
+        conv_state_elems: (d_conv - 1) * (d_inner + 2 * n_group * d_state),
+        delta_state_elems: d_state * d_inner,
+    })
+}
+
 /// What the runtime needs to know about a GGUF model beyond ModelConfig.
 /// qwen3's per-head q/k RMSNorm and explicit head_dim travel here — lane 2
 /// applies them; the cpu/metal forward does not know them and refuses qwen3.
@@ -389,11 +489,17 @@ pub struct GgufArch {
 /// `general.architecture` + the per-arch keys → the shared ModelConfig.
 pub fn model_config(g: &GgufFile) -> crate::Result<(crate::config::ModelConfig, GgufArch)> {
     let arch = g.get_str("general.architecture")?.to_string();
-    if !matches!(arch.as_str(), "llama" | "qwen2" | "qwen3") {
+    if !matches!(arch.as_str(), "llama" | "qwen2" | "qwen3" | "qwen35") {
         return Err(format!(
-            "GGUF architecture \"{arch}\" is not supported (llama, qwen2, qwen3 are)"
+            "GGUF architecture \"{arch}\" is not supported (llama, qwen2, qwen3, qwen35 are)"
         )
         .into());
+    }
+    if arch == "qwen35" && !g.has_key("tokenizer.ggml.tokens") {
+        // An MTP-only companion file (trunkless) cannot generate on its own.
+        return Err("this qwen35 file looks like an MTP-only companion (no trunk) — \
+             download the full checkpoint"
+            .into());
     }
     let k = |suffix: &str| format!("{arch}.{suffix}");
     let heads = g.get_usize(&k("attention.head_count"))?;
@@ -411,11 +517,20 @@ pub fn model_config(g: &GgufFile) -> crate::Result<(crate::config::ModelConfig, 
     let qk_norm = g.has_key("tokenizer.ggml.tokens") && arch == "qwen3"
         || g.infos.iter().any(|i| i.name.ends_with("attn_q_norm.weight"));
 
+    // qwen35: the MTP block rides inside block_count but is not part of the
+    // generating stack — depth is the trunk.
+    let num_hidden_layers = match arch.as_str() {
+        "qwen35" => {
+            let bc = g.get_usize(&k("block_count"))?;
+            bc - g.get_usize(&k("nextn_predict_layers")).unwrap_or(0)
+        }
+        _ => g.get_usize(&k("block_count"))?,
+    };
     let cfg = crate::config::ModelConfig {
         architectures: vec![format!("gguf:{arch}")],
         hidden_size: hidden,
         intermediate_size: g.get_usize(&k("feed_forward_length"))?,
-        num_hidden_layers: g.get_usize(&k("block_count"))?,
+        num_hidden_layers,
         num_attention_heads: heads,
         num_key_value_heads: g.get_usize(&k("attention.head_count_kv"))?,
         vocab_size,
