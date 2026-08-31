@@ -12,8 +12,8 @@
 //! windowed attention, and the --memory-budget arithmetic.
 
 mod forward;
-mod gguf;
-mod manifest;
+pub(crate) mod gguf;
+pub(crate) mod manifest;
 mod pool;
 
 use crate::config::ModelConfig;

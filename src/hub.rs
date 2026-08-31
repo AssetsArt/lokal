@@ -16,12 +16,38 @@ use std::path::{Path, PathBuf};
 /// directory. Returns the directory containing the model files.
 pub fn resolve_model(spec: &str) -> crate::Result<PathBuf> {
     let p = Path::new(spec);
-    if p.is_dir() {
+    if p.is_dir() || p.is_file() {
+        // A file spec is a GGUF checkpoint (main.rs routes on the extension).
         return Ok(p.to_path_buf());
     }
     let (owner, name) = spec.split_once('/').ok_or_else(|| {
-        format!("model spec \"{spec}\" is neither a local directory nor an owner/name repo id")
+        format!("model spec \"{spec}\" is neither a local path nor an owner/name repo id")
     })?;
+
+    // owner/repo/FILE.gguf: fetch that single file into the normal HF cache.
+    if let Some((repo_name, file)) = name.split_once('/') {
+        if !file.to_ascii_lowercase().ends_with(".gguf") {
+            return Err(format!(
+                "model spec \"{spec}\" names a file inside a repo — only .gguf files resolve that way"
+            )
+            .into());
+        }
+        let client = HFClientSync::new()?;
+        let repo = client.model(owner, repo_name);
+        let one = vec![file.to_string()];
+        let snapshot = repo
+            .snapshot_download()
+            .allow_patterns(one.clone())
+            .send()
+            .or_else(|_| {
+                repo.snapshot_download().allow_patterns(one).local_files_only(true).send()
+            })?;
+        let path = snapshot.join(file);
+        if !path.is_file() {
+            return Err(format!("{owner}/{repo_name} has no file named {file}").into());
+        }
+        return Ok(path);
+    }
 
     let client = HFClientSync::new()?;
     let repo = client.model(owner, name);

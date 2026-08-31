@@ -79,7 +79,13 @@ impl KvCache {
 impl Model {
     /// Wire the loaded tensors (name → values) into the model structure.
     pub fn load(dir: &Path, cfg: ModelConfig) -> crate::Result<Self> {
-        let mut t = crate::weights::load(dir)?;
+        Self::from_tensors(cfg, crate::weights::load(dir)?)
+    }
+
+    /// The tail `load` always contained, split out so a checkpoint that is not
+    /// safetensors-on-disk (GGUF, dequantized to f32) can enter with the same
+    /// numerics: an already-materialized name → f32 map, HF names.
+    pub fn from_tensors(cfg: ModelConfig, mut t: crate::weights::TensorMap) -> crate::Result<Self> {
         let n_params = t.values().map(|v| v.len()).sum();
 
         let h = cfg.hidden_size;

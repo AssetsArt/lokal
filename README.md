@@ -111,6 +111,27 @@ TinyLlama/TinyLlama-1.1B-Chat-v1.0
 
 Architectures: `LlamaForCausalLM`, `Qwen2ForCausalLM`, `MistralForCausalLM`.
 
+### GGUF checkpoints
+
+lokal also runs the ecosystem's pre-quantized GGUF files directly — point `-m`
+at a `.gguf` path, or at a single file inside a Hub repo:
+
+```bash
+lokal -b metal -m ~/models/qwen2.5-0.5b-instruct-q8_0.gguf -p "hello"
+lokal -b metal -m Qwen/Qwen2.5-0.5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q8_0.gguf -p "hello"
+```
+
+Config and tokenizer come out of the file itself (nothing else to download);
+tensor types F32, F16, Q8_0, Q4_0, Q4_K, Q5_K, and Q6_K are supported, and
+anything else is refused by name. On `-b cpu` and `-b metal` the weights are
+dequantized to f32 up front, so the honest memory cost is the EXPANDED size,
+not the file size — a 4 GB Q4 file is ~28 GB of f32, and lokal refuses the
+load (naming both numbers) rather than letting the OS kill it; `-b lowmem`
+is the path that keeps quantized weights paged under a fixed budget. The
+hybrid backend cannot run GGUF (its ANE graphs are exported from safetensors).
+GGUF architectures: `llama`, `qwen2` (and `qwen3` on `-b lowmem`), byte-level
+BPE tokenizers.
+
 ## Backends
 
 Pick with `-b cpu | metal | hybrid | lowmem`. cpu and metal are verified to
