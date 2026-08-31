@@ -13,6 +13,7 @@
 
 mod forward;
 pub(crate) mod gguf;
+pub(crate) mod iq_grids;
 pub(crate) mod manifest;
 mod pool;
 
@@ -262,6 +263,17 @@ impl SrcType {
             SrcType::Quant(GgmlType::Q6_K) => 5,
             SrcType::Quant(GgmlType::Q5_K) => 6,
             SrcType::Quant(GgmlType::Q5_0) => 7,
+            SrcType::Quant(GgmlType::Q2_K) => 8,
+            SrcType::Quant(GgmlType::Q3_K) => 9,
+            SrcType::Quant(GgmlType::IQ4_NL) => 10,
+            SrcType::Quant(GgmlType::IQ4_XS) => 11,
+            SrcType::Quant(GgmlType::IQ3_XXS) => 12,
+            SrcType::Quant(GgmlType::IQ3_S) => 13,
+            SrcType::Quant(GgmlType::IQ2_XXS) => 14,
+            SrcType::Quant(GgmlType::IQ2_XS) => 15,
+            SrcType::Quant(GgmlType::IQ2_S) => 16,
+            SrcType::Quant(GgmlType::IQ1_S) => 17,
+            SrcType::Quant(GgmlType::IQ1_M) => 18,
             SrcType::Quant(_) => u32::MAX, // refused at PagedTensor::new
         }
     }

@@ -173,6 +173,17 @@ pub enum GgmlType {
     F32 = 0,
     F16 = 1,
     Q4_0 = 2,
+    Q2_K = 10,
+    Q3_K = 11,
+    IQ1_S = 19,
+    IQ1_M = 29,
+    IQ2_XXS = 16,
+    IQ2_XS = 17,
+    IQ2_S = 22,
+    IQ3_XXS = 18,
+    IQ3_S = 21,
+    IQ4_NL = 20,
+    IQ4_XS = 23,
     Q5_0 = 6,
     Q8_0 = 8,
     Q4_K = 12,
@@ -198,20 +209,20 @@ impl GgmlType {
             3 => return Err("Q4_1"),
             7 => return Err("Q5_1"),
             9 => return Err("Q8_1"),
-            10 => return Err("Q2_K"),
-            11 => return Err("Q3_K"),
+            10 => Self::Q2_K,
+            11 => Self::Q3_K,
             15 => return Err("Q8_K"),
-            16 => return Err("IQ2_XXS"),
-            17 => return Err("IQ2_XS"),
-            18 => return Err("IQ3_XXS"),
-            19 => return Err("IQ1_S"),
-            20 => return Err("IQ4_NL"),
-            21 => return Err("IQ3_S"),
-            22 => return Err("IQ2_S"),
-            23 => return Err("IQ4_XS"),
+            16 => Self::IQ2_XXS,
+            17 => Self::IQ2_XS,
+            18 => Self::IQ3_XXS,
+            19 => Self::IQ1_S,
+            20 => Self::IQ4_NL,
+            21 => Self::IQ3_S,
+            22 => Self::IQ2_S,
+            23 => Self::IQ4_XS,
             24..=27 => return Err("integer tensor"),
             28 => return Err("F64"),
-            29 => return Err("IQ1_M"),
+            29 => Self::IQ1_M,
             30 => return Err("BF16"),
             _ => return Err("unknown ggml type"),
         })
@@ -221,8 +232,10 @@ impl GgmlType {
     pub fn blk_elems(self) -> usize {
         match self {
             Self::F32 | Self::F16 => 1,
-            Self::Q4_0 | Self::Q5_0 | Self::Q8_0 => 32, // QK4_0 / QK5_0 / QK8_0
-            Self::Q4_K | Self::Q5_K | Self::Q6_K => 256, // QK_K
+            Self::Q4_0 | Self::Q5_0 | Self::Q8_0 | Self::IQ4_NL => 32, // QK4_0 / QK5_0 / QK8_0 / QK4_NL
+            Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::IQ4_XS | Self::IQ3_XXS | Self::IQ3_S
+            | Self::IQ2_XXS | Self::IQ2_XS | Self::IQ2_S
+            | Self::IQ1_S | Self::IQ1_M => 256, // QK_K
         }
     }
 
@@ -234,6 +247,17 @@ impl GgmlType {
             Self::Q4_0 => 2 + 16,            // f16 d + 32 nibbles
             Self::Q5_0 => 2 + 4 + 16,        // f16 d + qh[4] high bits + 32 nibbles
             Self::Q8_0 => 2 + 32,            // f16 d + 32 i8
+            Self::IQ1_S => 2 + 32 + 16,      // d + qs[QK_K/8] + qh[QK_K/32] u16
+            Self::IQ1_M => 32 + 16 + 8,      // qs + qh + scales — NO d field
+            Self::IQ2_XXS => 2 + 64,         // d + qs[QK_K/8] u16
+            Self::IQ2_XS => 2 + 64 + 8,      // d + qs[QK_K/8] u16 + scales[QK_K/32]
+            Self::IQ2_S => 2 + 64 + 8 + 8,   // d + qs[QK_K/4] (idx|signs) + qh + scales
+            Self::IQ3_XXS => 2 + 96,         // d + qs[3*QK_K/8] (64 grid idx + 32 scale/sign)
+            Self::IQ3_S => 2 + 64 + 8 + 32 + 4, // d + qs + qh + signs + scales[QK_K/64]
+            Self::IQ4_NL => 2 + 16,          // d + qs[QK4_NL/2]
+            Self::IQ4_XS => 2 + 2 + 4 + 128, // d + scales_h + scales_l[QK_K/64] + qs[QK_K/2]
+            Self::Q2_K => 16 + 64 + 2 + 2,   // scales[QK_K/16] + qs[QK_K/4] + d + dmin
+            Self::Q3_K => 32 + 64 + 12 + 2,  // hmask[QK_K/8] + qs[QK_K/4] + scales[12] + d
             Self::Q4_K => 2 + 2 + 12 + 128,  // d + dmin + scales[12] + qs[QK_K/2]
             Self::Q5_K => 2 + 2 + 12 + 32 + 128, // … + qh[QK_K/8]
             Self::Q6_K => 128 + 64 + 16 + 2, // ql[QK_K/2] + qh[QK_K/4] + scales[16] + d
@@ -274,6 +298,42 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
             (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
         )
     }
+}
+
+use super::iq_grids::{
+    IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS,
+    KSIGNS_IQ2XS,
+};
+
+/// ggml's IQ1S_DELTA / IQ1M_DELTA (both 0.125f in ggml-common.h): the offset
+/// added to every signed grid value before scaling.
+const IQ1S_DELTA: f32 = 0.125;
+
+/// ggml's `kvalues_iq4nl` (ggml-common.h) — the 16-entry non-linear codebook
+/// both IQ4 types index with a 4-bit quant. Copied verbatim; the values are not
+/// a formula and must never be "recomputed".
+pub(crate) const KVALUES_IQ4NL: [i8; 16] =
+    [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+
+/// Q3_K's 12 packed scale bytes -> 16 six-bit values, ggml's aux shuffle from
+/// dequantize_row_q3_K verbatim (kmask1 0x03030303, kmask2 0x0f0f0f0f). The
+/// caller subtracts the 32 bias. Done on u32 lanes exactly as ggml does, so the
+/// byte order that falls out is the same one its int8 view reads.
+fn q3k_scales(p: &[u8]) -> [u8; 16] {
+    let w = |i: usize| u32::from_le_bytes([p[4 * i], p[4 * i + 1], p[4 * i + 2], p[4 * i + 3]]);
+    let (k1, k2) = (0x0303_0303u32, 0x0f0f_0f0fu32);
+    let (a0, a1, tmp) = (w(0), w(1), w(2));
+    let aux = [
+        (a0 & k2) | (((tmp >> 0) & k1) << 4),
+        (a1 & k2) | (((tmp >> 2) & k1) << 4),
+        ((a0 >> 4) & k2) | (((tmp >> 4) & k1) << 4),
+        ((a1 >> 4) & k2) | (((tmp >> 6) & k1) << 4),
+    ];
+    let mut out = [0u8; 16];
+    for (i, a) in aux.iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&a.to_le_bytes());
+    }
+    out
 }
 
 /// CPU reference dequantization of one row: exact ggml semantics per type
@@ -325,6 +385,228 @@ pub fn dequant_row_ref(ty: GgmlType, src: &[u8], out: &mut [f32]) {
                 let d = f16_bits_at(blk, 0);
                 for j in 0..32 {
                     y[j] = (blk[2 + j] as i8) as f32 * d;
+                }
+            }
+        }
+        // dequantize_row_q2_K. Block is scales[16] | qs[64] | d | dmin (84 B).
+        // Each of the 16 scale bytes packs a 4-bit scale (low) and a 4-bit min
+        // (high) for one 16-element group; the 2-bit quants for a 128-element
+        // half share one 32-byte qs run, selected by a shift of 2 per group-pair.
+        // dequantize_row_iq4_nl: d | qs[16] (18 B). Low nibbles fill the first
+        // 16 outputs, high nibbles the second 16 — not interleaved.
+        // dequantize_row_iq3_xxs: d | qs[64 grid indices] | 8 u32 of packed
+        // scale+signs (98 B). Each u32 holds a 4-bit scale in its top nibble
+        // and four 7-bit sign selectors below it.
+        // dequantize_row_iq2_xxs: d | qs[32 u16] (66 B). Each 32-element group
+        // reads TWO u32: the first four bytes are grid indices, the second u32
+        // carries a 4-bit scale on top and four 7-bit sign selectors below.
+        // dequantize_row_iq1_s: d | qs[32] | qh[8 u16] (50 B). Grid bytes are
+        // SIGNED here, unlike every IQ2/IQ3 grid, and each value carries a
+        // +/-0.125 delta chosen by qh's top bit.
+        GgmlType::IQ1_S => {
+            for (b, y) in out.chunks_exact_mut(256).enumerate() {
+                let blk = &src[b * 50..b * 50 + 50];
+                let d = f16_bits_at(blk, 0);
+                for (i, o) in y.iter_mut().enumerate() {
+                    let (ib, r) = (i >> 5, i & 31);
+                    let (l, j) = (r >> 3, r & 7);
+                    let qh = u16::from_le_bytes([blk[34 + 2 * ib], blk[35 + 2 * ib]]);
+                    let dl = d * (2 * ((qh >> 12) & 7) + 1) as f32;
+                    let delta = if qh & 0x8000 != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
+                    let gi = blk[2 + 4 * ib + l] as usize | ((((qh >> (3 * l)) & 7) as usize) << 8);
+                    let g = ((IQ1S_GRID[gi] >> (8 * j)) & 0xFF) as u8 as i8;
+                    *o = dl * (g as f32 + delta);
+                }
+            }
+        }
+        // dequantize_row_iq1_m: qs[32] | qh[16] | scales[8] (56 B). There is NO
+        // d field — the super-block scale is assembled from four nibbles spread
+        // across the four scale u16s, and only then read as an f16.
+        GgmlType::IQ1_M => {
+            for (b, y) in out.chunks_exact_mut(256).enumerate() {
+                let blk = &src[b * 56..b * 56 + 56];
+                let sc = |k: usize| u16::from_le_bytes([blk[48 + 2 * k], blk[49 + 2 * k]]);
+                let bits = (sc(0) >> 12) | ((sc(1) >> 8) & 0x00f0) | ((sc(2) >> 4) & 0x0f00) | (sc(3) & 0xf000);
+                let d = half::f16::from_bits(bits).to_f32();
+                for (i, o) in y.iter_mut().enumerate() {
+                    let (ib, r) = (i >> 5, i & 31);
+                    let (l, j) = (r >> 3, r & 7);
+                    let shift = 6 * (ib % 2) + if l < 2 { 0 } else { 3 };
+                    let dl = d * (2 * ((sc(ib / 2) >> shift) & 7) + 1) as f32;
+                    let qh = blk[32 + 2 * ib + (l >> 1)] as usize;
+                    let gi = blk[4 * ib + l] as usize
+                        | ((qh << (if l % 2 == 0 { 8 } else { 4 })) & 0x700);
+                    let mask = if l % 2 == 0 { 0x08 } else { 0x80 };
+                    let delta = if qh & mask != 0 { -IQ1S_DELTA } else { IQ1S_DELTA };
+                    let g = ((IQ1S_GRID[gi] >> (8 * j)) & 0xFF) as u8 as i8;
+                    *o = dl * (g as f32 + delta);
+                }
+            }
+        }
+        GgmlType::IQ2_XXS => {
+            for (b, y) in out.chunks_exact_mut(256).enumerate() {
+                let blk = &src[b * 66..b * 66 + 66];
+                let d = f16_bits_at(blk, 0);
+                for (i, o) in y.iter_mut().enumerate() {
+                    let (ib32, r) = (i >> 5, i & 31);
+                    let (l, j) = (r >> 3, r & 7);
+                    let base = 2 + 8 * ib32;
+                    let a1 = u32::from_le_bytes([blk[base + 4], blk[base + 5], blk[base + 6], blk[base + 7]]);
+                    let db = d * (0.5 + (a1 >> 28) as f32) * 0.25;
+                    let signs = KSIGNS_IQ2XS[((a1 >> (7 * l)) & 127) as usize];
+                    let g = (IQ2XXS_GRID[blk[base + l] as usize] >> (8 * j)) & 0xFF;
+                    let sgn = if signs & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                    *o = db * g as f32 * sgn;
+                }
+            }
+        }
+        // dequantize_row_iq2_xs: d | qs[32 u16] | scales[8] (74 B). Each u16
+        // splits into a 9-bit grid index and a 7-bit sign selector.
+        GgmlType::IQ2_XS => {
+            for (b, y) in out.chunks_exact_mut(256).enumerate() {
+                let blk = &src[b * 74..b * 74 + 74];
+                let d = f16_bits_at(blk, 0);
+                for (i, o) in y.iter_mut().enumerate() {
+                    let (ib32, r) = (i >> 5, i & 31);
+                    let (l, j) = (r >> 3, r & 7);
+                    let sc = blk[66 + ib32];
+                    let nib = if l / 2 == 0 { sc & 0xF } else { sc >> 4 };
+                    let db = d * (0.5 + nib as f32) * 0.25;
+                    let off = 2 + 2 * (4 * ib32 + l);
+                    let qv = u16::from_le_bytes([blk[off], blk[off + 1]]);
+                    let signs = KSIGNS_IQ2XS[(qv >> 9) as usize];
+                    let g = (IQ2XS_GRID[(qv & 511) as usize] >> (8 * j)) & 0xFF;
+                    let sgn = if signs & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                    *o = db * g as f32 * sgn;
+                }
+            }
+        }
+        // dequantize_row_iq2_s: d | qs[64] | qh[8] | scales[8] (82 B). The
+        // SIGNS live in the SECOND HALF of qs (ggml takes signs = qs + QK_K/8),
+        // not in a field of their own; qh donates two more index bits.
+        GgmlType::IQ2_S => {
+            for (b, y) in out.chunks_exact_mut(256).enumerate() {
+                let blk = &src[b * 82..b * 82 + 82];
+                let d = f16_bits_at(blk, 0);
+                for (i, o) in y.iter_mut().enumerate() {
+                    let (ib32, r) = (i >> 5, i & 31);
+                    let (l, j) = (r >> 3, r & 7);
+                    let sc = blk[74 + ib32];
+                    let nib = if l / 2 == 0 { sc & 0xF } else { sc >> 4 };
+                    let db = d * (0.5 + nib as f32) * 0.25;
+                    let qh = blk[66 + ib32] as usize;
+                    let gi = blk[2 + 4 * ib32 + l] as usize | ((qh << (8 - 2 * l)) & 0x300);
+                    let g = (IQ2S_GRID[gi] >> (8 * j)) & 0xFF;
+                    let sgn = if blk[2 + 32 + 4 * ib32 + l] & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                    *o = db * g as f32 * sgn;
+                }
+            }
+        }
+        GgmlType::IQ3_XXS => {
+            for (b, y) in out.chunks_exact_mut(256).enumerate() {
+                let blk = &src[b * 98..b * 98 + 98];
+                let d = f16_bits_at(blk, 0);
+                for (i, o) in y.iter_mut().enumerate() {
+                    let (ib32, r) = (i >> 5, i & 31);
+                    let (l, jj) = (r >> 3, r & 7);
+                    let (hf, j) = (jj >> 2, jj & 3);
+                    let sas = 2 + 64 + 4 * ib32;
+                    let aux32 = u32::from_le_bytes([blk[sas], blk[sas + 1], blk[sas + 2], blk[sas + 3]]);
+                    let db = d * (0.5 + (aux32 >> 28) as f32) * 0.5;
+                    let signs = KSIGNS_IQ2XS[((aux32 >> (7 * l)) & 127) as usize];
+                    let gi = blk[2 + ib32 * 8 + 2 * l + hf] as usize;
+                    let g = (IQ3XXS_GRID[gi] >> (8 * j)) & 0xFF;
+                    let sgn = if signs & KMASK_IQ2XS[jj] != 0 { -1.0 } else { 1.0 };
+                    *o = db * g as f32 * sgn;
+                }
+            }
+        }
+        // dequantize_row_iq3_s: d | qs[64] | qh[8] | signs[32] | scales[4]
+        // (110 B). qh donates a NINTH grid-index bit per half; scales pack two
+        // 4-bit values per byte, each used as 1 + 2*s.
+        GgmlType::IQ3_S => {
+            for (b, y) in out.chunks_exact_mut(256).enumerate() {
+                let blk = &src[b * 110..b * 110 + 110];
+                let d = f16_bits_at(blk, 0);
+                for (i, o) in y.iter_mut().enumerate() {
+                    let (g, r) = (i >> 5, i & 31);
+                    let (l, jj) = (r >> 3, r & 7);
+                    let (hf, j) = (jj >> 2, jj & 3);
+                    let sc_byte = blk[106 + g / 2];
+                    let sc = if g % 2 == 0 { sc_byte & 0xF } else { sc_byte >> 4 };
+                    let db = d * (1 + 2 * sc as u32) as f32;
+                    let qh = blk[66 + g] as usize;
+                    let gi = blk[2 + g * 8 + 2 * l + hf] as usize
+                        | ((qh << (8 - 2 * l - hf)) & 256);
+                    let gv = (IQ3S_GRID[gi] >> (8 * j)) & 0xFF;
+                    let sgn = if blk[74 + g * 4 + l] & KMASK_IQ2XS[jj] != 0 { -1.0 } else { 1.0 };
+                    *o = db * gv as f32 * sgn;
+                }
+            }
+        }
+        GgmlType::IQ4_NL => {
+            for (b, y) in out.chunks_exact_mut(32).enumerate() {
+                let blk = &src[b * 18..b * 18 + 18];
+                let d = f16_bits_at(blk, 0);
+                for j in 0..16 {
+                    let q = blk[2 + j];
+                    y[j] = d * KVALUES_IQ4NL[(q & 0xF) as usize] as f32;
+                    y[j + 16] = d * KVALUES_IQ4NL[(q >> 4) as usize] as f32;
+                }
+            }
+        }
+        // dequantize_row_iq4_xs: d | scales_h(u16) | scales_l[4] | qs[128]
+        // (136 B). Each of the 8 sub-blocks takes a 6-bit scale split across
+        // scales_l (low 4 bits) and scales_h (high 2), biased by -32.
+        GgmlType::IQ4_XS => {
+            for (b, y) in out.chunks_exact_mut(256).enumerate() {
+                let blk = &src[b * 136..b * 136 + 136];
+                let d = f16_bits_at(blk, 0);
+                let scales_h = u16::from_le_bytes([blk[2], blk[3]]);
+                for (i, o) in y.iter_mut().enumerate() {
+                    let (ib, w) = (i >> 5, i & 31);
+                    let (half, j) = (w >> 4, w & 15);
+                    let ls = ((blk[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) as i32
+                        | ((((scales_h >> (2 * ib)) & 3) as i32) << 4);
+                    let q = blk[8 + ib * 16 + j];
+                    let nib = if half == 1 { q >> 4 } else { q & 0xF };
+                    *o = d * (ls - 32) as f32 * KVALUES_IQ4NL[nib as usize] as f32;
+                }
+            }
+        }
+        GgmlType::Q2_K => {
+            for (b, y) in out.chunks_exact_mut(256).enumerate() {
+                let blk = &src[b * 84..b * 84 + 84];
+                let d = f16_bits_at(blk, 80);
+                let dmin = f16_bits_at(blk, 82);
+                for (i, o) in y.iter_mut().enumerate() {
+                    let (nh, r) = (i >> 7, i & 127);
+                    let (j, w) = (r >> 5, r & 31);
+                    let (half, l) = (w >> 4, w & 15);
+                    let sc = blk[nh * 8 + j * 2 + half];
+                    let q = (blk[16 + nh * 32 + half * 16 + l] >> (2 * j)) & 3;
+                    *o = d * (sc & 0xF) as f32 * q as f32 - dmin * (sc >> 4) as f32;
+                }
+            }
+        }
+        // dequantize_row_q3_K. Block is hmask[32] | qs[64] | scales[12] | d
+        // (110 B). The 12 scale bytes hold 16 SIGNED 6-bit scales in ggml's
+        // aux shuffle, biased by -32; the high bit of each 3-bit quant lives in
+        // hmask, and a CLEAR bit subtracts 4 (not sets it).
+        GgmlType::Q3_K => {
+            for (b, y) in out.chunks_exact_mut(256).enumerate() {
+                let blk = &src[b * 110..b * 110 + 110];
+                let d_all = f16_bits_at(blk, 108);
+                let scales = q3k_scales(&blk[96..108]);
+                for (i, o) in y.iter_mut().enumerate() {
+                    let (nh, r) = (i >> 7, i & 127);
+                    let (j, w) = (r >> 5, r & 31);
+                    let (half, l) = (w >> 4, w & 15);
+                    let dl = d_all * (scales[nh * 8 + j * 2 + half] as i32 - 32) as f32;
+                    let q = ((blk[32 + nh * 32 + half * 16 + l] >> (2 * j)) & 3) as i32;
+                    let m = 1u8 << (nh * 4 + j);
+                    let hi = if blk[half * 16 + l] & m != 0 { 0 } else { 4 };
+                    *o = dl * (q - hi) as f32;
                 }
             }
         }
@@ -440,6 +722,74 @@ mod gguf_seam_tests {
         assert!(y[1..16].iter().chain(&y[17..]).all(|&v| v == 0.0));
     }
 
+    /// Q2_K by hand. d=0.5 at byte 80, dmin=0.25 at 82, scales[0]=0x21 so the
+    /// first 16-element group has scale 1 and min 2; qs[0]=3 so element 0's
+    /// 2-bit quant is 3. Everything else zero.
+    ///   y[0]  = 0.5*1*3 - 0.25*2 = 1.0
+    ///   y[1]  = 0.5*1*0 - 0.25*2 = -0.5   (same group, zero quant)
+    ///   y[16] = scales[1]=0 -> scale 0, min 0 -> 0.0
+    #[test]
+    fn q2_k_hand_vector() {
+        let mut blk = vec![0u8; 84];
+        blk[0] = 0x21;
+        blk[16] = 3;
+        blk[80..82].copy_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
+        blk[82..84].copy_from_slice(&half::f16::from_f32(0.25).to_bits().to_le_bytes());
+        let mut y = vec![0f32; 256];
+        dequant_row_ref(GgmlType::Q2_K, &blk, &mut y);
+        assert_eq!(y[0], 1.0);
+        assert_eq!(y[1], -0.5);
+        assert_eq!(y[16], 0.0);
+        assert_eq!(GgmlType::Q2_K.blk_bytes(), 84);
+    }
+
+    /// Q3_K by hand. All 12 scale bytes zero, so every unpacked scale is 0 and
+    /// the -32 bias makes dl = d*(0-32) = -16 with d=0.5. A hmask bit that is
+    /// CLEAR subtracts 4 — the inverted sense is the easy thing to get backwards.
+    ///   y[0]   qs[0]=1, hmask bit set   -> -16 * (1 - 0) = -16
+    ///   y[1]   qs[1]=0, hmask bit clear -> -16 * (0 - 4) = 64
+    ///   y[128] second half, m = 1<<4, hmask[0]=1 so bit clear -> 64
+    #[test]
+    fn q3_k_hand_vector() {
+        let mut blk = vec![0u8; 110];
+        blk[0] = 1; // hmask[0], bit for (nh=0, j=0)
+        blk[32] = 1; // qs[0]
+        blk[108..110].copy_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
+        let mut y = vec![0f32; 256];
+        dequant_row_ref(GgmlType::Q3_K, &blk, &mut y);
+        assert_eq!(y[0], -16.0);
+        assert_eq!(y[1], 64.0);
+        assert_eq!(y[128], 64.0);
+        assert_eq!(GgmlType::Q3_K.blk_bytes(), 110);
+    }
+
+    /// The aux shuffle is the classic silent-rot spot for Q3_K, so pin it on a
+    /// pattern where every lane differs: low nibbles come from bytes 0..7, the
+    /// top two bits of each from byte 8..11's 2-bit fields, shifted up by 4.
+    #[test]
+    fn q3_k_scale_unpack_matches_ggml_shuffle() {
+        let p: Vec<u8> = (0u8..12).map(|i| i.wrapping_mul(17)).collect();
+        let got = q3k_scales(&p);
+        // Recomputed straight from the C: aux[0..1] keep low nibbles of words
+        // 0,1; aux[2..3] take their high nibbles; word 2 donates 2 bits each.
+        let w = |i: usize| u32::from_le_bytes([p[4 * i], p[4 * i + 1], p[4 * i + 2], p[4 * i + 3]]);
+        let (k1, k2) = (0x0303_0303u32, 0x0f0f_0f0fu32);
+        let (a0, a1, t) = (w(0), w(1), w(2));
+        let want = [
+            (a0 & k2) | (((t >> 0) & k1) << 4),
+            (a1 & k2) | (((t >> 2) & k1) << 4),
+            ((a0 >> 4) & k2) | (((t >> 4) & k1) << 4),
+            ((a1 >> 4) & k2) | (((t >> 6) & k1) << 4),
+        ];
+        let mut flat = [0u8; 16];
+        for (i, a) in want.iter().enumerate() {
+            flat[4 * i..4 * i + 4].copy_from_slice(&a.to_le_bytes());
+        }
+        assert_eq!(got, flat);
+        // Every scale is a 6-bit value, so nothing may exceed 63.
+        assert!(got.iter().all(|&v| v < 64), "6-bit scales only: {got:?}");
+    }
+
     #[test]
     fn q5_0_hand_vector() {
         // d=0.5; qh = 0x00010001 (bit 0 and bit 16 set); qs[0]=0x21:
@@ -546,7 +896,15 @@ mod gguf_seam_tests {
     #[test]
     fn from_gguf_names_the_unsupported_type() {
         assert_eq!(GgmlType::from_gguf(12).unwrap(), GgmlType::Q4_K);
-        assert_eq!(GgmlType::from_gguf(10).unwrap_err(), "Q2_K");
-        assert_eq!(GgmlType::from_gguf(23).unwrap_err(), "IQ4_XS");
+        assert_eq!(GgmlType::from_gguf(10).unwrap(), GgmlType::Q2_K);
+        assert_eq!(GgmlType::from_gguf(11).unwrap(), GgmlType::Q3_K);
+        assert_eq!(GgmlType::from_gguf(3).unwrap_err(), "Q4_1");
+        assert_eq!(GgmlType::from_gguf(23).unwrap(), GgmlType::IQ4_XS);
+        assert_eq!(GgmlType::from_gguf(20).unwrap(), GgmlType::IQ4_NL);
+        // Still refused, and this list SHRINKS as the lane lands types.
+        assert_eq!(GgmlType::from_gguf(22).unwrap(), GgmlType::IQ2_S);
+        // Still refused — only the IQ1 pair and the non-K legacy types remain.
+        assert_eq!(GgmlType::from_gguf(29).unwrap(), GgmlType::IQ1_M);
+        assert_eq!(GgmlType::from_gguf(19).unwrap(), GgmlType::IQ1_S);
     }
 }
