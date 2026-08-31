@@ -403,14 +403,19 @@ impl WeightPool {
         }
     }
 
-    /// Which checkpoint row holds output row `r`, undoing llama.cpp's q/k permute.
+    /// Which GGUF row holds HF row `r`, undoing llama.cpp's q/k permute.
+///
 /// The converter reshapes (n_head, 2, hd/2, cols) and swaps the middle axes, so
-/// output row h*hd + d*2 + p came from h*hd + p*(hd/2) + d. The mapping stays
-/// inside one head, and is its own inverse only when hd == 2.
+/// the file's row h*hd + d*2 + p carries HF's row h*hd + p*(hd/2) + d. We need
+/// that read backwards — given the HF row we are filling, which file row holds
+/// it — and the map is NOT an involution (it is one only at hd == 2), so
+/// applying the forward direction here scrambles q/k into fluent nonsense.
+/// The mapping never leaves its head.
 fn unpermuted_src_row(r: usize, head_dim: usize) -> usize {
-    let (h, rem) = (r / head_dim, r % head_dim);
-    let (d, p) = (rem / 2, rem % 2);
-    h * head_dim + p * (head_dim / 2) + d
+    let (h, q) = (r / head_dim, r % head_dim);
+    let half = head_dim / 2;
+    let (p, d) = (q / half, q % half);
+    h * head_dim + d * 2 + p
 }
 
 /// Read the block's rows from the mmap and convert into the buffer — the
@@ -517,6 +522,44 @@ fn unpermuted_src_row(r: usize, head_dim: usize) -> usize {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod permute_tests {
+    use super::*;
+
+    /// llama.cpp's forward permute, straight from convert_hf_to_gguf.py's
+    /// reshape/swapaxes: file row `r` carries this HF row.
+    fn forward(r: usize, hd: usize) -> usize {
+        let (h, rem) = (r / hd, r % hd);
+        let (d, p) = (rem / 2, rem % 2);
+        h * hd + p * (hd / 2) + d
+    }
+
+    /// The two must compose to the identity. They did not once — the forward
+    /// map was used for both directions, and a 135M model answered that the
+    /// capital of Thailand is a city in the United States.
+    #[test]
+    fn unpermute_inverts_llama_cpp_permute() {
+        for hd in [2usize, 4, 64, 128] {
+            for r in 0..hd * 3 {
+                assert_eq!(forward(WeightPool::unpermuted_src_row(r, hd), hd), r, "hd={hd} r={r}");
+            }
+        }
+    }
+
+    /// Every row maps somewhere distinct inside its own head — a permutation,
+    /// not a collapse.
+    #[test]
+    fn unpermute_is_a_within_head_bijection() {
+        let hd = 64;
+        for h in 0..3 {
+            let mut seen: Vec<usize> =
+                (h * hd..(h + 1) * hd).map(|r| WeightPool::unpermuted_src_row(r, hd)).collect();
+            seen.sort_unstable();
+            assert_eq!(seen, (h * hd..(h + 1) * hd).collect::<Vec<_>>());
+        }
     }
 }
 

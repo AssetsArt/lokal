@@ -274,6 +274,22 @@ impl LowMemSource {
         matches!(self, LowMemSource::Gguf(_))
     }
 
+    /// The distinct quantized types this checkpoint actually uses. Pipelines
+    /// are built per type PRESENT, never per type supported: a dtype selector
+    /// as a function constant multiplies pipeline builds, and compiling the
+    /// whole matvec family for six types a file never mentions costs seconds
+    /// of startup for nothing.
+    pub fn quant_types(&self) -> Vec<GgmlType> {
+        let LowMemSource::Gguf(g) = self else { return Vec::new() };
+        let mut v: Vec<GgmlType> = Vec::new();
+        for t in g.file.tensors() {
+            if !matches!(t.ty, GgmlType::F32 | GgmlType::F16) && !v.contains(&t.ty) {
+                v.push(t.ty);
+            }
+        }
+        v
+    }
+
     /// qwen3-style per-head q/k norm, straight from the file's metadata.
     pub fn qk_norm(&self) -> bool {
         match self {
@@ -424,6 +440,18 @@ impl LowMemEngine {
     pub fn new(dir: &Path, cfg: ModelConfig, opts: &LowMemOpts) -> crate::Result<Self> {
         let t0 = Instant::now();
         let mut source = LowMemSource::open(dir)?;
+        // The refusal that used to sit in engine.rs, narrowed to the real gap:
+        // an F16/F32 GGUF executes through the existing f16 pipelines today,
+        // while quantized weights still need their dequant pipelines. Better a
+        // named refusal than a build that half-runs a file.
+        let quant = source.quant_types();
+        if !quant.is_empty() {
+            return Err(format!(
+                "-b lowmem cannot execute {quant:?} weights yet: the GPU dequant \
+                 pipelines land with lane gguf-kernels. F16 GGUF files run today."
+            )
+            .into());
+        }
         eprintln!(
             "lowmem: {} {} tensors | {:.1}M params (headers parsed in {:.2}s)",
             if source.is_gguf() { "gguf" } else { "manifest" },
