@@ -41,6 +41,24 @@ impl ModelConfig {
         // weight files on its own).
         const SUPPORTED: &[&str] = &["LlamaForCausalLM", "Qwen2ForCausalLM", "MistralForCausalLM"];
         if let Some(a) = cfg.architectures.first() {
+            // The Qwen3 family (Qwen3*, Qwen3_5*) is KNOWN to break the Llama
+            // walk this path implements: config.json states an explicit
+            // head_dim that violates the hidden/heads identity head_dim()
+            // assumes, and the checkpoints carry q/k-norm weights the dense
+            // walks never apply. Running one as-Llama reads q/k at the wrong
+            // width — degenerate CLI output, garbage nondeterministic serve —
+            // so refuse by name and point at the path that actually works.
+            // The as-Llama attempt below stays for genuinely llama-shaped
+            // architectures we merely haven't tested.
+            if a.starts_with("Qwen3") {
+                return Err(format!(
+                    "architecture {a} is not supported from safetensors: its explicit \
+                     head_dim and qk-norm do not fit the Llama forward pass this path \
+                     implements — run the GGUF instead (-m owner/repo:Q4_K_M or a local \
+                     .gguf); safetensors support for this architecture is not wired yet"
+                )
+                .into());
+            }
             if !SUPPORTED.contains(&a.as_str()) {
                 eprintln!("warning: architecture {a} is untested — attempting to run it as Llama");
             }
@@ -83,5 +101,53 @@ impl EosIds {
             Self::One(x) => *x == id,
             Self::Many(xs) => xs.contains(&id),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load_arch(arch: &str) -> crate::Result<ModelConfig> {
+        let json = format!(
+            r#"{{"architectures":["{arch}"],"hidden_size":64,"intermediate_size":128,
+                "num_hidden_layers":2,"num_attention_heads":4,"num_key_value_heads":2,
+                "vocab_size":100,"rms_norm_eps":1e-6}}"#
+        );
+        let dir = std::env::temp_dir().join(format!("lokal-cfg-test-{arch}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, json).unwrap();
+        let r = ModelConfig::load(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        r
+    }
+
+    /// The Qwen3 family refuses by NAME with the working alternative in the
+    /// text — never the silent as-Llama walk that produced degenerate output.
+    #[test]
+    fn qwen3_family_is_refused_by_name() {
+        for arch in ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM", "Qwen3_5ForCausalLM"] {
+            let err = match load_arch(arch) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("{arch} must be refused"),
+            };
+            assert!(err.contains(arch), "{err}");
+            assert!(err.contains("not supported from safetensors"), "{err}");
+            assert!(err.contains(".gguf"), "names the working alternative: {err}");
+        }
+    }
+
+    /// Genuinely llama-shaped unknowns keep the as-Llama attempt (the warning
+    /// goes to stderr — behavior, not assertable text, is what matters here),
+    /// and the supported list loads silently.
+    #[test]
+    fn llama_shaped_archs_still_load() {
+        for arch in ["LlamaForCausalLM", "Qwen2ForCausalLM", "SomeNewLlamaCloneForCausalLM"] {
+            assert!(load_arch(arch).is_ok(), "{arch} must load");
+        }
+        // Qwen2 < Qwen3 lexically but shares the prefix up to the digit —
+        // prove the refusal never swallows it.
+        assert!(load_arch("Qwen2ForCausalLM").is_ok());
     }
 }
