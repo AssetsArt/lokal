@@ -45,6 +45,9 @@ struct RopeParams {
     pos0: u32,
     theta: f32,
     n_rows: u32,
+    /// Leading dims that rotate; the rest of each head passes through. Equals
+    /// head_dim everywhere except qwen35 (rope.dimension_count 64 of 256).
+    rot_dim: u32,
 }
 #[repr(C)]
 struct RopeQkParams {
@@ -625,6 +628,7 @@ impl<'a> LowMemSession<'a> {
         let e = self.e;
         let cfg = &e.cfg;
         let (h, hd, kvd) = (cfg.hidden_size, self.e.dims.head_dim, self.e.dims.kv_dim);
+        let rot = self.e.dims.rot_dim; // == hd except on qwen35
         let v_base = (self.chunk * kvd * 4) as u64; // V's half of the kvs staging
 
         // Attention half.
@@ -647,11 +651,12 @@ impl<'a> LowMemSession<'a> {
                 pos0: pos0 as u32,
                 theta: cfg.rope_theta,
                 n_rows: n as u32,
+                rot_dim: rot as u32,
             };
             enc.set_compute_pipeline_state(&e.pipes.rope);
             enc.set_buffer(0, Some(&self.q), 0);
             set_bytes(enc, 1, &p);
-            gpu::dispatch_grid(enc, n * cfg.num_attention_heads * hd / 2);
+            gpu::dispatch_grid(enc, n * cfg.num_attention_heads * rot / 2);
         }
         for &(row, slot, len) in &self.write_spans(pos0, n) {
             let src_off = (row * kvd * 4) as u64;
@@ -664,11 +669,12 @@ impl<'a> LowMemSession<'a> {
                 pos0: (pos0 + row) as u32,
                 theta: cfg.rope_theta,
                 n_rows: len as u32,
+                rot_dim: rot as u32,
             };
             enc.set_compute_pipeline_state(&e.pipes.rope_h);
             enc.set_buffer(0, Some(&self.k_cache[l]), dst_off);
             set_bytes(enc, 1, &p);
-            gpu::dispatch_grid(enc, len * cfg.num_key_value_heads * hd / 2);
+            gpu::dispatch_grid(enc, len * cfg.num_key_value_heads * rot / 2);
         }
         let p = AttnParams {
             head_dim: hd as u32,

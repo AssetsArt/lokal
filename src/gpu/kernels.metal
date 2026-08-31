@@ -2239,6 +2239,12 @@ struct RopeParams {
     uint pos0;
     float theta;
     uint n_rows;
+    /// How many of each head's leading dims actually rotate. Equal to head_dim
+    /// on every architecture the repo met before qwen35, which states
+    /// rope.dimension_count = 64 inside head_dim 256 — so dims 64..255 must
+    /// pass through UNTOUCHED. Rotating them looks harmless (it is a valid
+    /// rotation of a real vector) and silently changes the model.
+    uint rot_dim;
 };
 
 kernel void rope(
@@ -2246,7 +2252,9 @@ kernel void rope(
     constant RopeParams &p [[buffer(1)]],
     uint gid [[thread_position_in_grid]])
 {
-    uint half_dim = p.head_dim / 2;
+    // Pairs live INSIDE the rotated prefix: i with i + rot_dim/2, and the tail
+    // beyond rot_dim is never visited because the grid is sized by half_dim.
+    uint half_dim = p.rot_dim / 2;
     uint per_row = p.n_heads * half_dim;
     if (gid >= p.n_rows * per_row) {
         return;
@@ -2255,7 +2263,7 @@ kernel void rope(
     uint h = (gid % per_row) / half_dim;
     uint i = gid % half_dim;
 
-    float freq = pow(p.theta, -2.0f * (float)i / (float)p.head_dim);
+    float freq = pow(p.theta, -2.0f * (float)i / (float)p.rot_dim);
     float angle = (float)(p.pos0 + row) * freq;
     float c;
     float s = sincos(angle, c); // one intrinsic for both — cheaper than separate sin/cos
@@ -2324,7 +2332,7 @@ kernel void rope_h(
     constant RopeParams &p [[buffer(1)]],
     uint gid [[thread_position_in_grid]])
 {
-    uint half_dim = p.head_dim / 2;
+    uint half_dim = p.rot_dim / 2;
     uint per_row = p.n_heads * half_dim;
     if (gid >= p.n_rows * per_row) {
         return;
@@ -2333,7 +2341,7 @@ kernel void rope_h(
     uint h = (gid % per_row) / half_dim;
     uint i = gid % half_dim;
 
-    float freq = pow(p.theta, -2.0f * (float)i / (float)p.head_dim);
+    float freq = pow(p.theta, -2.0f * (float)i / (float)p.rot_dim);
     float angle = (float)(p.pos0 + row) * freq;
     float c;
     float s = sincos(angle, c); // one intrinsic for both — cheaper than separate sin/cos

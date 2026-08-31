@@ -76,10 +76,17 @@ pub(crate) struct Dims {
     /// overruns (see gpu::metal::attn_row_width): size the projection's
     /// destination by THIS, and attention's own widths by `q_dim`.
     pub q_proj_dim: usize,
+    /// How many of each head's leading dims RoPE rotates. head_dim on every
+    /// architecture before qwen35, which rotates only rope.dimension_count = 64
+    /// of its 256. Derived as 2·Σ(rope_sections) rather than read from a new
+    /// metadata key: the sections are already parsed, and the two are equal by
+    /// construction — that identity is the same one the MRoPE equivalence rests
+    /// on, so deriving it here keeps a single source of truth.
+    pub rot_dim: usize,
 }
 
 impl Dims {
-    fn new(cfg: &ModelConfig, head_dim: Option<usize>, joint_q_gate: bool) -> Self {
+    fn new(cfg: &ModelConfig, head_dim: Option<usize>, q35: Option<&gguf::Qwen35Meta>) -> Self {
         let head_dim = head_dim.unwrap_or_else(|| cfg.head_dim());
         let q_dim = cfg.num_attention_heads * head_dim;
         Dims {
@@ -87,7 +94,8 @@ impl Dims {
             head_dim,
             q_dim,
             kv_dim: cfg.num_key_value_heads * head_dim,
-            q_proj_dim: if joint_q_gate { 2 * q_dim } else { q_dim },
+            q_proj_dim: if q35.is_some() { 2 * q_dim } else { q_dim },
+            rot_dim: q35.map_or(head_dim, |m| 2 * m.rope_sections.iter().sum::<usize>()),
         }
     }
 }
@@ -765,7 +773,7 @@ impl LowMemEngine {
             t0.elapsed().as_secs_f64(),
         );
 
-        let dims = Dims::new(&cfg, source.head_dim(), source.qwen35().is_some());
+        let dims = Dims::new(&cfg, source.head_dim(), source.qwen35().as_ref());
         let device = Device::system_default().ok_or("no Metal-capable GPU found")?;
         source.make_gpu_views(&device);
         let queue = device.new_command_queue();
@@ -1190,13 +1198,18 @@ mod tests {
             num_key_value_heads: 2,
             ..qwen05b_cfg()
         };
-        let joint = Dims::new(&cfg, Some(256), true);
+        let mut m = q35_meta_27b(24);
+        m.rope_sections = [11, 11, 10, 0];
+        let joint = Dims::new(&cfg, Some(256), Some(&m));
         assert_eq!(joint.q_dim, 2048, "attention still consumes n_heads*head_dim");
         assert_eq!(joint.q_proj_dim, 4096, "the tensor is 2x that: [q|gate] per head");
         assert_eq!(joint.kv_dim, 512);
         // A dense model must be unaffected: the two widths stay one number.
-        let dense = Dims::new(&cfg, Some(256), false);
+        // rope.dimension_count on the 2B is 64, and 2*sum([11,11,10,0]) is 64.
+        assert_eq!(joint.rot_dim, 64, "only 64 of each 256-wide head rotates");
+        let dense = Dims::new(&cfg, Some(256), None);
         assert_eq!(dense.q_proj_dim, dense.q_dim);
+        assert_eq!(dense.rot_dim, dense.head_dim, "a dense model rotates the whole head");
     }
 
     // ---- qwen35 real-file tests: run by the gates with `--ignored` ----
@@ -1319,13 +1332,13 @@ mod tests {
     fn budget_arithmetic_refuses_impossible_budgets() {
         let cfg = qwen05b_cfg();
         let win = WindowCfg::new(2048, 4).unwrap();
-        let err = match memory_plan(&cfg, Dims::new(&cfg, None, false), &win, 300, None) {
+        let err = match memory_plan(&cfg, Dims::new(&cfg, None, None), &win, 300, None) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("a 300 MB budget must be refused"),
         };
         assert!(err.contains("--memory-budget 300"), "{err}");
         assert!(err.contains("weight-pool floor"), "{err}");
-        let plan = memory_plan(&cfg, Dims::new(&cfg, None, false), &win, 4096, None).unwrap();
+        let plan = memory_plan(&cfg, Dims::new(&cfg, None, None), &win, 4096, None).unwrap();
         let total = plan.kv_bytes
             + plan.act_bytes
             + plan.state_bytes
@@ -1364,7 +1377,7 @@ mod tests {
     fn budget_arithmetic_qwen35_kv_on_attention_layers_only() {
         let mut cfg = qwen05b_cfg();
         cfg.num_hidden_layers = 64;
-        let dims = Dims::new(&cfg, None, false);
+        let dims = Dims::new(&cfg, None, None);
         let meta = q35_meta_27b(64);
         assert_eq!(meta.is_recurrent.iter().filter(|&&r| !r).count(), 16);
 

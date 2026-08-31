@@ -249,7 +249,12 @@ pub struct MetalEngine {
 
 /// lowmem's Dims constructor is module-private; same three lines, same reason
 /// as the WindowCfg mirror (fields are pub, the formula is fixed).
-fn dims_of(cfg: &ModelConfig, head_dim: Option<usize>, joint_q_gate: bool) -> crate::lowmem::Dims {
+fn dims_of(
+    cfg: &ModelConfig,
+    head_dim: Option<usize>,
+    joint_q_gate: bool,
+    rot_dim: Option<usize>,
+) -> crate::lowmem::Dims {
     let hd = head_dim.unwrap_or_else(|| cfg.head_dim());
     let q_dim = cfg.num_attention_heads * hd;
     crate::lowmem::Dims {
@@ -259,6 +264,7 @@ fn dims_of(cfg: &ModelConfig, head_dim: Option<usize>, joint_q_gate: bool) -> cr
         kv_dim: cfg.num_key_value_heads * hd,
         // qwen35 projects Q and the output gate jointly; everyone else does not.
         q_proj_dim: if joint_q_gate { 2 * q_dim } else { q_dim },
+        rot_dim: rot_dim.unwrap_or(hd),
     }
 }
 
@@ -593,7 +599,7 @@ impl MetalEngine {
         let lib = device
             .new_library_with_source(&shader_source(model.kv_dim), &CompileOptions::new())
             .map_err(|e| format!("failed to compile kernels.metal: {e}"))?;
-        let dims = dims_of(&model.cfg, Some(model.head_dim), false);
+        let dims = dims_of(&model.cfg, Some(model.head_dim), false, None);
         let pipes = Self::build_pipelines(&device, &lib, &model.cfg)?;
         let win_state = Self::build_win_state(&device, &lib, &model.cfg, dims.kv_dim, win)?;
         Self::finish_dense(device, queue, model, pipes, win_state, dims)
@@ -1395,7 +1401,13 @@ impl MetalEngine {
         let queue = device.new_command_queue();
         let mut source = LowMemSource::open(path)?;
         source.make_gpu_views(&device);
-        let dims = dims_of(&cfg, source.head_dim(), source.qwen35().is_some());
+        let q35m = source.qwen35();
+        let dims = dims_of(
+            &cfg,
+            source.head_dim(),
+            q35m.is_some(),
+            q35m.as_ref().map(|m| 2 * m.rope_sections.iter().sum::<usize>()),
+        );
 
         let shader = shader_source(dims.kv_dim);
         let lib = device
@@ -3948,6 +3960,97 @@ mod qwen35_kernel_oracle {
             state_gap <= 4.0 * state_yard,
             "delta state drift {state_gap:e} exceeds 4x the probe's {state_yard:e}"
         );
+    }
+
+    /// Partial RoPE: qwen35 rotates only rope.dimension_count (64) of each
+    /// 256-wide head and leaves the rest ALONE. The tail is the half worth
+    /// testing — rotating it would still produce a valid rotation of a real
+    /// vector, so nothing would crash or NaN; the model would just quietly be a
+    /// different model. So this asserts the tail is BIT-IDENTICAL to the input,
+    /// and that the rotated prefix matches a full-width rope of that size.
+    #[test]
+    fn rope_rotates_only_the_leading_rot_dim() {
+        let (head_dim, rot, n_heads, n_rows) = (256usize, 64usize, 2usize, 3usize);
+        let mut seed = 0x0A0B_0C0Du32;
+        let x: Vec<f32> = (0..n_rows * n_heads * head_dim).map(|_| lcg(&mut seed)).collect();
+
+        let device = Device::system_default().expect("Metal device required");
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+        let f = lib.get_function("rope", None).expect("rope");
+        let pipe = device.new_compute_pipeline_state_with_function(&f).expect("pipeline");
+        let queue = device.new_command_queue();
+        let buf = device.new_buffer_with_data(
+            x.as_ptr() as *const _,
+            std::mem::size_of_val(&x[..]) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        #[repr(C)]
+        struct P { head_dim: u32, n_heads: u32, pos0: u32, theta: f32, n_rows: u32, rot_dim: u32 }
+        let p = P {
+            head_dim: head_dim as u32,
+            n_heads: n_heads as u32,
+            pos0: 5,
+            theta: 1.0e7,
+            n_rows: n_rows as u32,
+            rot_dim: rot as u32,
+        };
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipe);
+        enc.set_buffer(0, Some(&buf), 0);
+        enc.set_bytes(1, std::mem::size_of::<P>() as u64, &p as *const P as *const _);
+        gpu::dispatch_grid(enc, n_rows * n_heads * rot / 2);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let got = unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, x.len()) };
+
+        let half = rot / 2;
+        for row in 0..n_rows {
+            for h in 0..n_heads {
+                let base = (row * n_heads + h) * head_dim;
+                for i in 0..half {
+                    let freq = (1.0e7f32).powf(-2.0 * i as f32 / rot as f32);
+                    let angle = (5 + row) as f32 * freq;
+                    let (s, c) = (angle.sin(), angle.cos());
+                    let (a, b) = (x[base + i], x[base + i + half]);
+                    let (wa, wb) = (a * c - b * s, a * s + b * c);
+                    // The prefix is checked to transcendental tolerance, not
+                    // bit-for-bit: the kernel reaches its angle through Metal's
+                    // pow and sincos and the CPU through libm's, which differ in
+                    // the last bits. THIS TEST'S CLAIM IS STRUCTURAL — which
+                    // dims move and which do not — and rope's numeric fidelity
+                    // is already covered end-to-end by the dense-model identity
+                    // gates. Saying so beats asserting a ulp count that is
+                    // really measuring two libm implementations.
+                    for (want, have) in [(wa, got[base + i]), (wb, got[base + i + half])] {
+                        assert!(
+                            rel_err(want, have) < 1e-5,
+                            "row {row} head {h} dim {i}: {want} vs {have}"
+                        );
+                    }
+                    // ...and it must actually have rotated, or "matches within
+                    // tolerance" would also pass on a kernel that did nothing.
+                    assert!(
+                        got[base + i].to_bits() != x[base + i].to_bits()
+                            || got[base + i + half].to_bits() != x[base + i + half].to_bits(),
+                        "row {row} head {h} dim {i} did not rotate at all"
+                    );
+                }
+                // THE TAIL MUST BE UNTOUCHED, bit for bit.
+                for i in rot..head_dim {
+                    assert_eq!(
+                        x[base + i].to_bits(),
+                        got[base + i].to_bits(),
+                        "row {row} head {h} dim {i} was rotated but must pass through"
+                    );
+                }
+            }
+        }
     }
 
     /// Run l2norm_rows over `rows` (one threadgroup per row) and read them back.
