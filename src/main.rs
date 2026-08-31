@@ -149,34 +149,61 @@ fn run() -> Result<()> {
         }
         return Ok(());
     }
-    let cfg = config::ModelConfig::load(&dir.join("config.json"))?;
-    let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))?;
+    // A .gguf file is its own checkpoint format: config and tokenizer come out
+    // of the file itself, weights are (possibly) quantized. Everything else
+    // stays the config.json + tokenizer.json + safetensors directory layout.
+    let is_gguf =
+        dir.is_file() && dir.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf"));
+    #[cfg(not(target_os = "macos"))]
+    if is_gguf {
+        return Err("GGUF checkpoints need the macOS build (Metal / lowmem)".into());
+    }
+
+    #[cfg(target_os = "macos")]
+    let (cfg, tokenizer, engine) = if is_gguf {
+        gguf_setup(&args, &dir)?
+    } else {
+        let cfg = config::ModelConfig::load(&dir.join("config.json"))?;
+        let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))?;
+        (cfg, tokenizer, None)
+    };
+    #[cfg(not(target_os = "macos"))]
+    let (cfg, tokenizer, engine) = {
+        let cfg = config::ModelConfig::load(&dir.join("config.json"))?;
+        let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))?;
+        (cfg, tokenizer, None)
+    };
 
     // Wrap the model in the selected backend (cpu uses it directly, metal uploads
     // to the GPU). lowmem builds itself from the model directory — it must never
     // go through Model::load's full-RAM materialization (see src/lowmem/).
-    let engine = if args.backend == "lowmem" {
-        engine::create_lowmem(&dir, cfg.clone(), &args.lowmem)?
-    } else if args.lowmem.any_set() {
-        return Err(
-            "--memory-budget, --context-window, and --attention-sink apply to -b lowmem only"
-                .into(),
-        );
-    } else {
-        let t0 = Instant::now();
-        let model = model::Model::load(&dir, cfg.clone())?;
-        eprintln!(
-            "{} | {} layers | hidden {} | {} q heads / {} kv | vocab {} | {:.1}M params (loaded in {:.1}s)",
-            args.model,
-            cfg.num_hidden_layers,
-            cfg.hidden_size,
-            cfg.num_attention_heads,
-            cfg.num_key_value_heads,
-            cfg.vocab_size,
-            model.n_params as f64 / 1e6,
-            t0.elapsed().as_secs_f64(),
-        );
-        engine::create(&args.backend, model, &dir)?
+    let engine = match engine {
+        Some(e) => e, // already built by the GGUF path
+        None if args.backend == "lowmem" => {
+            engine::create_lowmem(&dir, cfg.clone(), &args.lowmem)?
+        }
+        None if args.lowmem.any_set() => {
+            return Err(
+                "--memory-budget, --context-window, and --attention-sink apply to -b lowmem only"
+                    .into(),
+            );
+        }
+        None => {
+            let t0 = Instant::now();
+            let model = model::Model::load(&dir, cfg.clone())?;
+            eprintln!(
+                "{} | {} layers | hidden {} | {} q heads / {} kv | vocab {} | {:.1}M params (loaded in {:.1}s)",
+                args.model,
+                cfg.num_hidden_layers,
+                cfg.hidden_size,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.vocab_size,
+                model.n_params as f64 / 1e6,
+                t0.elapsed().as_secs_f64(),
+            );
+            engine::create(&args.backend, model, &dir)?
+        }
     };
     eprintln!("backend: {}", engine.name());
 
@@ -242,4 +269,101 @@ fn run() -> Result<()> {
         out.generated_tokens as f64 / out.decode_secs.max(1e-9),
     );
     Ok(())
+}
+
+/// Build (config, tokenizer, engine) from a GGUF checkpoint (revised D6):
+/// cpu/metal dequantize everything to f32 when the EXPANDED weights fit RAM,
+/// lowmem is the bounded path, hybrid cannot run GGUF at all.
+#[cfg(target_os = "macos")]
+fn gguf_setup(
+    args: &Args,
+    path: &std::path::Path,
+) -> Result<(config::ModelConfig, tokenizers::Tokenizer, Option<Box<dyn engine::Engine>>)> {
+    use lowmem::gguf;
+    let g = gguf::GgufFile::open(path)?;
+    // LOKAL_GGUF_INFO=1: dump the tensor table and exit — the cross-check gate
+    // diffs this against `llama-cli --verbose` (parser-only, so it works even
+    // on files whose tokenizer lokal refuses).
+    if std::env::var_os("LOKAL_GGUF_INFO").is_some_and(|v| v == "1") {
+        print!("{}", g.dump_tsv());
+        println!("total\t{}", g.n_tensors());
+        std::process::exit(0);
+    }
+    let (cfg, arch) = gguf::model_config(&g)?;
+    let tokenizer = gguf::build_tokenizer(&g)?;
+    eprintln!(
+        "{} | {} ({}) | {} layers | hidden {} | {} q heads / {} kv | vocab {}",
+        args.model,
+        gguf::summary(&g),
+        arch.arch,
+        cfg.num_hidden_layers,
+        cfg.hidden_size,
+        cfg.num_attention_heads,
+        cfg.num_key_value_heads,
+        cfg.vocab_size,
+    );
+    let engine = match args.backend.as_str() {
+        "lowmem" => Some(engine::create_lowmem(path, cfg.clone(), &args.lowmem)?),
+        "hybrid" | "ane" => {
+            return Err("the hybrid backend cannot run a GGUF: its ANE prefill graphs are \
+                 exported from safetensors (tools/export_prefill.py) — use -b metal, or the \
+                 model's safetensors checkpoint"
+                .into())
+        }
+        "cpu" | "metal" => {
+            if arch.arch == "qwen3" || arch.qk_norm {
+                return Err(format!(
+                    "architecture {} needs per-head q/k RMSNorm, which only -b lowmem runs — \
+                     use -b lowmem",
+                    arch.arch
+                )
+                .into());
+            }
+            if args.lowmem.any_set() {
+                return Err(
+                    "--memory-budget, --context-window, and --attention-sink apply to -b lowmem only"
+                        .into(),
+                );
+            }
+            // The honest RAM cost is the EXPANDED f32 size, not the file size —
+            // a 4 GB Q4 file is ~28 GB of f32. Checked before any allocation.
+            let expanded = gguf::expanded_f32_bytes(&g);
+            let ram = gguf::phys_ram_bytes();
+            if expanded > ram {
+                return Err(format!(
+                    "this GGUF expands to {:.1} GB of f32 weights, but the machine has {:.1} GB \
+                     of RAM — run it with -b lowmem (weights stay quantized and paged there)",
+                    expanded as f64 / 1e9,
+                    ram as f64 / 1e9
+                )
+                .into());
+            }
+            let quant = gguf::quant_bytes(&g);
+            if expanded >= 4 * quant {
+                eprintln!(
+                    "note: this {:.1} GB file becomes {:.1} GB of f32 in RAM on -b {} — \
+                     -b lowmem keeps the weights quantized instead",
+                    quant as f64 / 1e9,
+                    expanded as f64 / 1e9,
+                    args.backend
+                );
+            }
+            let t0 = Instant::now();
+            let model = model::Model::from_tensors(cfg.clone(), gguf::load_f32(&g)?)?;
+            eprintln!(
+                "dequantized {:.1}M params to f32 in {:.1}s",
+                model.n_params as f64 / 1e6,
+                t0.elapsed().as_secs_f64()
+            );
+            let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            Some(engine::create(&args.backend, model, parent)?)
+        }
+        other => {
+            return Err(format!(
+                "unknown backend \"{other}\" for a GGUF — available: cpu, metal, lowmem"
+            )
+            .into())
+        }
+    };
+    Ok((cfg, tokenizer, engine))
 }

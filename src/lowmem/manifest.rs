@@ -168,6 +168,7 @@ impl WeightManifest {
 /// (enum ggml_type in ggml.h) — `from_gguf` is the only constructor.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(u32)]
+#[allow(non_camel_case_types)] // names match ggml's exactly — grep-ability beats style
 pub enum GgmlType {
     F32 = 0,
     F16 = 1,
