@@ -15,6 +15,8 @@ mod forward;
 pub(crate) mod gguf;
 pub(crate) mod iq_grids;
 pub(crate) mod manifest;
+#[allow(dead_code)] // consumers arrive with lane C
+pub(crate) mod qwen35_ref; // lane B oracle (challenge on qwen35-cpu-ref)
 mod pool;
 
 use crate::config::ModelConfig;
