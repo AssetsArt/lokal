@@ -346,6 +346,21 @@ fn gguf_setup(
         cfg.num_key_value_heads,
         cfg.vocab_size,
     );
+    // qwen35's hybrid blocks (gated deltanet + MTP) have no execution path yet
+    // — lanes qwen35-kernels/-state build it. Say so instead of failing on the
+    // first tensor name the standard walk cannot find.
+    if arch.arch == "qwen35" {
+        let m = lowmem::gguf::qwen35_meta(&g)?;
+        return Err(format!(
+            "qwen35 parsed clean ({} trunk layers: {} full-attention + {} gated-deltanet{}) — \
+             execution lands with the qwen35 kernel and session-state lanes",
+            m.trunk_layers,
+            m.is_recurrent.iter().filter(|r| !**r).count(),
+            m.is_recurrent.iter().filter(|r| **r).count(),
+            if m.nextn_layers > 0 { ", +1 MTP block (skipped)" } else { "" },
+        )
+        .into());
+    }
     let engine = match args.backend.as_str() {
         "lowmem" => Some(engine::create_lowmem(path, cfg.clone(), &args.lowmem)?),
         "hybrid" | "ane" => {
