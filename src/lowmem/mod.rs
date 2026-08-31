@@ -20,7 +20,7 @@ use crate::config::ModelConfig;
 use crate::engine::{Engine, Session};
 use crate::gpu::metal as gpu;
 use manifest::{dequant_row_ref, GgmlType, WeightManifest};
-use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, FunctionConstantValues, MTLDataType};
+use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, FunctionConstantValues, MTLDataType, MTLResourceOptions};
 use pool::{PagedTensor, WeightPool, PAGE_BYTES};
 use safetensors::Dtype;
 use std::collections::HashMap;
@@ -283,6 +283,10 @@ pub(crate) enum LowMemSource {
 /// file speaks `blk.0.attn_q.weight`.
 pub(crate) struct GgufSource {
     file: gguf::GgufFile,
+    /// One no-copy Metal view over the file's mmap, plus the page-aligned host
+    /// address it starts at, so a tensor's span becomes (view, byte offset).
+    view: Option<Buffer>,
+    base: usize,
     /// HF name -> the GGUF name that carries it.
     by_hf: HashMap<String, String>,
     arch: gguf::GgufArch,
@@ -302,18 +306,46 @@ impl LowMemSource {
                     by_hf.insert(hf, t.name.clone());
                 }
             }
-            Ok(LowMemSource::Gguf(Box::new(GgufSource { file, by_hf, arch, n_params })))
+            Ok(LowMemSource::Gguf(Box::new(GgufSource {
+                file,
+                by_hf,
+                arch,
+                n_params,
+                view: None,
+                base: 0,
+            })))
         } else {
             Ok(LowMemSource::Safetensors(WeightManifest::open(path)?))
         }
     }
 
     pub fn make_gpu_views(&mut self, device: &Device) {
-        if let LowMemSource::Safetensors(mf) = self {
-            mf.make_gpu_views(device);
+        const PAGE: usize = 16384;
+        match self {
+            LowMemSource::Safetensors(mf) => mf.make_gpu_views(device),
+            LowMemSource::Gguf(g) => {
+                // The mmap base is not exposed, but every tensor points into
+                // it, so the lowest tensor address rounded DOWN to a page is a
+                // mapped, page-aligned address — which is all Metal needs.
+                let (mut lo, mut hi) = (usize::MAX, 0usize);
+                for t in g.file.tensors() {
+                    let p = t.data.as_ptr() as usize;
+                    lo = lo.min(p);
+                    hi = hi.max(p + t.data.len());
+                }
+                if lo == usize::MAX {
+                    return;
+                }
+                let base = lo & !(PAGE - 1);
+                g.base = base;
+                g.view = Some(device.new_buffer_with_bytes_no_copy(
+                    base as *const _,
+                    (hi - base).next_multiple_of(PAGE) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                    None,
+                ));
+            }
         }
-        // GGUF direct-read views land with the streaming path; a None span
-        // simply routes staging through the CPU copy, which is correct either way.
     }
 
     pub fn n_tensors(&self) -> usize {
@@ -423,7 +455,20 @@ impl LowMemSource {
     ) -> crate::Result<Option<(&Buffer, usize)>> {
         match self {
             LowMemSource::Safetensors(mf) => mf.gpu_span(name, r0, r1),
-            LowMemSource::Gguf(_) => Ok(None),
+            LowMemSource::Gguf(g) => {
+                let Some(view) = &g.view else { return Ok(None) };
+                let t = g.tensor(name)?;
+                let cols = *t.dims.last().ok_or("gguf tensor has no dims")?;
+                if r1 > t.dims[0] || r0 >= r1 {
+                    return Err(format!("gpu_span({name}, {r0}..{r1})").into());
+                }
+                // A permuted tensor's rows are not contiguous in the file, so
+                // there is no single span to hand the GPU — those stage.
+                if self.unpermute_head_dim(name).is_some() {
+                    return Ok(None);
+                }
+                Ok(Some((view, t.data.as_ptr() as usize - g.base + r0 * t.ty.row_bytes(cols))))
+            }
         }
     }
 

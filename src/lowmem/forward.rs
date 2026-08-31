@@ -331,7 +331,13 @@ impl<'a> LowMemSession<'a> {
                     enc.set_buffer(0, Some(buf), 0);
                 }
                 Bind::Direct(view, off) => {
-                    enc.set_compute_pipeline_state(self.e.direct_pipe(fam));
+                    // Quant blocks read identically from a pool page or the
+                    // checkpoint, so they keep their staged pipeline; only
+                    // bf16 needs the raw-checkpoint specialization.
+                    enc.set_compute_pipeline_state(match t.ty.is_quant() {
+                        true => self.e.staged_pipe(t.ty, fam),
+                        false => self.e.direct_pipe(fam),
+                    });
                     enc.set_buffer(0, Some(view), *off as u64);
                 }
             }

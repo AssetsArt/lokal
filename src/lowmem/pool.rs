@@ -169,6 +169,11 @@ pub(super) struct WeightPool {
     /// f32→f16 clips past 65504 — flag an overflowing checkpoint once, at the
     /// first page that actually clips (cheaper than a full scan at open).
     overflow_warned: bool,
+    /// LOKAL_LOWMEM_QDIRECT=1: let over-budget QUANT pages read straight from
+    /// the checkpoint instead of staging. Correct in every run measured at the
+    /// alignment gate below, but the gate's threshold is empirical rather than
+    /// explained, so the default keeps quant pages on the staged path.
+    qdirect: bool,
     /// Staging counters. A model that fits the pool must stage every page once
     /// and never again — the residency promise is exactly "zero stage-ins per
     /// decode step", and a gate cannot assert that from free text.
@@ -203,6 +208,7 @@ impl WeightPool {
             free: HashMap::new(),
             free_bytes: 0,
             overflow_warned: false,
+            qdirect: std::env::var("LOKAL_LOWMEM_QDIRECT").is_ok_and(|v| v == "1"),
             stats: PoolStats::default(),
         }
     }
@@ -342,11 +348,25 @@ impl WeightPool {
         }
         let need = t.block_bytes(block);
         if self.used + self.free_bytes + need > self.budget
-            && t.ty == SrcType::BF16 // the direct pipes read raw bf16
+            // bf16 needs its own pipeline to read raw checkpoint bytes; a QUANT
+            // page needs nothing special, because the pool page and the file
+            // span hold the SAME quant blocks — the staged pipeline reads
+            // either one. That is the streaming promise: over-budget quant
+            // weights cross the bus as quant bytes, once.
+            && (t.ty == SrcType::BF16 || (t.ty.is_quant() && self.qdirect))
         {
             let (r0, rows) = t.block_rows(block);
             if let Some((view, off)) = src.gpu_span(&t.name, r0, r0 + rows)? {
-                if off % 4 == 0 {
+                // 64, not 4, for quant. MEASURED, not derived: on Qwen3-0.6B
+                // Q4_K_M at a 200 MB pool, spans admitted at 4- or 16-byte
+                // alignment decode into garbage while the SAME code at 64 and
+                // 128 is exact, and Q4_K alone reproduces it, so it is not a
+                // per-type bug. Every offset here is already 32-aligned (GGUF
+                // aligns tensor data to 32 and the view base to a page), so
+                // what fails is precisely the 32-mod-64 spans. Until the reason
+                // is understood this path stays OFF by default — see qdirect.
+                let need_align = if t.ty.is_quant() { 64 } else { 4 };
+                if off % need_align == 0 {
                     self.stats.direct_binds += 1;
                     self.stats.direct_bytes += need as u64;
                     return Ok(Ok(Bind::Direct(view.clone(), off)));
