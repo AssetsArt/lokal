@@ -328,6 +328,27 @@ pub(crate) struct GgufSource {
     n_params: usize,
 }
 
+/// The one qwen35 tensor `gguf::hf_name` cannot express: `blk.N.ssm_a` carries
+/// NO `.weight`/`.bias` suffix, so the generic mapper's `rsplit_once('.')`
+/// fails and the tensor never enters the name index — it would be invisible to
+/// the loader rather than merely awkwardly named.
+///
+/// Every other deltanet tensor already survives, via the mapper's
+/// `gguf.<mid>` fallback (`blk.0.ssm_conv1d.weight` becomes
+/// `model.layers.0.gguf.ssm_conv1d.weight`), so this handles the one exception
+/// rather than duplicating the mapper. It lives here, not in gguf.rs, because
+/// that file belongs to the loader lane; this is a lowmem-side index fix and
+/// changes no shared behaviour — `hf_name` is consulted first and wins.
+fn qwen35_hf_name(gguf: &str) -> Option<String> {
+    let rest = gguf.strip_prefix("blk.")?;
+    let (n, mid) = rest.split_once('.')?;
+    let i: usize = n.parse().ok()?;
+    match mid {
+        "ssm_a" => Some(format!("model.layers.{i}.gguf.ssm_a")),
+        _ => None,
+    }
+}
+
 impl LowMemSource {
     pub fn open(path: &Path) -> crate::Result<Self> {
         if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
@@ -338,6 +359,8 @@ impl LowMemSource {
             for t in file.tensors() {
                 n_params += t.dims.iter().product::<usize>();
                 if let Some(hf) = gguf::hf_name(&t.name) {
+                    by_hf.insert(hf, t.name.clone());
+                } else if let Some(hf) = qwen35_hf_name(&t.name) {
                     by_hf.insert(hf, t.name.clone());
                 }
             }
@@ -990,6 +1013,111 @@ impl Engine for LowMemEngine {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- qwen35 real-file tests: run by the gates with `--ignored` ----
+
+    fn qwen35_gguf() -> Option<std::path::PathBuf> {
+        let snaps = std::path::PathBuf::from(std::env::var("HOME").ok()?)
+            .join(".cache/huggingface/hub/models--unsloth--Qwen3.5-2B-GGUF/snapshots");
+        std::fs::read_dir(snaps)
+            .ok()?
+            .flatten()
+            .flat_map(|e| std::fs::read_dir(e.path()).into_iter().flatten().flatten())
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "gguf"))
+    }
+
+    /// Every tensor the qwen35 forward pass will ask for must be ADDRESSABLE
+    /// before any of it is written. The hybrid has two different block shapes
+    /// and they share only the norms and the FFN, so a name that silently fails
+    /// to resolve would surface much later as a confusing load error in the
+    /// middle of a graph — this asserts the whole set up front, per layer, on
+    /// the real checkpoint.
+    ///
+    /// It also pins the one name the generic mapper cannot express: `ssm_a`
+    /// carries no `.weight` suffix, so without `qwen35_hf_name` it is absent
+    /// from the index entirely rather than merely oddly named.
+    #[test]
+    #[ignore]
+    fn qwen35_2b_every_tensor_resolves() {
+        let Some(path) = qwen35_gguf() else {
+            panic!("Qwen3.5-2B GGUF not in the HF cache — this gate needs the real file");
+        };
+        let src = LowMemSource::open(&path).expect("opens");
+        let meta = src.qwen35().expect("qwen35 meta parses");
+        assert_eq!(meta.is_recurrent.len(), meta.trunk_layers);
+
+        let mut linear = 0;
+        let mut full = 0;
+        for i in 0..meta.trunk_layers {
+            let p = format!("model.layers.{i}");
+            // Shared by both block kinds.
+            for n in [
+                format!("{p}.input_layernorm.weight"),
+                format!("{p}.gguf.post_attention_norm.weight"),
+                format!("{p}.mlp.gate_proj.weight"),
+                format!("{p}.mlp.up_proj.weight"),
+                format!("{p}.mlp.down_proj.weight"),
+            ] {
+                assert!(src.has(&n), "layer {i}: missing {n}");
+            }
+            if meta.is_recurrent[i] {
+                linear += 1;
+                for n in [
+                    format!("{p}.gguf.attn_qkv.weight"),
+                    format!("{p}.gguf.attn_gate.weight"),
+                    format!("{p}.gguf.ssm_conv1d.weight"),
+                    format!("{p}.gguf.ssm_a"),
+                    format!("{p}.gguf.ssm_alpha.weight"),
+                    format!("{p}.gguf.ssm_beta.weight"),
+                    format!("{p}.gguf.ssm_dt.bias"),
+                    format!("{p}.gguf.ssm_norm.weight"),
+                    format!("{p}.gguf.ssm_out.weight"),
+                ] {
+                    assert!(src.has(&n), "linear layer {i}: missing {n}");
+                }
+            } else {
+                full += 1;
+                for n in [
+                    format!("{p}.self_attn.q_proj.weight"),
+                    format!("{p}.self_attn.k_proj.weight"),
+                    format!("{p}.self_attn.v_proj.weight"),
+                    format!("{p}.self_attn.o_proj.weight"),
+                    format!("{p}.self_attn.q_norm.weight"),
+                    format!("{p}.self_attn.k_norm.weight"),
+                ] {
+                    assert!(src.has(&n), "attention layer {i}: missing {n}");
+                }
+            }
+        }
+        // full_attention_interval 4 over 24 blocks: 6 attention, 18 linear.
+        assert_eq!((linear, full), (18, 6), "hybrid split on the 2B");
+        assert!(src.has("model.embed_tokens.weight") && src.has("model.norm.weight"));
+    }
+
+    /// The shapes the kernels were written against, read off the real file
+    /// rather than assumed. conv_channels is the load-bearing one: the joint
+    /// qkv projection's output width must EQUAL 2·n_group·d_state + d_inner, or
+    /// the conv kernel is reading a differently-packed row than lane B's
+    /// reference and every gate downstream is meaningless.
+    #[test]
+    #[ignore]
+    fn qwen35_2b_shapes_match_the_kernel_assumptions() {
+        let Some(path) = qwen35_gguf() else { panic!("Qwen3.5-2B GGUF not in the HF cache") };
+        let src = LowMemSource::open(&path).expect("opens");
+        let meta = src.qwen35().expect("qwen35 meta parses");
+        let d = crate::lowmem::qwen35_ref::DeltaDims {
+            d_state: meta.d_state,
+            n_v_heads: meta.dt_rank,
+            n_k_heads: meta.n_group,
+            d_conv: meta.d_conv,
+        };
+        assert_eq!(d.d_inner(), meta.d_inner, "d_inner = dt_rank · d_state");
+        // 2B: 2·16·128 + 2048 = 6144, which must be attn_qkv's output width.
+        assert_eq!(d.conv_channels(), 6144);
+        assert_eq!(meta.conv_state_elems, (meta.d_conv - 1) * d.conv_channels());
+        assert_eq!(meta.delta_state_elems, meta.d_state * meta.d_inner);
+    }
     use super::*;
     use crate::config::EosIds;
 
