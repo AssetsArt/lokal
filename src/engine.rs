@@ -136,6 +136,22 @@ pub fn create_lowmem(
     }
 }
 
+/// Quantized-GGUF execution on the Metal backend — built from the file, never
+/// from a materialized Model (the whole point is no f32 expansion).
+pub fn create_metal_quant(
+    path: &std::path::Path,
+    cfg: crate::config::ModelConfig,
+    win: Option<(usize, usize)>,
+) -> crate::Result<Box<dyn Engine>> {
+    #[cfg(target_os = "macos")]
+    return Ok(Box::new(crate::gpu::metal::MetalEngine::new_gguf_quant(path, cfg, win)?));
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (path, cfg, win);
+        Err("quantized GGUF execution needs Metal — macOS only".into())
+    }
+}
+
 // ---------- CPU backend: wraps the reference Model + KvCache in the traits ----------
 
 pub struct CpuEngine {
