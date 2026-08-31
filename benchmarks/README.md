@@ -4,6 +4,41 @@ Cross-engine comparison of local inference servers on Apple Silicon, and the
 harness that produced it. Numbers here are honest measurements, including the
 ones lokal loses — they exist to steer the roadmap, not to advertise.
 
+## GGUF on `-b lowmem` — two rows held, and how to collect them
+
+`-b lowmem` runs quantized GGUF checkpoints, and on a 16 GB machine the
+capability is the result worth reporting:
+
+| checkpoint | file | result |
+|---|---|---|
+| Qwen3-32B Q4_K_M | 19.76 GB | opens and answers correctly on a 16 GB box |
+| Qwen2.5-14B Q4_K_M | 8.99 GB | pool-resident, answers correctly |
+| Qwen3-0.6B Q4_K_M | 0.46 GB | 5/5 prompts byte-identical to llama.cpp, 48 greedy tokens |
+| Qwen2.5-0.5B Q4_K_M | 0.40 GB | ~120 tok/s decode (resident, measured clean) |
+
+**The 14B and 32B decode rows are deliberately not here.** Both were measured
+in a quieted window and both were discarded: with 8.1 GB of weights on a 16 GB
+box, macOS compresses the pool rather than swapping it, every decode pass
+touches all of it, and the measured ~1.8 GB/s decompression rate accounted for
+the throughput almost exactly. Such a row measures the compressor, not the
+engine, and would not reproduce for a reader. What reproduces is the
+requirement: **14B Q4 needs ~10 GB of genuinely free RAM to decode at resident
+speed** (8.1 GB pool + 0.5 GB KV + 0.3 GB activations + overhead).
+
+To collect the held rows on an actually-idle machine — a fresh boot, or after
+any agent crew exits — run:
+
+```
+zsh /path/to/k4-bigmodels.sh
+```
+
+It gates itself: CPU-quiet before and after, `vm_stat` swapins and
+decompressions sampled around each run (>20k swapins or >200k decompressions
+fails the row), one run per model, and an untimed `vmmap` footprint pass kept
+separate because `vmmap` suspends its target and would corrupt a timed number.
+If it refuses, the machine was not idle enough — the refusal is the result, not
+an obstacle to work around.
+
 ## Setup
 
 - Hardware: Apple M1 Pro, 16 GB RAM, macOS 26.5

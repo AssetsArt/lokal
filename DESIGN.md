@@ -414,12 +414,26 @@ Decode throughput, models small enough to be genuinely resident on this box:
 | Qwen2.5-0.5B Q4_K_M | ~120 tok/s |
 | Qwen2.5-0.5B Q8_0 | ~114 tok/s |
 
-The 14B and 32B decode rows are **pending a memory-quiet window** and are
-deliberately absent rather than estimated. Both were measured, and both are
-contaminated: with only ~3 GB free the box swapped through the run, so the
-figure describes what else was resident on the machine rather than what the
-engine does. A reader on an idle 16 GB M1 Pro would not reproduce it, which is
-the only test a published row has to pass.
+The 14B and 32B decode rows are **requirements, not numbers**, and that is the
+honest form rather than a placeholder:
+
+- **14B Q4 (8.99 GB file)** — pool-resident and correct. Resident-speed decode
+  needs about **10 GB genuinely free** (8.1 GB pool + 0.5 GB KV + 0.3 GB
+  activations + overhead); a 16 GB box also carrying macOS does not provide it.
+- **32B Q4 (19.76 GB file)** — opens and answers correctly; streaming-bound by
+  construction at 8.1 GB per token, which the counters confirm exactly
+  (`decode_MB=34071` over four tokens). Its speed needs a box whose free RAM
+  holds the pool uncompressed, for the same reason.
+
+Both were measured in a deliberately quieted window and both figures were
+discarded, because on a 16 GB box they measure **macOS's memory compressor**
+rather than this engine: the pool is compressed rather than swapped, every
+decode pass touches all of it, and the resulting ~1.8 GB/s decompression rate
+matched the observed throughput almost exactly. Swap looked mild while that was
+happening (836k swapins against 9.8M decompressions), which is why the residency
+gate now samples both. For resident-decode physics, read the 0.5B rows above —
+those measured clean. To collect the headline on an actually-idle box, see
+`benchmarks/README.md`.
 
 ## Where the time goes
 
