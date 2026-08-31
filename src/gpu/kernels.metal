@@ -164,6 +164,147 @@ inline float lm_dequant_q6_K(device const uchar *row, uint col) {
     return d * (float)sc[(l >> 4) + 2 * grp] * (float)q;
 }
 
+// ---- Per-run dequant: the same arithmetic, hoisted ----
+//
+// The per-element helpers above are the readable reference and the oracle's
+// subject, but calling one per weight costs ~10 scattered byte loads for every
+// element: the block base, the f16 scale and the 6-bit scale/min are all
+// re-derived each time. On a fully-resident 14B Q4_K_M that was 17.5 s/token.
+//
+// Every run below covers 32 CONTIGUOUS, 32-ALIGNED elements, which is exactly
+// the granularity at which the block-invariant work stops changing: for the
+// 32-element types a run is one whole block, and for the K-quants the
+// sub-block index, the 64-element group and the nibble half are all constant
+// across it. So the scales are decoded ONCE and the loop reads only payload.
+// Per-element values are unchanged; only the order of the SUM differs, which
+// no gate promises and the oracle (which compares dequantized values, not
+// dot products) still pins.
+
+inline float lm_dot_run_q8_0(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 5) * 34;
+    float d = lm_f16_at(b);
+    float s = 0.0f;
+    for (uint j = 0; j < 32; j++) {
+        s += (float)(char)b[2 + j] * x[e0 + j];
+    }
+    return s * d;
+}
+
+inline float lm_dot_run_q4_0(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 5) * 18;
+    float d = lm_f16_at(b);
+    float s = 0.0f;
+    for (uint j = 0; j < 16; j++) {
+        uchar by = b[2 + j];
+        s += (float)((int)(by & 0x0F) - 8) * x[e0 + j];
+        s += (float)((int)(by >> 4) - 8) * x[e0 + j + 16];
+    }
+    return s * d;
+}
+
+inline float lm_dot_run_q5_0(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 5) * 22;
+    float d = lm_f16_at(b);
+    uint qh = (uint)b[2] | ((uint)b[3] << 8) | ((uint)b[4] << 16) | ((uint)b[5] << 24);
+    float s = 0.0f;
+    for (uint j = 0; j < 16; j++) {
+        uchar by = b[6 + j];
+        uint xl = ((qh >> j) << 4) & 0x10;
+        uint xh = (qh >> (j + 12)) & 0x10;
+        s += (float)((int)((by & 0x0F) | xl) - 16) * x[e0 + j];
+        s += (float)((int)((by >> 4) | xh) - 16) * x[e0 + j + 16];
+    }
+    return s * d;
+}
+
+inline float lm_dot_run_q4_K(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 8) * 144;
+    float d = lm_f16_at(b);
+    float dmin = lm_f16_at(b + 2);
+    uint ib0 = e0 & 255;
+    uint sc, mn;
+    lm_scale_min_k4(ib0 >> 5, b + 4, sc, mn);
+    float d1 = d * (float)sc;
+    float m1 = dmin * (float)mn;
+    device const uchar *qs = b + 16 + (ib0 >> 6) * 32;
+    bool hi = (ib0 & 32) != 0;
+    // y = d1*q - m1 per element, so the run is d1*sum(q*x) - m1*sum(x).
+    float sq = 0.0f, sx = 0.0f;
+    for (uint j = 0; j < 32; j++) {
+        uchar by = qs[j];
+        uint q = hi ? (by >> 4) : (by & 0x0F);
+        float xv = x[e0 + j];
+        sq += (float)q * xv;
+        sx += xv;
+    }
+    return d1 * sq - m1 * sx;
+}
+
+inline float lm_dot_run_q5_K(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 8) * 176;
+    float d = lm_f16_at(b);
+    float dmin = lm_f16_at(b + 2);
+    uint ib0 = e0 & 255;
+    uint g = ib0 >> 6;
+    uint hi_half = (ib0 >> 5) & 1;
+    uint sc, mn;
+    lm_scale_min_k4(ib0 >> 5, b + 4, sc, mn);
+    float d1 = d * (float)sc;
+    float m1 = dmin * (float)mn;
+    device const uchar *qh = b + 16;
+    device const uchar *qs = b + 48 + g * 32;
+    float sq = 0.0f, sx = 0.0f;
+    for (uint l = 0; l < 32; l++) {
+        uchar by = qs[l];
+        uint nib = hi_half ? (by >> 4) : (by & 0x0F);
+        uint hi = ((qh[l] >> (2 * g + hi_half)) & 1) << 4;
+        float xv = x[e0 + l];
+        sq += (float)(nib + hi) * xv;
+        sx += xv;
+    }
+    return d1 * sq - m1 * sx;
+}
+
+inline float lm_dot_run_q6_K(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 8) * 210;
+    uint ib0 = e0 & 255;
+    uint h = ib0 >> 7;
+    uint grp = (ib0 & 127) >> 5;
+    device const uchar *ql = b + h * 64 + (grp & 1) * 32;
+    device const uchar *qh = b + 128 + h * 32;
+    device const char *sc = (device const char *)(b + 192) + h * 8;
+    float d = lm_f16_at(b + 208);
+    // Q6_K's scales change every 16 elements, so a 32-run spans exactly two.
+    float s0 = d * (float)sc[2 * grp];
+    float s1 = d * (float)sc[1 + 2 * grp];
+    float a0 = 0.0f, a1 = 0.0f;
+    for (uint l = 0; l < 32; l++) {
+        uchar lowbyte = ql[l];
+        uint low = (grp < 2) ? (lowbyte & 0x0F) : (lowbyte >> 4);
+        uint hi2 = (qh[l] >> (2 * grp)) & 3;
+        float q = (float)((int)(low | (hi2 << 4)) - 32);
+        if (l < 16) {
+            a0 += q * x[e0 + l];
+        } else {
+            a1 += q * x[e0 + l];
+        }
+    }
+    return s0 * a0 + s1 * a1;
+}
+
+/// Dot product of one 32-element aligned run of a quantized row with x.
+inline float lm_dot_run(device const uchar *row, uint e0, device const float *x) {
+    switch (LM_W_QTYPE) {
+        case 2: return lm_dot_run_q8_0(row, e0, x);
+        case 3: return lm_dot_run_q4_0(row, e0, x);
+        case 4: return lm_dot_run_q4_K(row, e0, x);
+        case 5: return lm_dot_run_q6_K(row, e0, x);
+        case 6: return lm_dot_run_q5_K(row, e0, x);
+        case 7: return lm_dot_run_q5_0(row, e0, x);
+        default: return 0.0f;
+    }
+}
+
 inline float lm_dequant(device const uchar *row, uint col) {
     switch (LM_W_QTYPE) {
         case 2: return lm_dequant_q8_0(row, col);
@@ -233,8 +374,13 @@ inline float dot_wx(device const half *w, uint row, device const float *x, uint 
     if (LM_W_QTYPE >= 2) {
         device const uchar *row_base =
             (device const uchar *)w + (ulong)row * lm_row_bytes(in_dim);
-        for (uint i = lane; i < in_dim; i += 32) {
-            acc += lm_dequant(row_base, i) * x[i];
+        // One 32-element run per lane, striding by the simdgroup: the block
+        // scales are decoded once per run instead of once per weight. Every
+        // quantized in_dim is a multiple of 32 (blocks are 32 or 256 elements
+        // and PagedTensor::new refuses a row that is not whole blocks).
+        uint runs = in_dim >> 5;
+        for (uint r = lane; r < runs; r += 32) {
+            acc += lm_dot_run(row_base, r << 5, x);
         }
         return acc;
     }

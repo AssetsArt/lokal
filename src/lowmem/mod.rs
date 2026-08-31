@@ -355,6 +355,15 @@ impl LowMemSource {
         }
     }
 
+    /// Bytes the pool holds for the whole model — the checkpoint's own encoding
+    /// for GGUF (quant blocks stay quantized), f16 for safetensors.
+    pub fn staged_bytes(&self) -> usize {
+        match self {
+            LowMemSource::Safetensors(mf) => mf.n_params * 2,
+            LowMemSource::Gguf(g) => g.file.tensors().map(|t| t.data.len()).sum(),
+        }
+    }
+
     pub fn n_params(&self) -> usize {
         match self {
             LowMemSource::Safetensors(mf) => mf.n_params,
@@ -788,7 +797,12 @@ impl LowMemEngine {
             Err(_) => plan.pool_bytes,
         };
         let pool = WeightPool::new(&device, pool_bytes);
-        let staged_bytes = source.n_params() * 2; // f16 in the pool, whatever the disk dtype
+        // What the pool would actually hold. NOT params*2: that assumes every
+        // weight stages as f16, which is the whole thing a quantized checkpoint
+        // is not — it reported a 19.8 GB Q4 file as needing 61 GB, and turned
+        // the disk-bound estimate into fiction on exactly the models this
+        // backend exists for.
+        let staged_bytes = source.staged_bytes();
         if staged_bytes > pool_bytes {
             // The ANE-compile lesson: long silent work must announce itself. And
             // the decode line pre-answers "why is the GPU idle": past the budget
