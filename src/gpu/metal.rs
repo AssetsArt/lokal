@@ -249,13 +249,22 @@ pub struct MetalEngine {
 
 /// lowmem's Dims constructor is module-private; same three lines, same reason
 /// as the WindowCfg mirror (fields are pub, the formula is fixed).
-fn dims_of(cfg: &ModelConfig, head_dim: Option<usize>) -> crate::lowmem::Dims {
+fn dims_of(
+    cfg: &ModelConfig,
+    head_dim: Option<usize>,
+    joint_q_gate: bool,
+    rot_dim: Option<usize>,
+) -> crate::lowmem::Dims {
     let hd = head_dim.unwrap_or_else(|| cfg.head_dim());
+    let q_dim = cfg.num_attention_heads * hd;
     crate::lowmem::Dims {
         hidden: cfg.hidden_size,
         head_dim: hd,
-        q_dim: cfg.num_attention_heads * hd,
+        q_dim,
         kv_dim: cfg.num_key_value_heads * hd,
+        // qwen35 projects Q and the output gate jointly; everyone else does not.
+        q_proj_dim: if joint_q_gate { 2 * q_dim } else { q_dim },
+        rot_dim: rot_dim.unwrap_or(hd),
     }
 }
 
@@ -375,6 +384,47 @@ pub(crate) struct Qwen35Layout {
 }
 
 impl Qwen35Layout {
+    /// MRoPE'S PRECONDITION, refused by name rather than silently assumed.
+    ///
+    /// qwen35 carries `rope.dimension_sections` and llama.cpp routes it through
+    /// ggml_mrope_cache_init. For a TEXT batch that function is a no-op relative
+    /// to plain rope — llama-batch.cpp:781-787 broadcasts ONE position into all
+    /// four components, ops.cpp sets indep_sects = is_vision so the per-section
+    /// resets never fire, and every one of the four thetas is multiplied by the
+    /// same theta_scale each pair. All four therefore stay equal for the whole
+    /// sequence, so whichever theta a sector selects is the plain-rope theta.
+    /// `mrope_degenerates_to_rope_for_text_batches` pins that numerically.
+    ///
+    /// The REAL precondition is a property of the batch, not the checkpoint:
+    /// this engine never constructs a vision batch. What metadata CAN tell us is
+    /// whether a checkpoint belongs to the family that equivalence was verified
+    /// on. A vision-capable variant reaches the same rope path and would be
+    /// silently rotated with the wrong thetas — the one way this bites — so an
+    /// unrecognised section layout is refused by name here instead.
+    ///
+    /// Deliberately NOT done: a sectioned rope kernel. Its best possible outcome
+    /// is bit-identity with the rope we already ship, against a hand-derived
+    /// index mapping that could be wrong (Detoro's ruling, task note e0449773).
+    pub fn check_rope_sections(m: &crate::lowmem::gguf::Qwen35Meta) -> Result<(), String> {
+        let s = &m.rope_sections;
+        let sum: usize = s.iter().sum();
+        if sum == 0 {
+            return Err(format!(
+                "qwen35: rope.dimension_sections is all zeros {s:?} — no rotary sections to \
+                 map; refusing rather than rotating with an undefined layout"
+            ));
+        }
+        if s[3] != 0 {
+            return Err(format!(
+                "qwen35: rope.dimension_sections {s:?} has a non-zero 4th (vision 'extra') \
+                 section — this is a vision-capable variant. This engine only builds text \
+                 batches, which is what makes MRoPE equivalent to plain rope, and it has no \
+                 sectioned rope kernel. Refusing by name rather than rotating it as text."
+            ));
+        }
+        Ok(())
+    }
+
     /// The one meta→layout translation, so no caller re-derives sizes (where
     /// the 17-layer misconception would creep back in): the map is exactly the
     /// TRUNK's is_recurrent — the MTP block is not in the meta's map at all.
@@ -505,6 +555,21 @@ pub(crate) fn attn_row_width(hidden: usize, q_dim: usize) -> usize {
     hidden.max(q_dim)
 }
 
+/// An f32 buffer holding `data`, for weights the qwen35 kernels read as f32.
+///
+/// The deltanet small tensors (ssm_conv1d, ssm_a, ssm_dt.bias, ssm_norm) are
+/// stored F32 in the checkpoint and consumed as `device const float *` by the
+/// kernels, which are gated BIT-FOR-BIT against an f32 CPU reference. Routing
+/// them through the f16 path that norms use would narrow them and forfeit that
+/// gate for no residency win — together they are a few hundred KB.
+pub(crate) fn f32_buffer_from(device: &Device, data: &[f32]) -> Buffer {
+    device.new_buffer_with_data(
+        data.as_ptr() as *const _,
+        std::mem::size_of_val(data) as u64,
+        MTLResourceOptions::StorageModeShared,
+    )
+}
+
 pub(crate) fn f32_buffer(device: &Device, len: usize) -> Buffer {
     device.new_buffer((len * 4) as u64, MTLResourceOptions::StorageModeShared)
 }
@@ -534,7 +599,7 @@ impl MetalEngine {
         let lib = device
             .new_library_with_source(&shader_source(model.kv_dim), &CompileOptions::new())
             .map_err(|e| format!("failed to compile kernels.metal: {e}"))?;
-        let dims = dims_of(&model.cfg, Some(model.head_dim));
+        let dims = dims_of(&model.cfg, Some(model.head_dim), false, None);
         let pipes = Self::build_pipelines(&device, &lib, &model.cfg)?;
         let win_state = Self::build_win_state(&device, &lib, &model.cfg, dims.kv_dim, win)?;
         Self::finish_dense(device, queue, model, pipes, win_state, dims)
@@ -1152,6 +1217,16 @@ impl MetalEngine {
     }
 
     /// Decode-only: RoPE on q and this position's new k cache row, one dispatch.
+    // qwen35 NOTE — do not "fix" this by adding MRoPE sectioning. qwen35 ships
+    // rope.dimension_sections and llama.cpp routes it through
+    // ggml_mrope_cache_init, but for a TEXT batch that is provably the same
+    // rope as this one: one position is broadcast into all four components, so
+    // the four thetas start equal and are all scaled by theta_scale every pair,
+    // and the sector select can never pick a different value. Pinned by
+    // qwen35_kernel_oracle::mrope_degenerates_to_rope_for_text_batches (with a
+    // vision-path negative control), and vision-capable checkpoints are refused
+    // by name in Qwen35Layout::check_rope_sections. A sectioned kernel's best
+    // possible outcome is bit-identity with this one.
     fn enc_rope_qk(
         &self,
         enc: &ComputeCommandEncoderRef,
@@ -1326,7 +1401,13 @@ impl MetalEngine {
         let queue = device.new_command_queue();
         let mut source = LowMemSource::open(path)?;
         source.make_gpu_views(&device);
-        let dims = dims_of(&cfg, source.head_dim());
+        let q35m = source.qwen35();
+        let dims = dims_of(
+            &cfg,
+            source.head_dim(),
+            q35m.is_some(),
+            q35m.as_ref().map(|m| 2 * m.rope_sections.iter().sum::<usize>()),
+        );
 
         let shader = shader_source(dims.kv_dim);
         let lib = device
@@ -1560,7 +1641,7 @@ impl MetalEngine {
             // q and attention rows are q_dim wide — qwen3's q_dim (heads x 128)
             // is 2x hidden, so sizing these by hidden overflows into whatever
             // the allocator placed next (the first symptom is nondeterminism).
-            q: f32_buffer(d, chunk * attn_row_width(cfg.hidden_size, self.dims.q_dim)),
+            q: f32_buffer(d, chunk * attn_row_width(cfg.hidden_size, self.dims.q_proj_dim)),
             att: f32_buffer(d, chunk * attn_row_width(cfg.hidden_size, self.dims.q_dim)),
             xb: f32_buffer(d, chunk * cfg.hidden_size),
             gate: f32_buffer(d, chunk * cfg.intermediate_size),
@@ -1579,7 +1660,7 @@ impl MetalEngine {
             ),
             xh: f16_empty_buffer(
                 d,
-                chunk * cfg.hidden_size.max(cfg.intermediate_size).max(self.dims.q_dim),
+                chunk * cfg.hidden_size.max(cfg.intermediate_size).max(self.dims.q_proj_dim),
             ),
             // Window mode stages fresh K/V rows in f32 here, then scatters them
             // into the ring as f16 spans (lowmem's exact write path). One float
@@ -2341,7 +2422,7 @@ impl MetalEngine {
             // overran them on every config where q_dim > hidden_size (Qwen3-0.6B
             // and 4B among them); session_scratch had the same bug and this
             // path was missed when that one was fixed.
-            q: f32_buffer(d, n_slots * attn_row_width(h, self.dims.q_dim)),
+            q: f32_buffer(d, n_slots * attn_row_width(h, self.dims.q_proj_dim)),
             att: f32_buffer(d, n_slots * attn_row_width(h, self.dims.q_dim)),
             gate: f32_buffer(d, n_slots * cfg.intermediate_size),
             logits: f32_buffer(d, n_slots * cfg.vocab_size),
@@ -2703,5 +2784,1438 @@ mod tests {
             * (layout.conv_elems + layout.delta_elems)
             * 4;
         assert_eq!(bytes >> 20, 149);
+    }
+}
+
+#[cfg(test)]
+mod qwen35_kernel_oracle {
+    //! GPU kernels vs lane B's CPU reference (src/lowmem/qwen35_ref.rs),
+    //! bit-for-bit. Same doctrine as the quant oracle: the reference is the
+    //! subject, the GPU is the thing under test, and a negative control proves
+    //! the comparison can fail.
+    use crate::gpu::metal as gpu;
+    use crate::lowmem::qwen35_ref as rf;
+    use metal::{CompileOptions, Device, MTLResourceOptions, MTLSize};
+
+    /// Small but structurally real: several channels, the true d_conv, and a
+    /// state that is genuinely rolled across steps rather than used once.
+    fn dims() -> rf::DeltaDims {
+        rf::DeltaDims { d_state: 8, n_v_heads: 4, n_k_heads: 2, d_conv: 4 }
+    }
+
+    fn lcg(seed: &mut u32) -> f32 {
+        *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        ((*seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+    }
+
+    /// Run ssm_conv_decode for `steps` tokens, returning every step's output
+    /// and the final state — the rolling is half the semantics, so a
+    /// single-shot comparison would miss a broken roll entirely.
+    fn gpu_conv(d: rf::DeltaDims, state0: &[f32], xs: &[Vec<f32>], w: &[f32]) -> (Vec<Vec<f32>>, Vec<f32>) {
+        let device = Device::system_default().expect("Metal device required");
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+        let f = lib.get_function("ssm_conv_decode", None).expect("ssm_conv_decode");
+        let pipe = device.new_compute_pipeline_state_with_function(&f).expect("pipeline");
+        let queue = device.new_command_queue();
+        let c_all = d.conv_channels();
+
+        let bytes = |v: &[f32]| (std::mem::size_of_val(v)) as u64;
+        let st = device.new_buffer_with_data(
+            state0.as_ptr() as *const _, bytes(state0), MTLResourceOptions::StorageModeShared);
+        let wb = device.new_buffer_with_data(
+            w.as_ptr() as *const _, bytes(w), MTLResourceOptions::StorageModeShared);
+        let out = device.new_buffer((c_all * 4) as u64, MTLResourceOptions::StorageModeShared);
+
+        #[repr(C)]
+        struct P { channels: u32, d_conv: u32 }
+        let p = P { channels: c_all as u32, d_conv: d.d_conv as u32 };
+        let mut outs = Vec::new();
+        for x in xs {
+            let xb = device.new_buffer_with_data(
+                x.as_ptr() as *const _, bytes(x), MTLResourceOptions::StorageModeShared);
+            let cb = queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipe);
+            enc.set_buffer(0, Some(&st), 0);
+            enc.set_buffer(1, Some(&xb), 0);
+            enc.set_buffer(2, Some(&wb), 0);
+            enc.set_buffer(3, Some(&out), 0);
+            enc.set_bytes(4, std::mem::size_of::<P>() as u64,
+                          &p as *const P as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(((c_all + 63) / 64) as u64, 1, 1), MTLSize::new(64, 1, 1));
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            outs.push(unsafe { std::slice::from_raw_parts(out.contents() as *const f32, c_all) }.to_vec());
+        }
+        let final_state =
+            unsafe { std::slice::from_raw_parts(st.contents() as *const f32, state0.len()) }.to_vec();
+        (outs, final_state)
+    }
+
+    #[test]
+    fn conv_decode_matches_reference_bit_for_bit() {
+        let d = dims();
+        let (c_all, k) = (d.conv_channels(), d.d_conv);
+        let mut seed = 0x2545_F491u32;
+        let state0: Vec<f32> = (0..c_all * (k - 1)).map(|_| lcg(&mut seed)).collect();
+        let w: Vec<f32> = (0..c_all * k).map(|_| lcg(&mut seed)).collect();
+        let xs: Vec<Vec<f32>> =
+            (0..5).map(|_| (0..c_all).map(|_| lcg(&mut seed)).collect()).collect();
+
+        let (gpu_outs, gpu_state) = gpu_conv(d, &state0, &xs, &w);
+
+        // Two different bars, because two different things are being checked.
+        //
+        // The DOT is pure multiply-add and must be BIT-EXACT: we control the
+        // order and, with contraction off, the GPU reproduces ggml's scalar
+        // form exactly. Anything less means a real arithmetic divergence.
+        //
+        // The SiLU output cannot be bit-exact: it goes through exp(), and no
+        // transcendental is bit-specified across implementations — Metal's and
+        // libm's differ, and `precise::exp` does not close it either (measured,
+        // not assumed). So this gate bounds the END-TO-END value at 2 ulp.
+        //
+        // That the DOT itself is bit-exact was established separately, by
+        // running this same comparison with silu removed from the kernel: it
+        // failed by 1 ulp until `#pragma clang fp contract(off)` stopped Metal
+        // fusing the multiply-add, then matched exactly. The bound below is
+        // therefore exp's floor and nothing else, which is why 2 ulp is an
+        // assertion rather than a shrug.
+        let mut ref_state = state0.clone();
+        let mut worst_ulp = 0i64;
+        for (step, x) in xs.iter().enumerate() {
+            let want = rf::conv_step(&d, &mut ref_state, x, &w);
+            for (i, (a, b)) in want.iter().zip(&gpu_outs[step]).enumerate() {
+                let ulp = (a.to_bits() as i64 - b.to_bits() as i64).abs();
+                assert!(
+                    ulp <= 2,
+                    "step {step} channel {i}: reference {a} vs gpu {b} ({ulp} ulp) — \
+                     more than exp()'s spread means a real divergence"
+                );
+                worst_ulp = worst_ulp.max(ulp);
+            }
+        }
+        // Pin the observed spread: if it ever grows, something changed that is
+        // not exp's last bit.
+        assert!(worst_ulp <= 2, "worst {worst_ulp} ulp across the run");
+        // The rolled state must match too: an off-by-one roll produces correct
+        // FIRST outputs and wrong later ones, so only comparing step 0 would
+        // pass a broken kernel.
+        for (i, (a, b)) in ref_state.iter().zip(&gpu_state).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "final state slot {i}");
+        }
+    }
+
+    /// The comparison must be able to FAIL: feeding the reference a state that
+    /// differs in one slot has to break bit-equality somewhere.
+    #[test]
+    fn conv_oracle_has_a_negative_control() {
+        let d = dims();
+        let (c_all, k) = (d.conv_channels(), d.d_conv);
+        let mut seed = 99u32;
+        let state0: Vec<f32> = (0..c_all * (k - 1)).map(|_| lcg(&mut seed)).collect();
+        let w: Vec<f32> = (0..c_all * k).map(|_| lcg(&mut seed)).collect();
+        let xs: Vec<Vec<f32>> = vec![(0..c_all).map(|_| lcg(&mut seed)).collect()];
+
+        let (gpu_outs, _) = gpu_conv(d, &state0, &xs, &w);
+        let mut perturbed = state0.clone();
+        perturbed[0] = perturbed[0] + 1.0;
+        let mut rs = perturbed;
+        let want = rf::conv_step(&d, &mut rs, &xs[0], &w);
+        assert!(
+            want.iter().zip(&gpu_outs[0]).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "a perturbed state must change the output, or the oracle proves nothing"
+        );
+    }
+
+    /// Run delta_decode_step for `steps` tokens against one persistent state,
+    /// returning every step's output and the final state.
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_delta(
+        d: rf::DeltaDims,
+        state0: &[f32],
+        q: &[Vec<f32>],
+        k: &[Vec<f32>],
+        v: &[Vec<f32>],
+        g: &[Vec<f32>],
+        beta: &[Vec<f32>],
+    ) -> (Vec<Vec<f32>>, Vec<f32>) {
+        let device = Device::system_default().expect("Metal device required");
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+        let f = lib.get_function("delta_decode_step", None).expect("delta_decode_step");
+        let pipe = device.new_compute_pipeline_state_with_function(&f).expect("pipeline");
+        let queue = device.new_command_queue();
+
+        let bytes = |v: &[f32]| (std::mem::size_of_val(v)) as u64;
+        let shared = MTLResourceOptions::StorageModeShared;
+        let st = device.new_buffer_with_data(state0.as_ptr() as *const _, bytes(state0), shared);
+        let n_out = d.d_state * d.n_v_heads;
+        let out = device.new_buffer((n_out * 4) as u64, shared);
+
+        #[repr(C)]
+        struct P {
+            d_state: u32,
+            n_v_heads: u32,
+            group: u32,
+        }
+        let p = P {
+            d_state: d.d_state as u32,
+            n_v_heads: d.n_v_heads as u32,
+            group: (d.n_v_heads / d.n_k_heads) as u32,
+        };
+
+        let mut outs = Vec::new();
+        for step in 0..q.len() {
+            let up = |x: &[f32]| device.new_buffer_with_data(x.as_ptr() as *const _, bytes(x), shared);
+            let (qb, kb, vb) = (up(&q[step]), up(&k[step]), up(&v[step]));
+            let (gb, bb) = (up(&g[step]), up(&beta[step]));
+            let cb = queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipe);
+            enc.set_buffer(0, Some(&st), 0);
+            enc.set_buffer(1, Some(&qb), 0);
+            enc.set_buffer(2, Some(&kb), 0);
+            enc.set_buffer(3, Some(&vb), 0);
+            enc.set_buffer(4, Some(&gb), 0);
+            enc.set_buffer(5, Some(&bb), 0);
+            enc.set_buffer(6, Some(&out), 0);
+            enc.set_bytes(7, std::mem::size_of::<P>() as u64, &p as *const P as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(((n_out + 63) / 64) as u64, 1, 1),
+                MTLSize::new(64, 1, 1),
+            );
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            outs.push(
+                unsafe { std::slice::from_raw_parts(out.contents() as *const f32, n_out) }.to_vec(),
+            );
+        }
+        let final_state =
+            unsafe { std::slice::from_raw_parts(st.contents() as *const f32, state0.len()) }.to_vec();
+        (outs, final_state)
+    }
+
+    /// Inputs for `steps` delta steps. `decay` chooses the g values: `None`
+    /// means g = 0 exactly, which is what makes the bit-exact test possible.
+    #[allow(clippy::type_complexity)]
+    fn delta_inputs(
+        d: rf::DeltaDims,
+        steps: usize,
+        seed: &mut u32,
+        decay: bool,
+    ) -> (Vec<f32>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let (s, hv, hk) = (d.d_state, d.n_v_heads, d.n_k_heads);
+        let state0: Vec<f32> = (0..d.delta_state_elems()).map(|_| lcg(seed)).collect();
+        fn mk(n: usize, seed: &mut u32) -> Vec<f32> {
+            (0..n).map(|_| lcg(seed)).collect()
+        }
+        let q: Vec<Vec<f32>> = (0..steps).map(|_| mk(s * hk, seed)).collect();
+        let k: Vec<Vec<f32>> = (0..steps).map(|_| mk(s * hk, seed)).collect();
+        let v: Vec<Vec<f32>> = (0..steps).map(|_| mk(s * hv, seed)).collect();
+        // g is a log-decay: the model's g = a·softplus(α+bias) is <= 0, so eᵍ
+        // is a contraction. Feeding positive g would let the state blow up over
+        // steps and the comparison would be measuring overflow, not the kernel.
+        let g: Vec<Vec<f32>> = (0..steps)
+            .map(|_| {
+                (0..hv)
+                    .map(|_| if decay { -(lcg(seed).abs()) } else { 0.0 })
+                    .collect()
+            })
+            .collect();
+        let beta: Vec<Vec<f32>> = (0..steps).map(|_| mk(hv, seed)).collect();
+        (state0, q, k, v, g, beta)
+    }
+
+    /// With g = 0 the decay factor is exp(0) = 1.0 — exact in every
+    /// implementation — so the ENTIRE kernel is add/multiply and must be
+    /// bit-for-bit. This is the load-bearing test: it pins the state layout,
+    /// the K-head broadcast, the 1/√S scaling, the update-then-read ordering
+    /// inside the second loop, and the summation order of both dots. Only the
+    /// decay itself is left to the bounded test below, so nothing can hide
+    /// inside a tolerance.
+    #[test]
+    fn delta_decode_matches_reference_bit_for_bit() {
+        let d = dims();
+        let mut seed = 0x9E37_79B9u32;
+        let (state0, q, k, v, g, beta) = delta_inputs(d, 5, &mut seed, false);
+        let (gpu_outs, gpu_state) = gpu_delta(d, &state0, &q, &k, &v, &g, &beta);
+
+        let mut ref_state = state0.clone();
+        for step in 0..q.len() {
+            let want =
+                rf::delta_decode_step(&d, &mut ref_state, &q[step], &k[step], &v[step], &g[step], &beta[step]);
+            for (i, (a, b)) in want.iter().zip(&gpu_outs[step]).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "step {step} slot {i}: reference {a} vs gpu {b} — with g=0 this kernel \
+                     is pure multiply-add and has no excuse for a difference"
+                );
+            }
+        }
+        // Several steps AND the final state, because the state is the half that
+        // a single-step comparison cannot see: a kernel that writes the right
+        // outputs from a subtly wrong state passes step 0 and fails step 3.
+        for (i, (a, b)) in ref_state.iter().zip(&gpu_state).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "final state slot {i}");
+        }
+    }
+
+    /// With a live decay the kernel calls exp(), which is where bit-equality
+    /// ends: Metal's exp and the host's differ in the last bit (measured on the
+    /// conv kernel; `precise::exp` does not close it). Every element of the
+    /// state is scaled by that value every step, so that difference is carried
+    /// forward and amplified by the recurrence.
+    ///
+    /// So this test does NOT assert a hand-picked tolerance. It MEASURES the
+    /// conditioning first — how far the reference drifts from ITSELF when
+    /// exp(g) is moved by one rounding unit — and then requires the GPU to sit
+    /// inside a small multiple of that. If the kernel's only divergence is
+    /// exp's last bit, it lands there by construction; if it has a real
+    /// arithmetic bug, no amount of ill-conditioning in the recurrence excuses
+    /// it, because the yardstick is derived from the reference alone and a GPU
+    /// bug cannot inflate it.
+    ///
+    /// A fixed tolerance would have been the wrong instrument here: the first
+    /// draft of this test asserted 1e-5 and passed, and the measured drift was
+    /// 5.5e-6 — about 46 ulp. That number is neither "exp's last bit" nor a
+    /// bug; it is the recurrence's gain, and the only way to tell those apart
+    /// is to measure the gain separately.
+    #[test]
+    fn delta_decode_bounded_once_the_decay_is_live() {
+        let d = dims();
+        let mut seed = 0x0DEF_ACEDu32;
+        let (state0, q, k, v, g, beta) = delta_inputs(d, 5, &mut seed, true);
+        let (gpu_outs, gpu_state) = gpu_delta(d, &state0, &q, &k, &v, &g, &beta);
+
+        // exp(g + δ) = exp(g)·(1 + δ), so δ = 2⁻²⁴ — f32's rounding unit — is
+        // exactly a one-rounding move in the decay factor, applied to every
+        // head at once (the worst case: the GPU's per-head last-bit errors
+        // point in arbitrary directions).
+        let delta = (2f32).powi(-24);
+        let g_nudged: Vec<Vec<f32>> =
+            g.iter().map(|row| row.iter().map(|x| x + delta).collect()).collect();
+
+        let run = |gs: &[Vec<f32>]| -> (Vec<Vec<f32>>, Vec<f32>) {
+            let mut st = state0.clone();
+            let outs = (0..q.len())
+                .map(|t| rf::delta_decode_step(&d, &mut st, &q[t], &k[t], &v[t], &gs[t], &beta[t]))
+                .collect();
+            (outs, st)
+        };
+        let (ref_outs, ref_state) = run(&g);
+        let (nudged_outs, nudged_state) = run(&g_nudged);
+
+        let worst = |a: &[Vec<f32>], b: &[Vec<f32>], sa: &[f32], sb: &[f32]| -> f32 {
+            let o = a
+                .iter()
+                .zip(b)
+                .flat_map(|(x, y)| x.iter().zip(y))
+                .fold(0f32, |m, (x, y)| m.max(rel_err(*x, *y)));
+            sa.iter().zip(sb).fold(o, |m, (x, y)| m.max(rel_err(*x, *y)))
+        };
+        let yardstick = worst(&ref_outs, &nudged_outs, &ref_state, &nudged_state);
+        let measured = worst(&ref_outs, &gpu_outs, &ref_state, &gpu_state);
+
+        // The yardstick must be non-zero, or it is not measuring anything and
+        // the ratio below would be vacuous.
+        assert!(yardstick > 0.0, "one-rounding nudge changed nothing — the sensitivity probe is broken");
+        // 4x, and the factor is derived rather than chosen: the yardstick moves
+        // every head's decay in the SAME direction, and heads never mix in this
+        // kernel, so a GPU whose only fault is exp's last bit cannot exceed ~2x
+        // it (exp(g) for g<0 lands in (0,1), where one ulp is between 2⁻²⁴ and
+        // 2⁻²³ relative). 4x is that ceiling with one doubling of margin.
+        // Measured on M-series at this seed: gpu 5.5e-6, yardstick 1.9e-5,
+        // ratio 0.29 — inside the envelope and 13x below the bar.
+        assert!(
+            measured <= 4.0 * yardstick,
+            "gpu drift {measured:e} exceeds 4x the reference's own one-rounding sensitivity {yardstick:e} — that is more than exp's last bit can explain"
+        );
+    }
+
+    fn rel_err(a: f32, b: f32) -> f32 {
+        let scale = a.abs().max(b.abs());
+        if scale == 0.0 { 0.0 } else { (a - b).abs() / scale }
+    }
+
+    /// Run attn_out_gate over a flat vector.
+    fn gpu_attn_gate(attn: &[f32], gate: &[f32]) -> Vec<f32> {
+        let device = Device::system_default().expect("Metal device required");
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+        let f = lib.get_function("attn_out_gate", None).expect("attn_out_gate");
+        let pipe = device.new_compute_pipeline_state_with_function(&f).expect("pipeline");
+        let queue = device.new_command_queue();
+        let shared = MTLResourceOptions::StorageModeShared;
+        let ab = device.new_buffer_with_data(
+            attn.as_ptr() as *const _, std::mem::size_of_val(attn) as u64, shared);
+        let gb = device.new_buffer_with_data(
+            gate.as_ptr() as *const _, std::mem::size_of_val(gate) as u64, shared);
+        let n = attn.len() as u32;
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipe);
+        enc.set_buffer(0, Some(&ab), 0);
+        enc.set_buffer(1, Some(&gb), 0);
+        enc.set_bytes(2, 4, &n as *const u32 as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new(((attn.len() + 63) / 64) as u64, 1, 1), MTLSize::new(64, 1, 1));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        unsafe { std::slice::from_raw_parts(ab.contents() as *const f32, attn.len()) }.to_vec()
+    }
+
+    /// The EXACT half for the out-gate. σ has three arguments where it is
+    /// exactly representable in any implementation — σ(0) = 0.5 (exp(0) = 1
+    /// exactly), σ(+big) = 1 and σ(−big) = 0 (exp underflows, 1+0 = 1) — so
+    /// feeding those pins the pairing, the indexing and the multiply with no
+    /// tolerance at all. The +big case is the valuable one: it asserts the
+    /// kernel leaves values ALONE when the gate is open, which a scaling bug
+    /// would break while still passing a σ(0) test.
+    #[test]
+    fn attn_out_gate_is_exact_at_saturation_and_zero() {
+        let mut seed = 0x7A11_0000u32;
+        let attn: Vec<f32> = (0..256).map(|_| lcg(&mut seed)).collect();
+        let gate: Vec<f32> = (0..256)
+            .map(|i| match i % 3 { 0 => 0.0, 1 => 100.0, _ => -100.0 })
+            .collect();
+        let got = gpu_attn_gate(&attn, &gate);
+        let mut want = attn.clone();
+        rf::attn_out_gate(&mut want, &gate);
+        for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "slot {i}: reference {a} vs gpu {b}");
+        }
+    }
+
+    /// The BOUNDED half — and the number in it was NOT picked, because when I
+    /// picked one I got it wrong.
+    ///
+    /// I asserted 2 ulp here first, on the strength of the conv kernel's
+    /// measured silu spread. It FAILED at 3 ulp, and the reason is structural,
+    /// not a fluke: σ(g) = 1/(1+exp(−g)) rounds three more times AFTER exp —
+    /// the add, the reciprocal, and the product — so a one-ulp exp error can
+    /// surface as three. conv's silu happened to land inside 2 and I
+    /// generalised from it.
+    ///
+    /// Bumping 2 to 3 would have been exactly the quiet gate-widening this lane
+    /// exists to prevent, so the bound is measured instead: perturb exp by one
+    /// rounding inside the reference's own σ, see how far the result moves, and
+    /// require the GPU inside 4x that. Then the bar tracks the arithmetic
+    /// rather than the last number that happened to pass.
+    #[test]
+    fn attn_out_gate_bounded_by_sigmoids_measured_floor() {
+        let mut seed = 0x7A11_0001u32;
+        let attn: Vec<f32> = (0..1024).map(|_| lcg(&mut seed) * 4.0).collect();
+        let gate: Vec<f32> = (0..1024).map(|_| lcg(&mut seed) * 8.0).collect();
+        let got = gpu_attn_gate(&attn, &gate);
+        let mut want = attn.clone();
+        rf::attn_out_gate(&mut want, &gate);
+
+        // σ with exp moved by one f32 rounding — the only thing the GPU is
+        // allowed to be doing differently.
+        let nudged: Vec<f32> = attn
+            .iter()
+            .zip(&gate)
+            .map(|(a, g)| {
+                // f32::EPSILON (2⁻²³), not 2⁻²⁴: 1.0 + 2⁻²⁴ rounds straight
+                // back to 1.0, so the smaller nudge is a no-op and the probe
+                // measures nothing. The guard below caught exactly that.
+                let e = (-g).exp() * (1.0 + f32::EPSILON);
+                a * (1.0 / (1.0 + e))
+            })
+            .collect();
+        let yardstick = want
+            .iter()
+            .zip(&nudged)
+            .fold(0f32, |m, (a, b)| m.max(rel_err(*a, *b)));
+        let measured = want.iter().zip(&got).fold(0f32, |m, (a, b)| m.max(rel_err(*a, *b)));
+        assert!(yardstick > 0.0, "the one-rounding nudge changed nothing — probe is broken");
+        assert!(
+            measured <= 4.0 * yardstick,
+            "gpu drift {measured:e} exceeds 4x sigmoid's measured one-rounding \
+             floor {yardstick:e} — more than exp's last bit can explain"
+        );
+    }
+
+    /// The out-gate's negative control: the gate is applied ELEMENTWISE and
+    /// paired by index, so rotating the gate by one must break the match. A
+    /// kernel that read the gate at the wrong offset — the exact hazard, since
+    /// the gate rides interleaved in the joint Q projection — would otherwise
+    /// look perfect.
+    #[test]
+    fn attn_out_gate_oracle_sees_a_misaligned_gate() {
+        let mut seed = 0x7A11_0002u32;
+        let attn: Vec<f32> = (0..256).map(|_| lcg(&mut seed)).collect();
+        let gate: Vec<f32> = (0..256).map(|_| lcg(&mut seed) * 4.0).collect();
+        let got = gpu_attn_gate(&attn, &gate);
+        let mut rotated: Vec<f32> = gate[1..].to_vec();
+        rotated.push(gate[0]);
+        let mut want = attn.clone();
+        rf::attn_out_gate(&mut want, &rotated);
+        assert!(
+            want.iter().zip(&got).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "a rotated gate must change the output, or the pairing is untested"
+        );
+    }
+
+    /// Run gated_output_norm (one threadgroup per V head).
+    fn gpu_gated_norm(d: rf::DeltaDims, o: &[f32], w: &[f32], z: &[f32], eps: f32) -> Vec<f32> {
+        let device = Device::system_default().expect("Metal device required");
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+        let f = lib.get_function("gated_output_norm", None).expect("gated_output_norm");
+        let pipe = device.new_compute_pipeline_state_with_function(&f).expect("pipeline");
+        let queue = device.new_command_queue();
+        let shared = MTLResourceOptions::StorageModeShared;
+        let mk = |v: &[f32]| device.new_buffer_with_data(
+            v.as_ptr() as *const _, std::mem::size_of_val(v) as u64, shared);
+        let (ob, wb, zb) = (mk(o), mk(w), mk(z));
+        let dim = d.d_state as u32;
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipe);
+        enc.set_buffer(0, Some(&ob), 0);
+        enc.set_buffer(1, Some(&wb), 0);
+        enc.set_buffer(2, Some(&zb), 0);
+        enc.set_bytes(3, 4, &dim as *const u32 as *const _);
+        enc.set_bytes(4, 4, &eps as *const f32 as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new(d.n_v_heads as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        unsafe { std::slice::from_raw_parts(ob.contents() as *const f32, o.len()) }.to_vec()
+    }
+
+    fn norm_dims() -> rf::DeltaDims {
+        rf::DeltaDims { d_state: 128, n_v_heads: 4, n_k_heads: 2, d_conv: 4 }
+    }
+
+    /// The EXACT half for the gated norm, built by removing BOTH inexact
+    /// ingredients at once rather than tolerating them:
+    ///   * integer o and w keep Σo² exactly representable, so the f32 tree sum
+    ///     and the reference's f64 sum agree bit-for-bit (and dividing by a
+    ///     power-of-two head width is exact);
+    ///   * z = +100 makes silu(z) = z EXACTLY (exp(−100) underflows, 1+0 = 1,
+    ///     σ = 1), so the gate contributes a real multiply rather than a
+    ///     transcendental — and unlike z = 0 it does not collapse the output to
+    ///     zeros, which would have made the test vacuous.
+    /// What remains pinned exactly is the whole operation order: mean, one
+    /// reciprocal root, and the (o·scale)·w association the reference uses.
+    #[test]
+    fn gated_output_norm_matches_reference_where_the_sums_agree() {
+        let d = norm_dims();
+        let (s, eps) = (d.d_state, 1e-5f32);
+        let mut seed = 0xBEEF_0001u32;
+        let o: Vec<f32> = (0..s * d.n_v_heads).map(|_| (lcg(&mut seed) * 8.0).round()).collect();
+        let w: Vec<f32> = (0..s).map(|_| (lcg(&mut seed) * 4.0).round()).collect();
+        let z: Vec<f32> = vec![100.0; s * d.n_v_heads];
+        let got = gpu_gated_norm(d, &o, &w, &z, eps);
+        let mut want = o.clone();
+        rf::gated_output_norm(&d, &mut want, &w, &z, eps);
+        for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "slot {i}: reference {a} vs gpu {b}");
+        }
+    }
+
+    /// The BOUNDED half. Two inexact ingredients now, so the yardstick is the
+    /// larger of the two measured floors: the f64→f32 accumulation gap (probed
+    /// on the reference itself) and one σ rounding. Same rule as everywhere in
+    /// this lane — the tolerance may only ever cover what was proven separately
+    /// above, and it is measured rather than picked.
+    #[test]
+    fn gated_output_norm_bounded_by_its_two_measured_floors() {
+        let d = norm_dims();
+        let (s, eps) = (d.d_state, 1e-5f32);
+        let mut seed = 0xBEEF_0002u32;
+        let o: Vec<f32> = (0..s * d.n_v_heads).map(|_| lcg(&mut seed)).collect();
+        let w: Vec<f32> = (0..s).map(|_| lcg(&mut seed)).collect();
+        let z: Vec<f32> = (0..s * d.n_v_heads).map(|_| lcg(&mut seed) * 4.0).collect();
+        let got = gpu_gated_norm(d, &o, &w, &z, eps);
+
+        let mut want = o.clone();
+        rf::gated_output_norm(&d, &mut want, &w, &z, eps);
+
+        // The accumulation probe: the same maths with the mean narrowed to f32.
+        let mut narrowed = o.clone();
+        for h in 0..d.n_v_heads {
+            let oh = &mut narrowed[h * s..(h + 1) * s];
+            let mean: f32 = oh.iter().map(|&v| v * v).sum::<f32>() / s as f32;
+            let scale = 1.0 / (mean + eps).sqrt();
+            for i in 0..s {
+                oh[i] = oh[i] * scale * w[i] * rf::silu(z[h * s + i]);
+            }
+        }
+        let accum_gap = want
+            .iter()
+            .zip(&narrowed)
+            .fold(0f32, |m, (a, b)| m.max(rel_err(*a, *b)));
+        // One f32 rounding is 2⁻²⁴ relative; σ costs about one.
+        let sigma_floor = (2f32).powi(-24);
+        let yardstick = accum_gap.max(sigma_floor);
+        let measured = want.iter().zip(&got).fold(0f32, |m, (a, b)| m.max(rel_err(*a, *b)));
+        assert!(accum_gap > 0.0, "narrowing the mean changed nothing — probe is broken");
+        assert!(
+            measured <= 4.0 * yardstick,
+            "gpu drift {measured:e} exceeds 4x the measured floor {yardstick:e} \
+             (accumulation {accum_gap:e}, sigma {sigma_floor:e})"
+        );
+    }
+
+    /// The gated norm's negative control. `w` is [S] and SHARED by every head,
+    /// so it must be indexed WITHIN the head — a kernel that walked it by
+    /// global position would produce head 0 correctly and every later head
+    /// wrong. Rotating w must break the match; that it does is what makes the
+    /// exact test above evidence about indexing and not just about arithmetic.
+    #[test]
+    fn gated_output_norm_oracle_sees_a_misaligned_weight() {
+        let d = norm_dims();
+        let (s, eps) = (d.d_state, 1e-5f32);
+        let mut seed = 0xBEEF_0003u32;
+        let o: Vec<f32> = (0..s * d.n_v_heads).map(|_| lcg(&mut seed)).collect();
+        let w: Vec<f32> = (0..s).map(|_| lcg(&mut seed)).collect();
+        let z: Vec<f32> = (0..s * d.n_v_heads).map(|_| lcg(&mut seed) * 4.0).collect();
+        let got = gpu_gated_norm(d, &o, &w, &z, eps);
+        let mut rotated: Vec<f32> = w[1..].to_vec();
+        rotated.push(w[0]);
+        let mut want = o.clone();
+        rf::gated_output_norm(&d, &mut want, &rotated, &z, eps);
+        assert!(
+            want.iter().zip(&got).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "a rotated ssm_norm weight must change the output, or w's indexing is untested"
+        );
+    }
+
+    /// (a) of the MRoPE ruling: the equivalence PINNED, not remembered.
+    ///
+    /// Both theta sequences are transcribed from ggml (ops.cpp
+    /// ggml_rope_cache_init and ggml_mrope_cache_init, read on this box, not
+    /// recalled) — only the theta each pair uses, since that is the entire
+    /// claim; rope_yarn is common to both paths and would only add noise.
+    ///
+    /// For a text batch all four position components carry the SAME position,
+    /// so theta_t/h/w/e start equal, and the loop multiplies all four by
+    /// theta_scale every pair — they can never diverge, so the sector select is
+    /// a no-op. That is why no sectioned kernel is needed.
+    ///
+    /// The negative control is in the same test on purpose: flipping
+    /// indep_sects (llama.cpp's vision path, where the thetas ARE reset at
+    /// section boundaries) must make the sequences differ. Without it, a
+    /// transcription that accidentally computed plain rope twice would "prove"
+    /// the equivalence while checking nothing.
+    #[test]
+    fn mrope_degenerates_to_rope_for_text_batches() {
+        // ops.cpp: theta_scale = powf(freq_base, -2/n_dims).
+        let (ne0, freq_base) = (256usize, 1.0e6f32);
+        let theta_scale = freq_base.powf(-2.0 / ne0 as f32);
+        let sections = [11usize, 11, 10, 0];
+
+        // ggml_rope_cache_init: one theta, scaled once per pair.
+        let rope_thetas = |base: f32| -> Vec<f32> {
+            let mut theta = base;
+            (0..ne0 / 2)
+                .map(|_| {
+                    let t = theta;
+                    theta *= theta_scale;
+                    t
+                })
+                .collect()
+        };
+
+        // ggml_mrope_cache_init, non-interleaved branch.
+        let mrope_thetas = |bases: [f32; 4], indep_sects: bool, is_imrope: bool| -> Vec<f32> {
+            let sect_dims: usize = sections.iter().sum();
+            let sec_w = sections[1] + sections[0];
+            let sec_e = sections[2] + sec_w;
+            let mut th = bases;
+            (0..ne0 / 2)
+                .map(|pair| {
+                    let sector = pair % sect_dims;
+                    if indep_sects {
+                        if sector == 0 {
+                            th[0] = bases[0];
+                        } else if sector == sections[0] {
+                            th[1] = bases[1];
+                        } else if sector == sec_w {
+                            th[2] = bases[2];
+                        } else if sector == sec_e {
+                            th[3] = bases[3];
+                        }
+                    }
+                    let t = if is_imrope {
+                        // The branch qwen35 ACTUALLY takes: llama-model.cpp:2708
+                        // maps LLM_ARCH_QWEN35 to LLAMA_ROPE_TYPE_IMROPE, so the
+                        // interleaved selector runs, not the contiguous one.
+                        if sector % 3 == 1 && sector < 3 * sections[1] {
+                            th[1]
+                        } else if sector % 3 == 2 && sector < 3 * sections[2] {
+                            th[2]
+                        } else if sector % 3 == 0 && sector < 3 * sections[0] {
+                            th[0]
+                        } else {
+                            th[3]
+                        }
+                    } else if sector >= sections[0] && sector < sec_w {
+                        th[1]
+                    } else if sector >= sec_w && sector < sec_w + sections[2] {
+                        th[2]
+                    } else if sector >= sec_w + sections[2] {
+                        th[3]
+                    } else {
+                        th[0]
+                    };
+                    for x in th.iter_mut() {
+                        *x *= theta_scale;
+                    }
+                    t
+                })
+                .collect()
+        };
+
+        let mut differing_pairs = 0;
+        for pos in 0..6u32 {
+            let base = pos as f32;
+            // A TEXT batch: one position broadcast into all four components.
+            let plain = rope_thetas(base);
+            // Both selectors, because the equivalence argument covers both and
+            // only one of them is the one qwen35 runs.
+            let m = mrope_thetas([base; 4], false, false);
+            let m_i = mrope_thetas([base; 4], false, true);
+            for (i, ((a, b), c)) in plain.iter().zip(&m).zip(&m_i).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "pos {pos} pair {i}: plain rope {a} vs mrope {b} — the equivalence this \
+                     lane relies on to ship NO sectioned kernel does not hold"
+                );
+                assert_eq!(
+                    a.to_bits(),
+                    c.to_bits(),
+                    "pos {pos} pair {i}: plain rope {a} vs INTERLEAVED mrope {c} — this is the \
+                     selector qwen35 actually uses (LLAMA_ROPE_TYPE_IMROPE)"
+                );
+            }
+            // The control: the vision path must NOT agree, or this proves nothing.
+            let vision = mrope_thetas([base; 4], true, true);
+            differing_pairs += plain.iter().zip(&vision).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        }
+        assert!(
+            differing_pairs > 0,
+            "indep_sects made no difference — the probe cannot see a sectioned rope, \
+             so the equivalence above is not evidence"
+        );
+    }
+
+    /// (b) of the MRoPE ruling: the precondition is refused BY NAME. A
+    /// vision-capable checkpoint reaches the same rope path and would be
+    /// silently rotated as text — the only way this finding can bite.
+    #[test]
+    fn vision_section_layout_is_refused_by_name() {
+        let mut meta = crate::lowmem::gguf::Qwen35Meta {
+            trunk_layers: 64,
+            nextn_layers: 1,
+            full_attention_interval: 4,
+            is_recurrent: (0..64).map(|i| (i + 1) % 4 != 0).collect(),
+            d_conv: 4,
+            d_state: 128,
+            n_group: 16,
+            dt_rank: 48,
+            d_inner: 6144,
+            rope_sections: [11, 11, 10, 0], // the real 27B layout
+            conv_state_elems: 30_720,
+            delta_state_elems: 786_432,
+        };
+        assert!(super::Qwen35Layout::check_rope_sections(&meta).is_ok(), "the real 27B layout must pass");
+
+        meta.rope_sections = [11, 11, 10, 4];
+        let err = super::Qwen35Layout::check_rope_sections(&meta).unwrap_err();
+        assert!(err.contains("vision"), "the refusal must name why: {err}");
+
+        meta.rope_sections = [0, 0, 0, 0];
+        assert!(super::Qwen35Layout::check_rope_sections(&meta).is_err(), "all-zero sections must refuse");
+    }
+
+    fn gpu_delta_gates(alpha: &[f32], beta_in: &[f32], a: &[f32], dt: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let device = Device::system_default().expect("Metal device required");
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+        let f = lib.get_function("delta_gates", None).expect("delta_gates");
+        let pipe = device.new_compute_pipeline_state_with_function(&f).expect("pipeline");
+        let queue = device.new_command_queue();
+        let shared = MTLResourceOptions::StorageModeShared;
+        let mk = |v: &[f32]| device.new_buffer_with_data(
+            v.as_ptr() as *const _, std::mem::size_of_val(v) as u64, shared);
+        let n = alpha.len();
+        let (ab, bb, aab, dtb) = (mk(alpha), mk(beta_in), mk(a), mk(dt));
+        let gout = device.new_buffer((n * 4) as u64, shared);
+        let bout = device.new_buffer((n * 4) as u64, shared);
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipe);
+        for (i, b) in [&ab, &bb, &aab, &dtb, &gout, &bout].iter().enumerate() {
+            enc.set_buffer(i as u64, Some(b), 0);
+        }
+        let n32 = n as u32;
+        enc.set_bytes(6, 4, &n32 as *const u32 as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new(((n + 63) / 64) as u64, 1, 1), MTLSize::new(64, 1, 1));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let rd = |b: &metal::Buffer| unsafe {
+            std::slice::from_raw_parts(b.contents() as *const f32, n)
+        }.to_vec();
+        (rd(&gout), rd(&bout))
+    }
+
+    /// The EXACT half. softplus's own x > 20 shortcut is what makes it
+    /// possible: above the threshold the reference returns x UNCHANGED, so no
+    /// transcendental runs on either side and g = a·(alpha+dt_bias) is pure
+    /// arithmetic. sigma is exact at the same three arguments as the out-gate.
+    /// This pins the pairing of the four inputs — the thing most likely to be
+    /// wrong — with no tolerance at all.
+    #[test]
+    fn delta_gates_are_exact_above_the_softplus_shortcut() {
+        let n = 16; // the 2B's n_v_heads
+        let mut seed = 0x5150_0001u32;
+        let dt: Vec<f32> = (0..n).map(|_| lcg(&mut seed)).collect();
+        // alpha chosen so alpha + dt_bias is comfortably past 20 in every slot.
+        let alpha: Vec<f32> = (0..n).map(|i| 40.0 + i as f32).collect();
+        let a: Vec<f32> = (0..n).map(|_| lcg(&mut seed) * 2.0).collect();
+        let beta_in: Vec<f32> = (0..n)
+            .map(|i| match i % 3 { 0 => 0.0, 1 => 100.0, _ => -100.0 })
+            .collect();
+        let (g, beta) = gpu_delta_gates(&alpha, &beta_in, &a, &dt);
+        for h in 0..n {
+            let want_g = rf::delta_gate(alpha[h], dt[h], a[h]);
+            assert_eq!(want_g.to_bits(), g[h].to_bits(), "g[{h}]: {want_g} vs {}", g[h]);
+            let want_b = rf::sigmoid(beta_in[h]);
+            assert_eq!(want_b.to_bits(), beta[h].to_bits(), "beta[{h}]");
+        }
+        // The shortcut must actually be what is being exercised, or this test
+        // is silently a transcendental comparison that happened to pass.
+        assert!(alpha.iter().zip(&dt).all(|(x, b)| x + b > 20.0));
+    }
+
+    /// The BOUNDED half, below the shortcut where log and exp both run. Bound
+    /// is measured, not chosen: nudge exp by one rounding inside the
+    /// reference's own softplus and sigma, and require the GPU inside 4x the
+    /// resulting self-drift.
+    #[test]
+    fn delta_gates_bounded_below_the_shortcut() {
+        let n = 48; // the 27B's n_v_heads
+        let mut seed = 0x5150_0002u32;
+        let alpha: Vec<f32> = (0..n).map(|_| lcg(&mut seed) * 4.0).collect();
+        let dt: Vec<f32> = (0..n).map(|_| lcg(&mut seed)).collect();
+        let a: Vec<f32> = (0..n).map(|_| lcg(&mut seed) * 2.0).collect();
+        let beta_in: Vec<f32> = (0..n).map(|_| lcg(&mut seed) * 6.0).collect();
+        let (g, beta) = gpu_delta_gates(&alpha, &beta_in, &a, &dt);
+
+        let eps = 1.0 + f32::EPSILON;
+        let mut worst = 0f32;
+        let mut yard = 0f32;
+        for h in 0..n {
+            let x = alpha[h] + dt[h];
+            assert!(x <= 20.0, "slot {h} took the shortcut — this test must exercise log/exp");
+            let want_g = rf::delta_gate(alpha[h], dt[h], a[h]);
+            let nudged_g = a[h] * (1.0 + x.exp() * eps).ln();
+            worst = worst.max(rel_err(want_g, g[h]));
+            yard = yard.max(rel_err(want_g, nudged_g));
+            let want_b = rf::sigmoid(beta_in[h]);
+            let nudged_b = 1.0 / (1.0 + (-beta_in[h]).exp() * eps);
+            worst = worst.max(rel_err(want_b, beta[h]));
+            yard = yard.max(rel_err(want_b, nudged_b));
+        }
+        assert!(yard > 0.0, "the one-rounding nudge changed nothing — probe is broken");
+        assert!(worst <= 4.0 * yard, "gpu drift {worst:e} exceeds 4x the measured floor {yard:e}");
+    }
+
+    /// One deltanet block on the GPU: the six kernels in llama.cpp's order,
+    /// one command buffer per token. Dispatches inside a compute encoder are
+    /// serial by default, so the chain's ordering needs no barriers here.
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_delta_block(
+        d: rf::DeltaDims,
+        conv1d: &[f32],
+        a: &[f32],
+        dt: &[f32],
+        ssm_norm: &[f32],
+        qkv: &[Vec<f32>],
+        z: &[Vec<f32>],
+        alpha: &[Vec<f32>],
+        beta_p: &[Vec<f32>],
+        eps: f32,
+    ) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>) {
+        let device = Device::system_default().expect("Metal device required");
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+        let pipe = |n: &str| {
+            let f = lib.get_function(n, None).unwrap_or_else(|_| panic!("{n}"));
+            device.new_compute_pipeline_state_with_function(&f).expect("pipeline")
+        };
+        let (p_gates, p_conv, p_l2, p_delta, p_norm) = (
+            pipe("delta_gates"),
+            pipe("ssm_conv_decode"),
+            pipe("l2norm_rows"),
+            pipe("delta_decode_step"),
+            pipe("gated_output_norm"),
+        );
+        let queue = device.new_command_queue();
+        let shared = MTLResourceOptions::StorageModeShared;
+        let up = |v: &[f32]| device.new_buffer_with_data(
+            v.as_ptr() as *const _, std::mem::size_of_val(v) as u64, shared);
+        let (s_dim, hv, hk) = (d.d_state, d.n_v_heads, d.n_k_heads);
+        let key_dim = s_dim * hk;
+        let c_all = d.conv_channels();
+
+        let (b_conv1d, b_a, b_dt, b_norm) = (up(conv1d), up(a), up(dt), up(ssm_norm));
+        let conv_state = gpu::f32_zero_buffer(&device, d.conv_state_elems());
+        let delta_state = gpu::f32_zero_buffer(&device, d.delta_state_elems());
+        let b_conv_out = gpu::f32_buffer(&device, c_all);
+        let b_g = gpu::f32_buffer(&device, hv);
+        let b_beta = gpu::f32_buffer(&device, hv);
+        let b_out = gpu::f32_buffer(&device, s_dim * hv);
+
+        let mut outs = Vec::new();
+        for t in 0..qkv.len() {
+            let (b_qkv, b_z, b_alpha, b_bp) = (up(&qkv[t]), up(&z[t]), up(&alpha[t]), up(&beta_p[t]));
+            let cb = queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+
+            // 1. the two per-head scalars
+            enc.set_compute_pipeline_state(&p_gates);
+            for (i, b) in [&b_alpha, &b_bp, &b_a, &b_dt, &b_g, &b_beta].iter().enumerate() {
+                enc.set_buffer(i as u64, Some(b), 0);
+            }
+            let hv32 = hv as u32;
+            enc.set_bytes(6, 4, &hv32 as *const u32 as *const _);
+            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(64, 1, 1));
+
+            // 2. depthwise conv + silu, rolling the conv state
+            #[repr(C)]
+            struct CP { channels: u32, d_conv: u32 }
+            let cp = CP { channels: c_all as u32, d_conv: d.d_conv as u32 };
+            enc.set_compute_pipeline_state(&p_conv);
+            enc.set_buffer(0, Some(&conv_state), 0);
+            enc.set_buffer(1, Some(&b_qkv), 0);
+            enc.set_buffer(2, Some(&b_conv1d), 0);
+            enc.set_buffer(3, Some(&b_conv_out), 0);
+            enc.set_bytes(4, std::mem::size_of::<CP>() as u64, &cp as *const CP as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(((c_all + 63) / 64) as u64, 1, 1), MTLSize::new(64, 1, 1));
+
+            // 3. l2-normalise q and k per K head, in place, on their own slices
+            let s32 = s_dim as u32;
+            for off in [0u64, (key_dim * 4) as u64] {
+                enc.set_compute_pipeline_state(&p_l2);
+                enc.set_buffer(0, Some(&b_conv_out), off);
+                enc.set_bytes(1, 4, &s32 as *const u32 as *const _);
+                enc.set_bytes(2, 4, &eps as *const f32 as *const _);
+                enc.dispatch_thread_groups(MTLSize::new(hk as u64, 1, 1), MTLSize::new(256, 1, 1));
+            }
+
+            // 4. the delta rule; q/k/v are three views of the conv output
+            #[repr(C)]
+            struct DP { d_state: u32, n_v_heads: u32, group: u32 }
+            let dp = DP { d_state: s32, n_v_heads: hv32, group: (hv / hk) as u32 };
+            enc.set_compute_pipeline_state(&p_delta);
+            enc.set_buffer(0, Some(&delta_state), 0);
+            enc.set_buffer(1, Some(&b_conv_out), 0);
+            enc.set_buffer(2, Some(&b_conv_out), (key_dim * 4) as u64);
+            enc.set_buffer(3, Some(&b_conv_out), (2 * key_dim * 4) as u64);
+            enc.set_buffer(4, Some(&b_g), 0);
+            enc.set_buffer(5, Some(&b_beta), 0);
+            enc.set_buffer(6, Some(&b_out), 0);
+            enc.set_bytes(7, std::mem::size_of::<DP>() as u64, &dp as *const DP as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(((s_dim * hv + 63) / 64) as u64, 1, 1), MTLSize::new(64, 1, 1));
+
+            // 5. per-head RMSNorm gated by silu(z), in place on the output
+            enc.set_compute_pipeline_state(&p_norm);
+            enc.set_buffer(0, Some(&b_out), 0);
+            enc.set_buffer(1, Some(&b_norm), 0);
+            enc.set_buffer(2, Some(&b_z), 0);
+            enc.set_bytes(3, 4, &s32 as *const u32 as *const _);
+            enc.set_bytes(4, 4, &eps as *const f32 as *const _);
+            enc.dispatch_thread_groups(MTLSize::new(hv as u64, 1, 1), MTLSize::new(256, 1, 1));
+
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            outs.push(
+                unsafe { std::slice::from_raw_parts(b_out.contents() as *const f32, s_dim * hv) }
+                    .to_vec(),
+            );
+        }
+        let rd = |b: &metal::Buffer, n: usize| unsafe {
+            std::slice::from_raw_parts(b.contents() as *const f32, n)
+        }.to_vec();
+        (outs, rd(&conv_state, d.conv_state_elems()), rd(&delta_state, d.delta_state_elems()))
+    }
+
+    /// THE SINGLE-LAYER IDENTITY GATE: one real deltanet block, on real
+    /// weights, through the six kernels composed in llama.cpp's order, against
+    /// lane B's reference doing the same thing on the CPU.
+    ///
+    /// Why this exists when every kernel already has its own oracle: unit gates
+    /// prove each kernel computes what it claims IN ISOLATION. They structurally
+    /// cannot catch the errors that actually kill a port — feeding conv the
+    /// wrong slice, splitting q/k/v at the wrong offsets, forgetting beta's
+    /// sigmoid, applying the gated norm before the delta step, using the K-head
+    /// count where the V-head count belongs. Those are composition errors, and
+    /// only a composed comparison sees them.
+    ///
+    /// The projections are computed on the CPU for BOTH sides from the same
+    /// real (dequantized) weights, so the two paths are fed byte-identical
+    /// inputs and the only thing under test is the deltanet chain itself.
+    /// Ordinary matmuls are covered elsewhere and would just add noise here.
+    ///
+    /// Multi-token, because both states roll: a block that is right for token 0
+    /// and wrong afterwards is the exact failure a single-shot test misses.
+    #[test]
+    #[ignore]
+    fn deltanet_block_matches_reference_on_real_weights() {
+        use crate::lowmem::LowMemSource;
+        let Some(path) = crate::lowmem::tests_qwen35_gguf() else {
+            panic!("Qwen3.5-2B GGUF not in the HF cache — this gate needs the real file")
+        };
+        let src = LowMemSource::open(&path).expect("opens");
+        let meta = src.qwen35().expect("qwen35 meta");
+        assert!(meta.is_recurrent[0], "layer 0 of the 2B is a linear block");
+        let d = rf::DeltaDims {
+            d_state: meta.d_state,
+            n_v_heads: meta.dt_rank,
+            n_k_heads: meta.n_group,
+            d_conv: meta.d_conv,
+        };
+        let (hidden, eps) = (2048usize, 1e-6f32);
+        let rd = |n: &str| src.read_f32(n).unwrap_or_else(|e| panic!("{n}: {e}"));
+        let p = "model.layers.0";
+        let w_qkv = rd(&format!("{p}.gguf.attn_qkv.weight"));
+        let w_z = rd(&format!("{p}.gguf.attn_gate.weight"));
+        let w_alpha = rd(&format!("{p}.gguf.ssm_alpha.weight"));
+        let w_beta = rd(&format!("{p}.gguf.ssm_beta.weight"));
+        let conv1d = rd(&format!("{p}.gguf.ssm_conv1d.weight"));
+        let ssm_a = rd(&format!("{p}.gguf.ssm_a"));
+        let dt_bias = rd(&format!("{p}.gguf.ssm_dt.bias"));
+        let ssm_norm = rd(&format!("{p}.gguf.ssm_norm.weight"));
+
+        // Shapes are row-major [rows, cols] (gguf.rs:280 reverses ne), so a
+        // projection is W[out][in] and conv1d is [channel][tap].
+        assert_eq!(w_qkv.len(), d.conv_channels() * hidden);
+        assert_eq!(conv1d.len(), d.conv_channels() * d.d_conv);
+        assert_eq!(ssm_a.len(), d.n_v_heads);
+        assert_eq!(ssm_norm.len(), d.d_state);
+
+        let matvec = |w: &[f32], x: &[f32], out_dim: usize| -> Vec<f32> {
+            (0..out_dim)
+                .map(|o| {
+                    let row = &w[o * hidden..(o + 1) * hidden];
+                    row.iter().zip(x).map(|(a, b)| a * b).sum::<f32>()
+                })
+                .collect()
+        };
+
+        let steps = 4;
+        let mut seed = 0x4C41_5945u32;
+        let xs: Vec<Vec<f32>> = (0..steps)
+            .map(|_| (0..hidden).map(|_| lcg(&mut seed) * 0.5).collect())
+            .collect();
+        let qkv: Vec<Vec<f32>> = xs.iter().map(|x| matvec(&w_qkv, x, d.conv_channels())).collect();
+        let z: Vec<Vec<f32>> = xs.iter().map(|x| matvec(&w_z, x, d.d_inner())).collect();
+        let alpha: Vec<Vec<f32>> = xs.iter().map(|x| matvec(&w_alpha, x, d.n_v_heads)).collect();
+        let beta_p: Vec<Vec<f32>> = xs.iter().map(|x| matvec(&w_beta, x, d.n_v_heads)).collect();
+
+        // ---- the reference block ----
+        let mut ref_conv = vec![0f32; d.conv_state_elems()];
+        let mut ref_state = vec![0f32; d.delta_state_elems()];
+        let mut want: Vec<Vec<f32>> = Vec::new();
+        for t in 0..steps {
+            let conv_out = rf::conv_step(&d, &mut ref_conv, &qkv[t], &conv1d);
+            let (q, k, v) = rf::split_qkv(&d, &conv_out, eps);
+            let g: Vec<f32> = (0..d.n_v_heads)
+                .map(|h| rf::delta_gate(alpha[t][h], dt_bias[h], ssm_a[h]))
+                .collect();
+            let b: Vec<f32> = beta_p[t].iter().map(|&x| rf::sigmoid(x)).collect();
+            let mut o = rf::delta_decode_step(&d, &mut ref_state, &q, &k, &v, &g, &b);
+            rf::gated_output_norm(&d, &mut o, &ssm_norm, &z[t], eps);
+            want.push(o);
+        }
+
+        // ---- the same block on the GPU ----
+        let (got, gpu_conv, gpu_state) =
+            gpu_delta_block(d, &conv1d, &ssm_a, &dt_bias, &ssm_norm, &qkv, &z, &alpha, &beta_p, eps);
+
+        // THE PROBE MUST MODEL EVERY DIVERGENCE THE GPU ACTUALLY HAS, or the
+        // ratio is meaningless. My first version nudged only the decay and the
+        // state came out at 6x it — which looked like a composition error and
+        // was not: this chain ALSO differs in l2_norm's and the gated norm's
+        // accumulation (f64 in the reference, f32 on a GPU that has no f64) and
+        // in sigma on beta. So the probe below is the same block computed with
+        // the GPU's OWN precision choices — f32 reductions throughout, exp moved
+        // one rounding — and the GPU is required to sit within 4x its distance
+        // from the f64 reference. Anything the probe does not model would still
+        // show up, which is the point.
+        let l2_f32 = |x: &mut [f32], eps: f32| {
+            let sum: f32 = x.iter().map(|&v| v * v).sum();
+            let scale = 1.0 / sum.sqrt().max(eps);
+            for v in x.iter_mut() {
+                *v *= scale;
+            }
+        };
+        let nudge = 1.0 + f32::EPSILON;
+        let mut nudged_conv = vec![0f32; d.conv_state_elems()];
+        let mut nudged_state = vec![0f32; d.delta_state_elems()];
+        let mut nudged: Vec<Vec<f32>> = Vec::new();
+        for t in 0..steps {
+            let conv_out = rf::conv_step(&d, &mut nudged_conv, &qkv[t], &conv1d);
+            let key_dim = d.d_state * d.n_k_heads;
+            let mut q = conv_out[..key_dim].to_vec();
+            let mut k = conv_out[key_dim..2 * key_dim].to_vec();
+            let v = conv_out[2 * key_dim..2 * key_dim + d.d_inner()].to_vec();
+            for h in 0..d.n_k_heads {
+                l2_f32(&mut q[h * d.d_state..(h + 1) * d.d_state], eps);
+                l2_f32(&mut k[h * d.d_state..(h + 1) * d.d_state], eps);
+            }
+            let g: Vec<f32> = (0..d.n_v_heads)
+                .map(|h| rf::delta_gate(alpha[t][h], dt_bias[h], ssm_a[h]) * nudge)
+                .collect();
+            let b: Vec<f32> = beta_p[t].iter().map(|&x| rf::sigmoid(x) * nudge).collect();
+            let mut o = rf::delta_decode_step(&d, &mut nudged_state, &q, &k, &v, &g, &b);
+            // the gated norm with an f32 mean, as the GPU computes it
+            for h in 0..d.n_v_heads {
+                let oh = &mut o[h * d.d_state..(h + 1) * d.d_state];
+                let mean: f32 = oh.iter().map(|&x| x * x).sum::<f32>() / d.d_state as f32;
+                let scale = 1.0 / (mean + eps).sqrt();
+                for i in 0..d.d_state {
+                    oh[i] = oh[i] * scale * ssm_norm[i] * rf::silu(z[t][h * d.d_state + i]);
+                }
+            }
+            nudged.push(o);
+        }
+
+        // METRIC: max |a-b| over the tensor, divided by the tensor's own
+        // largest magnitude. NOT per-element relative error — the delta state
+        // spans seven orders of magnitude (it starts at zero and grows as a sum
+        // of outer products), so per-element relative error is dominated by
+        // entries around 1e-9 that carry no information. The first draft of
+        // this gate used per-element and "failed" on a slot holding -3.20e-9
+        // against -3.23e-9 while the tensor's max was 5.4e-2. The same metric is
+        // applied to the reference-vs-nudged probe, so the ratio stays honest.
+        let rel_inf = |a: &[f32], b: &[f32]| -> f32 {
+            let scale = a.iter().fold(0f32, |m, v| m.max(v.abs())).max(f32::MIN_POSITIVE);
+            a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs())) / scale
+        };
+        let flat = |v: &[Vec<f32>]| -> Vec<f32> { v.iter().flatten().copied().collect() };
+        let (fw, fg, fn_) = (flat(&want), flat(&got), flat(&nudged));
+
+        let out_yard = rel_inf(&fw, &fn_);
+        let out_gap = rel_inf(&fw, &fg);
+        let state_yard = rel_inf(&ref_state, &nudged_state);
+        let state_gap = rel_inf(&ref_state, &gpu_state);
+        let conv_gap = rel_inf(&ref_conv, &gpu_conv);
+
+        assert!(out_yard > 0.0, "the one-rounding nudge changed nothing — probe is broken");
+        // The conv state is pure add/multiply with contraction off: no exp, no
+        // reduction, nothing to excuse a difference. It must be EXACT, and that
+        // it is proves the conv half of the composition (slice offsets, the
+        // rolling window, the channel packing) independently of the tolerance
+        // the rest of the chain needs.
+        assert!(
+            ref_conv.iter().zip(&gpu_conv).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the conv state must be bit-exact, gap {conv_gap:e}"
+        );
+        assert!(
+            out_gap <= 4.0 * out_yard,
+            "deltanet block output drift {out_gap:e} exceeds 4x the reference's own \
+             one-rounding sensitivity {out_yard:e} — that is a composition error, not noise"
+        );
+        // The state must track too: a block whose OUTPUT matches while its state
+        // drifts is right until it suddenly is not.
+        assert!(
+            state_gap <= 4.0 * state_yard,
+            "delta state drift {state_gap:e} exceeds 4x the probe's {state_yard:e}"
+        );
+    }
+
+    /// Partial RoPE: qwen35 rotates only rope.dimension_count (64) of each
+    /// 256-wide head and leaves the rest ALONE. The tail is the half worth
+    /// testing — rotating it would still produce a valid rotation of a real
+    /// vector, so nothing would crash or NaN; the model would just quietly be a
+    /// different model. So this asserts the tail is BIT-IDENTICAL to the input,
+    /// and that the rotated prefix matches a full-width rope of that size.
+    #[test]
+    fn rope_rotates_only_the_leading_rot_dim() {
+        let (head_dim, rot, n_heads, n_rows) = (256usize, 64usize, 2usize, 3usize);
+        let mut seed = 0x0A0B_0C0Du32;
+        let x: Vec<f32> = (0..n_rows * n_heads * head_dim).map(|_| lcg(&mut seed)).collect();
+
+        let device = Device::system_default().expect("Metal device required");
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+        let f = lib.get_function("rope", None).expect("rope");
+        let pipe = device.new_compute_pipeline_state_with_function(&f).expect("pipeline");
+        let queue = device.new_command_queue();
+        let buf = device.new_buffer_with_data(
+            x.as_ptr() as *const _,
+            std::mem::size_of_val(&x[..]) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        #[repr(C)]
+        struct P { head_dim: u32, n_heads: u32, pos0: u32, theta: f32, n_rows: u32, rot_dim: u32 }
+        let p = P {
+            head_dim: head_dim as u32,
+            n_heads: n_heads as u32,
+            pos0: 5,
+            theta: 1.0e7,
+            n_rows: n_rows as u32,
+            rot_dim: rot as u32,
+        };
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipe);
+        enc.set_buffer(0, Some(&buf), 0);
+        enc.set_bytes(1, std::mem::size_of::<P>() as u64, &p as *const P as *const _);
+        gpu::dispatch_grid(enc, n_rows * n_heads * rot / 2);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let got = unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, x.len()) };
+
+        let half = rot / 2;
+        for row in 0..n_rows {
+            for h in 0..n_heads {
+                let base = (row * n_heads + h) * head_dim;
+                for i in 0..half {
+                    let freq = (1.0e7f32).powf(-2.0 * i as f32 / rot as f32);
+                    let angle = (5 + row) as f32 * freq;
+                    let (s, c) = (angle.sin(), angle.cos());
+                    let (a, b) = (x[base + i], x[base + i + half]);
+                    let (wa, wb) = (a * c - b * s, a * s + b * c);
+                    // The prefix is checked to transcendental tolerance, not
+                    // bit-for-bit: the kernel reaches its angle through Metal's
+                    // pow and sincos and the CPU through libm's, which differ in
+                    // the last bits. THIS TEST'S CLAIM IS STRUCTURAL — which
+                    // dims move and which do not — and rope's numeric fidelity
+                    // is already covered end-to-end by the dense-model identity
+                    // gates. Saying so beats asserting a ulp count that is
+                    // really measuring two libm implementations.
+                    for (want, have) in [(wa, got[base + i]), (wb, got[base + i + half])] {
+                        assert!(
+                            rel_err(want, have) < 1e-5,
+                            "row {row} head {h} dim {i}: {want} vs {have}"
+                        );
+                    }
+                    // ...and it must actually have rotated, or "matches within
+                    // tolerance" would also pass on a kernel that did nothing.
+                    assert!(
+                        got[base + i].to_bits() != x[base + i].to_bits()
+                            || got[base + i + half].to_bits() != x[base + i + half].to_bits(),
+                        "row {row} head {h} dim {i} did not rotate at all"
+                    );
+                }
+                // THE TAIL MUST BE UNTOUCHED, bit for bit.
+                for i in rot..head_dim {
+                    assert_eq!(
+                        x[base + i].to_bits(),
+                        got[base + i].to_bits(),
+                        "row {row} head {h} dim {i} was rotated but must pass through"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Run l2norm_rows over `rows` (one threadgroup per row) and read them back.
+    fn gpu_l2norm(rows: &[Vec<f32>], eps: f32) -> Vec<Vec<f32>> {
+        let device = Device::system_default().expect("Metal device required");
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+        let f = lib.get_function("l2norm_rows", None).expect("l2norm_rows");
+        let pipe = device.new_compute_pipeline_state_with_function(&f).expect("pipeline");
+        let queue = device.new_command_queue();
+
+        let dim = rows[0].len();
+        let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+        let buf = device.new_buffer_with_data(
+            flat.as_ptr() as *const _,
+            std::mem::size_of_val(&flat[..]) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipe);
+        enc.set_buffer(0, Some(&buf), 0);
+        let d32 = dim as u32;
+        enc.set_bytes(1, 4, &d32 as *const u32 as *const _);
+        enc.set_bytes(2, 4, &eps as *const f32 as *const _);
+        // One threadgroup per row, NORM_TG threads wide — the kernel strides.
+        enc.dispatch_thread_groups(MTLSize::new(rows.len() as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let out = unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, flat.len()) };
+        out.chunks(dim).map(|c| c.to_vec()).collect()
+    }
+
+    /// The EXACT half. The only thing that can differ between this kernel and
+    /// the reference is the accumulation of Σx² (f32 tree here, f64 sequential
+    /// there), so this test removes that variable instead of tolerating it:
+    /// with small-integer inputs every partial sum is exactly representable, so
+    /// both accumulations agree BIT-FOR-BIT in any order. Everything else — the
+    /// eps clamp, the single reciprocal, the scaling, the row striding — is
+    /// then pinned exactly, with no tolerance to hide in.
+    ///
+    /// (√ is safe to compare: rounding a f64 square root to f32 gives the
+    /// correctly-rounded f32 result, because 53 ≥ 2·24+2, so the reference's
+    /// f64-then-narrow and the GPU's native f32 √ cannot disagree here.)
+    #[test]
+    fn l2norm_matches_reference_where_the_sums_agree() {
+        let dim = 128; // the real d_state
+        let eps = 1e-6f32;
+        let mut seed = 0xC0FF_EE11u32;
+        let rows: Vec<Vec<f32>> = (0..6)
+            .map(|_| (0..dim).map(|_| (lcg(&mut seed) * 16.0).round()).collect())
+            .collect();
+        let got = gpu_l2norm(&rows, eps);
+        for (r, row) in rows.iter().enumerate() {
+            let mut want = row.clone();
+            rf::l2_norm(&mut want, eps);
+            for (i, (a, b)) in want.iter().zip(&got[r]).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "row {r} slot {i}: reference {a} vs gpu {b} — on exactly-summable \
+                     input this kernel has no excuse for a difference"
+                );
+            }
+        }
+    }
+
+    /// The eps clamp, pinned on the one input that can expose it. A zero row is
+    /// reachable in practice (split_qkv l2-normalises per K head, and a head
+    /// whose conv output is all zeros produces one), and without the clamp the
+    /// kernel computes 1/0 = inf and then 0·inf = NaN while the reference
+    /// returns zeros. No random test data ever generates this row, which is
+    /// exactly why it gets its own test rather than a seed.
+    #[test]
+    fn l2norm_zero_row_is_zero_not_nan() {
+        let dim = 128;
+        let eps = 1e-6f32;
+        let rows = vec![vec![0f32; dim], vec![1f32; dim]];
+        let got = gpu_l2norm(&rows, eps);
+        assert!(
+            got[0].iter().all(|v| v.is_finite()),
+            "zero row produced non-finite values — the eps clamp is missing or wrong"
+        );
+        let mut want = rows[0].clone();
+        rf::l2_norm(&mut want, eps);
+        for (i, (a, b)) in want.iter().zip(&got[0]).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "zero row slot {i}");
+        }
+        // The neighbouring row must still be normalised normally — a clamp that
+        // fires on every row would also pass the check above.
+        let n = (dim as f32).sqrt();
+        assert!(
+            (got[1][0] - 1.0 / n).abs() < 1e-6,
+            "the clamp must not fire on an ordinary row: got {}",
+            got[1][0]
+        );
+    }
+
+    /// The BOUNDED half, calibrated the same way as the delta step: the f32-vs-
+    /// f64 accumulation gap is measured on the reference itself (same maths,
+    /// sum narrowed to f32) and the GPU is required to sit inside a small
+    /// multiple of it. The GPU sums in a different ORDER as well (a simd tree,
+    /// not a sequential walk), which is why the allowance is 4x and not 1x.
+    #[test]
+    fn l2norm_bounded_by_the_measured_accumulation_gap() {
+        let dim = 128;
+        let eps = 1e-6f32;
+        let mut seed = 0x1234_ABCDu32;
+        let rows: Vec<Vec<f32>> = (0..6)
+            .map(|_| (0..dim).map(|_| lcg(&mut seed)).collect())
+            .collect();
+        let got = gpu_l2norm(&rows, eps);
+
+        let f32_sum_variant = |row: &[f32]| -> Vec<f32> {
+            let sum: f32 = row.iter().map(|&v| v * v).sum();
+            let scale = 1.0 / sum.sqrt().max(eps);
+            row.iter().map(|v| v * scale).collect()
+        };
+        let (mut worst_gpu, mut yardstick) = (0f32, 0f32);
+        for (r, row) in rows.iter().enumerate() {
+            let mut want = row.clone();
+            rf::l2_norm(&mut want, eps);
+            let narrowed = f32_sum_variant(row);
+            for i in 0..dim {
+                worst_gpu = worst_gpu.max(rel_err(want[i], got[r][i]));
+                yardstick = yardstick.max(rel_err(want[i], narrowed[i]));
+            }
+        }
+        assert!(yardstick > 0.0, "narrowing the sum to f32 changed nothing — probe is broken");
+        assert!(
+            worst_gpu <= 4.0 * yardstick,
+            "gpu drift {worst_gpu:e} exceeds 4x the measured f64→f32 accumulation gap \
+             {yardstick:e} — more than the missing f64 can explain"
+        );
+    }
+
+    /// The comparison must be able to see a TRANSPOSED state. The layout is
+    /// s[i + j*S + h*S*S] with i the contraction index; a kernel that swapped
+    /// i and j would produce finite, plausible numbers. Feeding the reference a
+    /// per-head transposed state has to break the match — if it does not, the
+    /// oracle is not testing the layout at all.
+    #[test]
+    fn delta_oracle_sees_a_transposed_state() {
+        let d = dims();
+        let mut seed = 0x5EED_1234u32;
+        let (state0, q, k, v, g, beta) = delta_inputs(d, 1, &mut seed, false);
+        let (gpu_outs, _) = gpu_delta(d, &state0, &q, &k, &v, &g, &beta);
+
+        let s = d.d_state;
+        let mut transposed = state0.clone();
+        for h in 0..d.n_v_heads {
+            for j in 0..s {
+                for i in 0..s {
+                    transposed[h * s * s + j * s + i] = state0[h * s * s + i * s + j];
+                }
+            }
+        }
+        let want = rf::delta_decode_step(&d, &mut transposed, &q[0], &k[0], &v[0], &g[0], &beta[0]);
+        assert!(
+            want.iter().zip(&gpu_outs[0]).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "a transposed state must change the output, or the layout is untested"
+        );
     }
 }

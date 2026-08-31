@@ -346,20 +346,39 @@ fn gguf_setup(
         cfg.num_key_value_heads,
         cfg.vocab_size,
     );
-    // qwen35's hybrid blocks (gated deltanet + MTP) have no execution path yet
-    // — lanes qwen35-kernels/-state build it. Say so instead of failing on the
-    // first tensor name the standard walk cannot find.
+    // qwen35 runs on -b lowmem. Two things are still refused BY NAME rather
+    // than attempted, because both would otherwise produce plausible wrong
+    // output instead of an error:
+    //   * a checkpoint whose rope sections are not the text-broadcast layout
+    //     the MRoPE equivalence was verified on (see Qwen35Layout::
+    //     check_rope_sections — this engine has no sectioned rope kernel and
+    //     would silently rotate a vision variant as if it were text);
+    //   * every backend except lowmem, which is where the gated-deltanet block
+    //     is wired. The metal backend builds its own per-layer tensors and has
+    //     no linear-block path yet, so it would fail on a tensor name at best
+    //     and mis-read the joint Q+gate projection at worst.
     if arch.arch == "qwen35" {
         let m = lowmem::gguf::qwen35_meta(&g)?;
-        return Err(format!(
-            "qwen35 parsed clean ({} trunk layers: {} full-attention + {} gated-deltanet{}) — \
-             execution lands with the qwen35 kernel and session-state lanes",
+        crate::gpu::metal::Qwen35Layout::check_rope_sections(&m)?;
+        if args.backend != "lowmem" {
+            return Err(format!(
+                "qwen35 runs on -b lowmem only ({} trunk layers: {} full-attention + {} \
+                 gated-deltanet{}); -b {} has no gated-deltanet path yet",
+                m.trunk_layers,
+                m.is_recurrent.iter().filter(|r| !**r).count(),
+                m.is_recurrent.iter().filter(|r| **r).count(),
+                if m.nextn_layers > 0 { ", +1 MTP block (skipped)" } else { "" },
+                args.backend,
+            )
+            .into());
+        }
+        eprintln!(
+            "qwen35: {} trunk layers — {} full-attention + {} gated-deltanet{}",
             m.trunk_layers,
             m.is_recurrent.iter().filter(|r| !**r).count(),
             m.is_recurrent.iter().filter(|r| **r).count(),
             if m.nextn_layers > 0 { ", +1 MTP block (skipped)" } else { "" },
-        )
-        .into());
+        );
     }
     let engine = match args.backend.as_str() {
         "lowmem" => Some(engine::create_lowmem(path, cfg.clone(), &args.lowmem)?),

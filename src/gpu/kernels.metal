@@ -2239,6 +2239,12 @@ struct RopeParams {
     uint pos0;
     float theta;
     uint n_rows;
+    /// How many of each head's leading dims actually rotate. Equal to head_dim
+    /// on every architecture the repo met before qwen35, which states
+    /// rope.dimension_count = 64 inside head_dim 256 — so dims 64..255 must
+    /// pass through UNTOUCHED. Rotating them looks harmless (it is a valid
+    /// rotation of a real vector) and silently changes the model.
+    uint rot_dim;
 };
 
 kernel void rope(
@@ -2246,7 +2252,9 @@ kernel void rope(
     constant RopeParams &p [[buffer(1)]],
     uint gid [[thread_position_in_grid]])
 {
-    uint half_dim = p.head_dim / 2;
+    // Pairs live INSIDE the rotated prefix: i with i + rot_dim/2, and the tail
+    // beyond rot_dim is never visited because the grid is sized by half_dim.
+    uint half_dim = p.rot_dim / 2;
     uint per_row = p.n_heads * half_dim;
     if (gid >= p.n_rows * per_row) {
         return;
@@ -2255,7 +2263,7 @@ kernel void rope(
     uint h = (gid % per_row) / half_dim;
     uint i = gid % half_dim;
 
-    float freq = pow(p.theta, -2.0f * (float)i / (float)p.head_dim);
+    float freq = pow(p.theta, -2.0f * (float)i / (float)p.rot_dim);
     float angle = (float)(p.pos0 + row) * freq;
     float c;
     float s = sincos(angle, c); // one intrinsic for both — cheaper than separate sin/cos
@@ -2324,7 +2332,7 @@ kernel void rope_h(
     constant RopeParams &p [[buffer(1)]],
     uint gid [[thread_position_in_grid]])
 {
-    uint half_dim = p.head_dim / 2;
+    uint half_dim = p.rot_dim / 2;
     uint per_row = p.n_heads * half_dim;
     if (gid >= p.n_rows * per_row) {
         return;
@@ -2333,7 +2341,7 @@ kernel void rope_h(
     uint h = (gid % per_row) / half_dim;
     uint i = gid % half_dim;
 
-    float freq = pow(p.theta, -2.0f * (float)i / (float)p.head_dim);
+    float freq = pow(p.theta, -2.0f * (float)i / (float)p.rot_dim);
     float angle = (float)(p.pos0 + row) * freq;
     float c;
     float s = sincos(angle, c); // one intrinsic for both — cheaper than separate sin/cos
@@ -3396,4 +3404,323 @@ kernel void add_inplace(
     if (gid < p.dim) {
         x[gid] += y[gid];
     }
+}
+
+// ---- qwen35 (gated deltanet) ----
+//
+// Kernels for the hybrid recurrent blocks. Semantics are transcribed from
+// llama.cpp's CPU path, not from the fused upstream Metal kernel, so that the
+// bit-for-bit oracle (lane B) compares against the same arithmetic the
+// reference performs.
+
+struct SsmConvParams {
+    uint channels; // d_inner + 2 * n_group * d_state
+    uint d_conv;   // filter taps (4 for qwen35)
+};
+
+/// Depthwise conv1d, DECODE form: one token, one rolling window per channel.
+///
+/// Mirrors lane B's `conv_step` exactly, because that is the oracle:
+///   * state is [channels][d_conv - 1], OLDEST FIRST — this is also the width
+///     llama.cpp's own state formula uses ((d_conv-1)*channels at
+///     llama-hparams.cpp:183), so a d_conv-wide window would not just differ
+///     from the reference, it would mis-size the persistent recurrent state;
+///   * the dot runs over the stored taps and then the NEW input against the
+///     last filter tap, f32, in that order (ggml's loop deliberately avoids
+///     its own double-precision dot here);
+///   * SiLU is applied INSIDE, matching the reference's gate boundary;
+///   * the window rolls AFTER the dot, never before.
+kernel void ssm_conv_decode(
+    device float *state [[buffer(0)]],          // [channels][d_conv-1], rolled in place
+    device const float *x [[buffer(1)]],        // [channels] this token's input
+    device const float *w [[buffer(2)]],        // [channels][d_conv] filter
+    device float *out [[buffer(3)]],            // [channels] post-SiLU
+    constant SsmConvParams &p [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= p.channels) {
+        return;
+    }
+    uint k = p.d_conv;
+    device float *st = state + (ulong)gid * (k - 1);
+    device const float *c = w + (ulong)gid * k;
+    float acc = 0.0f;
+    float xv = x[gid];
+    {
+        // ggml's CPU dot does a separate multiply and add per tap. Metal
+        // contracts that into an fma unless told not to — and fast-math being
+        // OFF does not stop it, contraction is a separate switch. Without this
+        // the kernel is one ulp from the reference on most channels.
+#pragma clang fp contract(off)
+        for (uint j = 0; j + 1 < k; j++) {
+            acc += st[j] * c[j];
+        }
+        acc += xv * c[k - 1];
+    }
+    // silu as the reference spells it: x * sigmoid(x), a reciprocal and a
+    // multiply. `x / (1 + exp(-x))` is the same value in real arithmetic and
+    // not always the same float.
+    out[gid] = acc * (1.0f / (1.0f + exp(-acc)));
+    for (uint j = 0; j + 1 < k - 1; j++) {
+        st[j] = st[j + 1];
+    }
+    st[k - 2] = xv;
+}
+
+/// Attention output gating, applied PRE-wo: out = attn_out * sigmoid(gate).
+/// qwen35's full-attention blocks project Q and the gate jointly and interleave
+/// them per head, so the gate arrives beside the attention output rather than
+/// as a separate tensor.
+kernel void attn_out_gate(
+    device float *attn_out [[buffer(0)]],
+    device const float *gate [[buffer(1)]],
+    constant uint &n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < n) {
+        attn_out[gid] *= 1.0f / (1.0f + exp(-gate[gid]));
+    }
+}
+
+/// L2 normalise each row: x / max(sqrt(sum(x^2)), eps), no weight — this is the
+/// deltanet l2norm, NOT RMSNorm (which divides by sqrt(mean) and scales).
+///
+/// THE EPS IS NOT DECORATION. ops.cpp clamps the DENOMINATOR after the root,
+/// and dropping it is not a rounding difference: a zero row — which split_qkv
+/// can hand us for a head whose conv output is all zeros — gives 1/0 = inf and
+/// then 0·inf = NaN, where the reference gives exactly 0. Random test data will
+/// never produce that row, so the oracle pins it by hand.
+///
+/// The sum accumulates in f32 here and in f64 (ggml_float) in the reference.
+/// That gap is unclosable — Metal has no f64 at all — and llama.cpp makes the
+/// identical trade in its own kernel_l2_norm_impl (threadgroup float). So the
+/// oracle proves the exact half on data where the two accumulations provably
+/// agree, and bounds only the accumulation difference.
+kernel void l2norm_rows(
+    device float *x [[buffer(0)]],
+    constant uint &dim [[buffer(1)]],
+    constant float &eps [[buffer(2)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    device float *r = x + (ulong)row * dim;
+    threadgroup float partial[NORM_TG / 32];
+    float acc = 0.0f;
+    for (uint i = tid; i < dim; i += NORM_TG) {
+        float v = r[i];
+        acc += v * v;
+    }
+    float sg = simd_sum(acc);
+    if (tid % 32 == 0) {
+        partial[tid / 32] = sg;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint j = 0; j < NORM_TG / 32; j++) {
+            total += partial[j];
+        }
+        partial[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // max(sqrt(sum), eps) — the reference's exact shape: clamp the denominator
+    // after the root, then take the reciprocal once and multiply.
+    float inv = 1.0f / max(sqrt(partial[0]), eps);
+    for (uint i = tid; i < dim; i += NORM_TG) {
+        r[i] *= inv;
+    }
+}
+
+struct DeltaStepParams {
+    uint d_state;   // S — both the contraction and the output extent
+    uint n_v_heads; // H_v
+    uint group;     // H_v / H_k, the K-head broadcast factor
+};
+
+/// One decode step of the gated delta rule, per V head h and output index j:
+///   q ← q/√S;  s ← s·eᵍ;  sk_j = Σ_i s[i,j]·k_i;
+///   d_j = (v_j − sk_j)·β;  s[i,j] += k_i·d_j;  o_j = Σ_i s[i,j]·q_i.
+///
+/// PARALLELISATION — why one thread per (h, j) and not a reduction:
+/// the reference's j loop has no cross-j dependency (column j of the state is
+/// read and written only by iteration j), so splitting on j is free. Splitting
+/// on i is NOT: both dots contract over i, and a simd/tree reduction sums in a
+/// different order, which forfeits bit-equality with the reference. So each
+/// thread walks its own column serially, in the reference's order.
+///
+/// The decay is fused into the first pass rather than run as a separate sweep
+/// over the whole head: every element is still multiplied by eᵍ exactly once,
+/// before that column is read, which is the reference's ordering restricted to
+/// one column.
+///
+/// State layout is ggml's: s[i + j*S + h*S*S], i the CONTRACTION index. Reading
+/// it transposed gives plausible finite numbers and wrong answers — the oracle
+/// carries a transposed negative control for exactly that.
+kernel void delta_decode_step(
+    device float *state [[buffer(0)]],       // [S*S*H_v], updated in place
+    device const float *q [[buffer(1)]],     // [S*H_k]
+    device const float *k [[buffer(2)]],     // [S*H_k]
+    device const float *v [[buffer(3)]],     // [S*H_v]
+    device const float *g [[buffer(4)]],     // [H_v] log-decay, one per V head
+    device const float *beta [[buffer(5)]],  // [H_v]
+    device float *out [[buffer(6)]],         // [S*H_v]
+    constant DeltaStepParams &p [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    // Contraction off, for the same reason as ssm_conv_decode: every one of the
+    // three accumulating loops below is a separate multiply and add in the
+    // reference, and Metal fuses them into fmas unless told not to (fast-math
+    // being off does not stop it — different switch).
+#pragma clang fp contract(off)
+    uint s_dim = p.d_state;
+    if (gid >= s_dim * p.n_v_heads) {
+        return;
+    }
+    uint h = gid / s_dim;
+    uint j = gid - h * s_dim;
+    uint kh_base = (h / p.group) * s_dim;
+
+    device float *st = state + (ulong)h * s_dim * s_dim + (ulong)j * s_dim;
+    device const float *kh = k + kh_base;
+    device const float *qh = q + kh_base;
+
+    float ge = exp(g[h]);
+    float scale = 1.0f / sqrt((float)s_dim);
+    float b = beta[h];
+
+    float sk = 0.0f;
+    for (uint i = 0; i < s_dim; i++) {
+        float s = st[i] * ge;
+        st[i] = s;
+        sk += s * kh[i];
+    }
+    float d = (v[h * s_dim + j] - sk) * b;
+    float o = 0.0f;
+    for (uint i = 0; i < s_dim; i++) {
+        float s = st[i] + kh[i] * d;
+        st[i] = s;
+        // q is scaled per element exactly as the reference does it (one
+        // rounding for q·scale, then the product, then the add).
+        o += s * (qh[i] * scale);
+    }
+    out[h * s_dim + j] = o;
+}
+
+/// The linear block's output stage: per-head RMSNorm(o; ssm_norm) · silu(z),
+/// in place on `o` — one threadgroup per V head (build_norm_gated).
+///
+/// The reference's operation order is load-bearing and reproduced exactly:
+/// the mean of squares, then 1/√(mean+eps) ONCE, then `(o · scale) · w`, in
+/// that association — not `o · (scale · w)`, which is the same value in real
+/// arithmetic and a different float.
+///
+/// Like l2norm this sums in f32 where the reference sums in f64, which is the
+/// one difference the oracle bounds rather than forbids; llama.cpp's
+/// kernel_rms_norm_fuse_impl makes the same trade.
+kernel void gated_output_norm(
+    device float *o [[buffer(0)]],       // [S*H_v], normalised and gated in place
+    device const float *w [[buffer(1)]], // [S] ssm_norm weights, shared by heads
+    device const float *z [[buffer(2)]], // [S*H_v] the gate, pre-silu
+    constant uint &dim [[buffer(3)]],    // S
+    constant float &eps [[buffer(4)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    device float *r = o + (ulong)head * dim;
+    device const float *zh = z + (ulong)head * dim;
+    threadgroup float partial[NORM_TG / 32];
+    float acc = 0.0f;
+    {
+        // Same contraction rule as everywhere else in this lane.
+#pragma clang fp contract(off)
+        for (uint i = tid; i < dim; i += NORM_TG) {
+            float v = r[i];
+            acc += v * v;
+        }
+    }
+    float sg = simd_sum(acc);
+    if (tid % 32 == 0) {
+        partial[tid / 32] = sg;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint j = 0; j < NORM_TG / 32; j++) {
+            total += partial[j];
+        }
+        partial[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float scale = 1.0f / sqrt(partial[0] / (float)dim + eps);
+    for (uint i = tid; i < dim; i += NORM_TG) {
+        float zv = zh[i];
+        r[i] = r[i] * scale * w[i] * (zv * (1.0f / (1.0f + exp(-zv))));
+    }
+}
+
+/// The delta rule's two per-head scalars, computed together because they are
+/// produced by two tiny projections and consumed by one kernel:
+///   g[h]    = a[h] · softplus(alpha[h] + dt_bias[h])
+///   beta[h] = sigmoid(beta_proj[h])
+///
+/// THE SIGMOID ON BETA IS NOT OPTIONAL and is the easiest thing in this block
+/// to leave out: llama.cpp applies it at qwen35.cpp:366, and lane B's reference
+/// takes beta ALREADY activated (it ships a delta_gate helper for g and
+/// deliberately none for beta). Raw beta is finite, plausible, and wrong.
+///
+/// softplus keeps ggml's shortcut: x > 20 returns x unchanged. That is not an
+/// optimisation, it is the reference's exact form — and it is what lets the
+/// oracle assert a BIT-EXACT half, since above the threshold no transcendental
+/// runs at all.
+kernel void delta_gates(
+    device const float *alpha [[buffer(0)]],   // [H_v] projection output
+    device const float *beta_in [[buffer(1)]], // [H_v] projection output
+    device const float *a [[buffer(2)]],       // [H_v] ssm_a
+    device const float *dt_bias [[buffer(3)]], // [H_v] ssm_dt.bias
+    device float *g [[buffer(4)]],             // [H_v]
+    device float *beta [[buffer(5)]],          // [H_v]
+    constant uint &n_v_heads [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n_v_heads) {
+        return;
+    }
+    float x = alpha[gid] + dt_bias[gid];
+    float sp = x > 20.0f ? x : log(1.0f + exp(x));
+    g[gid] = a[gid] * sp;
+    beta[gid] = 1.0f / (1.0f + exp(-beta_in[gid]));
+}
+
+struct QGSplitParams {
+    uint head_dim;
+    uint n_heads;
+    uint n_rows;
+};
+
+/// De-interleave qwen35's joint Q+gate projection into two compact tensors.
+///
+/// The projection emits [q(head_dim) | gate(head_dim)] PER HEAD, so a row is
+/// h0_q h0_gate h1_q h1_gate ... (llama.cpp qwen35.cpp:273-296 builds exactly
+/// these two strided views). Splitting once here means qk-norm, RoPE and
+/// attention all keep operating on an ordinary compact [rows][heads][head_dim]
+/// tensor instead of every one of them learning a stride — and the gate comes
+/// out in the shape attn_out_gate already expects.
+kernel void split_q_gate(
+    device const float *src [[buffer(0)]],  // [rows][heads][2*head_dim]
+    device float *q [[buffer(1)]],          // [rows][heads][head_dim]
+    device float *gate [[buffer(2)]],       // [rows][heads][head_dim]
+    constant QGSplitParams &p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint per_row = p.n_heads * p.head_dim;
+    if (gid >= p.n_rows * per_row) {
+        return;
+    }
+    uint row = gid / per_row;
+    uint rem = gid - row * per_row;
+    uint h = rem / p.head_dim;
+    uint i = rem - h * p.head_dim;
+    ulong base = (ulong)row * per_row * 2 + (ulong)h * 2 * p.head_dim;
+    q[gid] = src[base + i];
+    gate[gid] = src[base + p.head_dim + i];
 }

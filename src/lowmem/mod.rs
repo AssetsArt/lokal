@@ -66,16 +66,36 @@ pub(crate) struct Dims {
     pub q_dim: usize,
     /// n_kv_heads * head_dim.
     pub kv_dim: usize,
+    /// The Q PROJECTION's output width, which is not always `q_dim`.
+    ///
+    /// qwen35's attention blocks project Q and the output gate JOINTLY —
+    /// [q(head_dim)|gate(head_dim)] interleaved per head — so the tensor is
+    /// 2·q_dim wide while attention itself still consumes q_dim. Two different
+    /// numbers that were one number on every previous architecture, which is
+    /// exactly the shape of bug that has already cost this repo two buffer
+    /// overruns (see gpu::metal::attn_row_width): size the projection's
+    /// destination by THIS, and attention's own widths by `q_dim`.
+    pub q_proj_dim: usize,
+    /// How many of each head's leading dims RoPE rotates. head_dim on every
+    /// architecture before qwen35, which rotates only rope.dimension_count = 64
+    /// of its 256. Derived as 2·Σ(rope_sections) rather than read from a new
+    /// metadata key: the sections are already parsed, and the two are equal by
+    /// construction — that identity is the same one the MRoPE equivalence rests
+    /// on, so deriving it here keeps a single source of truth.
+    pub rot_dim: usize,
 }
 
 impl Dims {
-    fn new(cfg: &ModelConfig, head_dim: Option<usize>) -> Self {
+    fn new(cfg: &ModelConfig, head_dim: Option<usize>, q35: Option<&gguf::Qwen35Meta>) -> Self {
         let head_dim = head_dim.unwrap_or_else(|| cfg.head_dim());
+        let q_dim = cfg.num_attention_heads * head_dim;
         Dims {
             hidden: cfg.hidden_size,
             head_dim,
-            q_dim: cfg.num_attention_heads * head_dim,
+            q_dim,
             kv_dim: cfg.num_key_value_heads * head_dim,
+            q_proj_dim: if q35.is_some() { 2 * q_dim } else { q_dim },
+            rot_dim: q35.map_or(head_dim, |m| 2 * m.rope_sections.iter().sum::<usize>()),
         }
     }
 }
@@ -110,7 +130,8 @@ fn memory_plan(
         chunk * cfg.num_attention_heads * win.cap * 4
     };
     let act_bytes = 3 * chunk * h * 4                    // x, xn, xb
-        + 2 * chunk * dims.q_dim * 4                     // q, att (q_dim != h on qwen3)
+        + chunk * dims.q_proj_dim * 4                    // q (q_proj_dim: joint Q+gate on qwen35)
+        + chunk * dims.q_dim * 4                         // att (q_dim != h on qwen3)
         + 2 * chunk * cfg.intermediate_size * 4          // gate, up
         + 2 * chunk * kvd * 4                            // kvs staging
         + chunk * dims.q_dim * 2                         // xh (o_proj input)
@@ -195,6 +216,18 @@ pub(crate) struct Pipes {
     pub attn_dec_reduce: ComputePipelineState,
     pub silu_mul: ComputePipelineState,
     pub add_inplace: ComputePipelineState,
+    /// qwen35's gated-deltanet block. Built unconditionally (they compile from
+    /// the same source as everything else and cost only pipeline objects) so
+    /// the encoder never has to unwrap an Option mid-dispatch.
+    pub ssm_conv_decode: ComputePipelineState,
+    pub delta_decode_step: ComputePipelineState,
+    pub delta_gates: ComputePipelineState,
+    pub l2norm_rows: ComputePipelineState,
+    pub gated_output_norm: ComputePipelineState,
+    /// qwen35's joint Q+gate projection, de-interleaved.
+    pub split_q_gate: ComputePipelineState,
+    /// attn_out · sigmoid(gate), pre-wo.
+    pub attn_out_gate: ComputePipelineState,
 }
 
 /// The matvec family specialized with LM_W_BF16: weight buffers are RAW bf16
@@ -233,17 +266,85 @@ pub(crate) enum Fam {
 pub(crate) struct LayerWeights {
     pub input_ln: Buffer,
     pub post_ln: Buffer,
+    /// What sits between the two norms. Dense models are `Full` on every layer;
+    /// qwen35 alternates, `Linear` on the gated-deltanet blocks and `Full` on
+    /// one in `full_attention_interval`. The FFN half below is shared — both
+    /// block kinds carry the same three projections, which is why they live
+    /// out here rather than being duplicated into both arms.
+    pub attn: AttnWeights,
+    pub gate: PagedTensor,
+    pub up: PagedTensor,
+    pub down: PagedTensor,
+}
+
+impl LayerWeights {
+    /// Every paged (pool-resident) tensor of this layer, whichever shape it is.
+    /// Sites that walk a layer's big weights — the residency plan, the page
+    /// enumerator, the max-rows scan — must not have to know which arm they
+    /// hold, and must not silently miss the deltanet projections.
+    pub fn paged(&self) -> Vec<&PagedTensor> {
+        let mut v: Vec<&PagedTensor> = match &self.attn {
+            AttnWeights::Full(f) => vec![&f.q, &f.k, &f.v, &f.o],
+            AttnWeights::Linear(l) => vec![&l.qkv, &l.z_gate, &l.out, &l.alpha, &l.beta],
+        };
+        v.extend([&self.gate, &self.up, &self.down]);
+        v
+    }
+}
+
+/// The two shapes a qwen35 trunk layer can take. An enum rather than a bag of
+/// Options because the arms share no tensor at all: a linear block has no
+/// q/k/v/o and an attention block has no conv or state, so Options would encode
+/// "absent" twelve times and let the wrong pair be read together.
+pub(crate) enum AttnWeights {
+    Full(Box<FullAttn>),
+    Linear(Box<LinearAttn>),
+}
+
+pub(crate) struct FullAttn {
     /// qwen3's per-head q/k RMSNorm weights (head_dim each), applied to every
     /// head of q and k before RoPE. None on architectures without qk-norm.
     pub q_norm: Option<Buffer>,
     pub k_norm: Option<Buffer>,
+    /// On qwen35 this projects Q and the output gate JOINTLY — out_dim is
+    /// 2·n_heads·head_dim, with [q(hd)|gate(hd)] interleaved per head.
     pub q: PagedTensor,
     pub k: PagedTensor,
     pub v: PagedTensor,
     pub o: PagedTensor,
-    pub gate: PagedTensor,
-    pub up: PagedTensor,
-    pub down: PagedTensor,
+}
+
+/// qwen35's gated-deltanet block. Tensor roles transcribed from llama.cpp
+/// (src/models/qwen35.cpp build_linear_attn) rather than inferred:
+///   qkv_mixed = attn_qkv·x      -> depthwise conv -> silu -> split q,k,v
+///   z         = attn_gate·x     -> silu gate on the normalised output
+///   beta      = SIGMOID(ssm_beta·x)        <- easy to miss; see the field note
+///   g         = ssm_a · softplus(ssm_alpha·x + ssm_dt)
+pub(crate) struct LinearAttn {
+    /// hidden -> conv_channels (2·n_group·d_state + d_inner).
+    pub qkv: PagedTensor,
+    /// hidden -> d_inner; the `z` that gates the normalised output.
+    pub z_gate: PagedTensor,
+    /// d_inner -> hidden.
+    pub out: PagedTensor,
+    /// hidden -> n_v_heads, the delta-rule gate's pre-activation.
+    pub alpha: PagedTensor,
+    /// hidden -> n_v_heads. THE SIGMOID IS THE CALLER'S JOB: qwen35.cpp:366
+    /// applies ggml_sigmoid to this projection's output, and lane B's
+    /// `delta_decode_step` takes beta already activated (it has a `delta_gate`
+    /// helper for g and deliberately none for beta). Feeding the raw
+    /// projection through would be silently plausible and wrong.
+    pub beta: PagedTensor,
+    /// [channels][d_conv], f32 — the depthwise conv filter. f32 and not f16
+    /// because the kernels are gated bit-for-bit against an f32 reference and
+    /// the file stores it as F32; narrowing here would forfeit that.
+    pub conv1d: Buffer,
+    /// [n_v_heads] f32, the per-head decay scale (ggml calls it A_NOSCAN).
+    pub a: Buffer,
+    /// [n_v_heads] f32.
+    pub dt_bias: Buffer,
+    /// [d_state] f32, the per-head RMSNorm weight of the output stage.
+    pub ssm_norm: Buffer,
 }
 
 /// What a weight's elements are, across both checkpoint formats. Safetensors
@@ -328,6 +429,50 @@ pub(crate) struct GgufSource {
     n_params: usize,
 }
 
+/// The one qwen35 tensor `gguf::hf_name` cannot express: `blk.N.ssm_a` carries
+/// NO `.weight`/`.bias` suffix, so the generic mapper's `rsplit_once('.')`
+/// fails and the tensor never enters the name index — it would be invisible to
+/// the loader rather than merely awkwardly named.
+///
+/// Every other deltanet tensor already survives, via the mapper's
+/// `gguf.<mid>` fallback (`blk.0.ssm_conv1d.weight` becomes
+/// `model.layers.0.gguf.ssm_conv1d.weight`), so this handles the one exception
+/// rather than duplicating the mapper. It lives here, not in gguf.rs, because
+/// that file belongs to the loader lane; this is a lowmem-side index fix and
+/// changes no shared behaviour — `hf_name` is consulted first and wins.
+fn qwen35_hf_name(gguf: &str) -> Option<String> {
+    let rest = gguf.strip_prefix("blk.")?;
+    let (n, mid) = rest.split_once('.')?;
+    let i: usize = n.parse().ok()?;
+    match mid {
+        "ssm_a" => Some(format!("model.layers.{i}.gguf.ssm_a")),
+        _ => None,
+    }
+}
+
+impl LowMemEngine {
+    /// The deltanet geometry, in the form the kernels and the reference both
+    /// speak. None on every non-qwen35 checkpoint.
+    pub(crate) fn delta_dims(&self) -> Option<qwen35_ref::DeltaDims> {
+        self.q35_dims
+    }
+}
+
+/// The cached Qwen3.5-2B, for the `--ignored` real-file gates in this crate.
+/// Shared with the GPU oracle so both sides of the identity gate name the same
+/// asset. Returns None when the file is absent so the caller can say so.
+#[cfg(test)]
+pub(crate) fn tests_qwen35_gguf() -> Option<std::path::PathBuf> {
+    let snaps = std::path::PathBuf::from(std::env::var("HOME").ok()?)
+        .join(".cache/huggingface/hub/models--unsloth--Qwen3.5-2B-GGUF/snapshots");
+    std::fs::read_dir(snaps)
+        .ok()?
+        .flatten()
+        .flat_map(|e| std::fs::read_dir(e.path()).into_iter().flatten().flatten())
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "gguf"))
+}
+
 impl LowMemSource {
     pub fn open(path: &Path) -> crate::Result<Self> {
         if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
@@ -338,6 +483,8 @@ impl LowMemSource {
             for t in file.tensors() {
                 n_params += t.dims.iter().product::<usize>();
                 if let Some(hf) = gguf::hf_name(&t.name) {
+                    by_hf.insert(hf, t.name.clone());
+                } else if let Some(hf) = qwen35_hf_name(&t.name) {
                     by_hf.insert(hf, t.name.clone());
                 }
             }
@@ -596,6 +743,12 @@ pub struct LowMemEngine {
     /// qwen35 only: what sessions allocate their recurrent state from.
     /// None on every other architecture (existing paths untouched).
     q35_layout: Option<crate::gpu::metal::Qwen35Layout>,
+    /// qwen35 only: the deltanet geometry the kernels take as parameters.
+    /// Stored as DeltaDims rather than the raw Qwen35Meta because that is what
+    /// both the kernels and lane B's reference speak, it is Copy, and it avoids
+    /// this file depending on a `Clone` that gguf.rs (the loader lane's file)
+    /// does not derive.
+    q35_dims: Option<qwen35_ref::DeltaDims>,
     /// LOKAL_LOWMEM_SYNC=1: wait out every command buffer before the next —
     /// the bisect mode for anything that smells like an eviction race.
     sync: bool,
@@ -624,7 +777,7 @@ impl LowMemEngine {
             t0.elapsed().as_secs_f64(),
         );
 
-        let dims = Dims::new(&cfg, source.head_dim());
+        let dims = Dims::new(&cfg, source.head_dim(), source.qwen35().as_ref());
         let device = Device::system_default().ok_or("no Metal-capable GPU found")?;
         source.make_gpu_views(&device);
         let queue = device.new_command_queue();
@@ -763,6 +916,13 @@ impl LowMemEngine {
             attn_dec_reduce: pipe("attention_decode_reduce")?,
             silu_mul: pipe("silu_mul")?,
             add_inplace: pipe("add_inplace")?,
+            ssm_conv_decode: pipe("ssm_conv_decode")?,
+            delta_decode_step: pipe("delta_decode_step")?,
+            delta_gates: pipe("delta_gates")?,
+            l2norm_rows: pipe("l2norm_rows")?,
+            gated_output_norm: pipe("gated_output_norm")?,
+            split_q_gate: pipe("split_q_gate")?,
+            attn_out_gate: pipe("attn_out_gate")?,
         };
         let direct = DirectPipes {
             matvec: qtype_pipe("matvec", 1)?,
@@ -798,24 +958,55 @@ impl LowMemEngine {
 
         let (h, kv) = (cfg.hidden_size, dims.kv_dim);
         let qk_norm = source.qk_norm();
+        // qwen35 names its second norm `post_attention_norm`, which the generic
+        // GGUF mapper leaves under its `gguf.` fallback rather than folding into
+        // llama's `ffn_norm` -> `post_attention_layernorm`. Both kinds of trunk
+        // layer carry it, so it is resolved once here, not per arm.
+        let q35 = source.qwen35();
+        let post_ln_name = |p: &str| match q35.is_some() {
+            true => format!("{p}.gguf.post_attention_norm.weight"),
+            false => format!("{p}.post_attention_layernorm.weight"),
+        };
+        let mut f32_small = |name: String| -> crate::Result<Buffer> {
+            Ok(gpu::f32_buffer_from(&device, &source.read_f32(&name)?))
+        };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{i}");
+            let recurrent = q35.as_ref().is_some_and(|m| m.is_recurrent[i]);
+            let attn = if recurrent {
+                let m = q35.as_ref().expect("recurrent implies qwen35 meta");
+                AttnWeights::Linear(Box::new(LinearAttn {
+                    qkv: mk(format!("{p}.gguf.attn_qkv"), h, 2 * m.n_group * m.d_state + m.d_inner)?,
+                    z_gate: mk(format!("{p}.gguf.attn_gate"), h, m.d_inner)?,
+                    out: mk(format!("{p}.gguf.ssm_out"), m.d_inner, h)?,
+                    alpha: mk(format!("{p}.gguf.ssm_alpha"), h, m.dt_rank)?,
+                    beta: mk(format!("{p}.gguf.ssm_beta"), h, m.dt_rank)?,
+                    conv1d: f32_small(format!("{p}.gguf.ssm_conv1d.weight"))?,
+                    a: f32_small(format!("{p}.gguf.ssm_a"))?,
+                    dt_bias: f32_small(format!("{p}.gguf.ssm_dt.bias"))?,
+                    ssm_norm: f32_small(format!("{p}.gguf.ssm_norm.weight"))?,
+                }))
+            } else {
+                AttnWeights::Full(Box::new(FullAttn {
+                    q_norm: match qk_norm {
+                        true => Some(small(format!("{p}.self_attn.q_norm.weight"))?),
+                        false => None,
+                    },
+                    k_norm: match qk_norm {
+                        true => Some(small(format!("{p}.self_attn.k_norm.weight"))?),
+                        false => None,
+                    },
+                    q: mk(format!("{p}.self_attn.q_proj"), h, dims.q_proj_dim)?,
+                    k: mk(format!("{p}.self_attn.k_proj"), h, kv)?,
+                    v: mk(format!("{p}.self_attn.v_proj"), h, kv)?,
+                    o: mk(format!("{p}.self_attn.o_proj"), dims.q_dim, h)?,
+                }))
+            };
             layers.push(LayerWeights {
                 input_ln: small(format!("{p}.input_layernorm.weight"))?,
-                post_ln: small(format!("{p}.post_attention_layernorm.weight"))?,
-                q_norm: match qk_norm {
-                    true => Some(small(format!("{p}.self_attn.q_norm.weight"))?),
-                    false => None,
-                },
-                k_norm: match qk_norm {
-                    true => Some(small(format!("{p}.self_attn.k_norm.weight"))?),
-                    false => None,
-                },
-                q: mk(format!("{p}.self_attn.q_proj"), h, dims.q_dim)?,
-                k: mk(format!("{p}.self_attn.k_proj"), h, kv)?,
-                v: mk(format!("{p}.self_attn.v_proj"), h, kv)?,
-                o: mk(format!("{p}.self_attn.o_proj"), dims.q_dim, h)?,
+                post_ln: small(post_ln_name(&p))?,
+                attn,
                 gate: mk(format!("{p}.mlp.gate_proj"), h, cfg.intermediate_size)?,
                 up: mk(format!("{p}.mlp.up_proj"), h, cfg.intermediate_size)?,
                 down: mk(format!("{p}.mlp.down_proj"), cfg.intermediate_size, h)?,
@@ -830,7 +1021,7 @@ impl LowMemEngine {
 
         let max_rows = layers
             .iter()
-            .flat_map(|l| [&l.q, &l.k, &l.v, &l.o, &l.gate, &l.up, &l.down])
+            .flat_map(|l| l.paged())
             .chain([&lm_head])
             .map(|t| t.rows_per_page)
             .max()
@@ -909,6 +1100,12 @@ impl LowMemEngine {
             sync: std::env::var("LOKAL_LOWMEM_SYNC").is_ok_and(|v| v == "1"),
             win,
             q35_layout,
+            q35_dims: q35_meta.as_ref().map(|m| qwen35_ref::DeltaDims {
+                d_state: m.d_state,
+                n_v_heads: m.dt_rank,
+                n_k_heads: m.n_group,
+                d_conv: m.d_conv,
+            }),
             clip_flag,
             clip_warned: std::sync::atomic::AtomicBool::new(false),
             cfg,
@@ -990,6 +1187,132 @@ impl Engine for LowMemEngine {
 
 #[cfg(test)]
 mod tests {
+
+    /// The Q projection's width and attention's width are the SAME number on
+    /// every dense model and DIFFERENT on qwen35, whose attention blocks project
+    /// Q and the output gate jointly ([q(hd)|gate(hd)] per head). Anything that
+    /// receives the projection must be sized by q_proj_dim; anything that
+    /// consumes attention itself by q_dim. Conflating them is the same class as
+    /// the two buffer overruns this repo has already paid for, so it gets a
+    /// test rather than a comment.
+    #[test]
+    fn joint_q_gate_widens_the_projection_but_not_attention() {
+        // Qwen3.5-2B: hidden 2048, 8 heads, head_dim 256 (key_length), 2 kv heads.
+        let cfg = ModelConfig {
+            hidden_size: 2048,
+            num_attention_heads: 8,
+            num_key_value_heads: 2,
+            ..qwen05b_cfg()
+        };
+        let mut m = q35_meta_27b(24);
+        m.rope_sections = [11, 11, 10, 0];
+        let joint = Dims::new(&cfg, Some(256), Some(&m));
+        assert_eq!(joint.q_dim, 2048, "attention still consumes n_heads*head_dim");
+        assert_eq!(joint.q_proj_dim, 4096, "the tensor is 2x that: [q|gate] per head");
+        assert_eq!(joint.kv_dim, 512);
+        // A dense model must be unaffected: the two widths stay one number.
+        // rope.dimension_count on the 2B is 64, and 2*sum([11,11,10,0]) is 64.
+        assert_eq!(joint.rot_dim, 64, "only 64 of each 256-wide head rotates");
+        let dense = Dims::new(&cfg, Some(256), None);
+        assert_eq!(dense.q_proj_dim, dense.q_dim);
+        assert_eq!(dense.rot_dim, dense.head_dim, "a dense model rotates the whole head");
+    }
+
+    // ---- qwen35 real-file tests: run by the gates with `--ignored` ----
+
+    use super::tests_qwen35_gguf as qwen35_gguf;
+
+    /// Every tensor the qwen35 forward pass will ask for must be ADDRESSABLE
+    /// before any of it is written. The hybrid has two different block shapes
+    /// and they share only the norms and the FFN, so a name that silently fails
+    /// to resolve would surface much later as a confusing load error in the
+    /// middle of a graph — this asserts the whole set up front, per layer, on
+    /// the real checkpoint.
+    ///
+    /// It also pins the one name the generic mapper cannot express: `ssm_a`
+    /// carries no `.weight` suffix, so without `qwen35_hf_name` it is absent
+    /// from the index entirely rather than merely oddly named.
+    #[test]
+    #[ignore]
+    fn qwen35_2b_every_tensor_resolves() {
+        let Some(path) = qwen35_gguf() else {
+            panic!("Qwen3.5-2B GGUF not in the HF cache — this gate needs the real file");
+        };
+        let src = LowMemSource::open(&path).expect("opens");
+        let meta = src.qwen35().expect("qwen35 meta parses");
+        assert_eq!(meta.is_recurrent.len(), meta.trunk_layers);
+
+        let mut linear = 0;
+        let mut full = 0;
+        for i in 0..meta.trunk_layers {
+            let p = format!("model.layers.{i}");
+            // Shared by both block kinds.
+            for n in [
+                format!("{p}.input_layernorm.weight"),
+                format!("{p}.gguf.post_attention_norm.weight"),
+                format!("{p}.mlp.gate_proj.weight"),
+                format!("{p}.mlp.up_proj.weight"),
+                format!("{p}.mlp.down_proj.weight"),
+            ] {
+                assert!(src.has(&n), "layer {i}: missing {n}");
+            }
+            if meta.is_recurrent[i] {
+                linear += 1;
+                for n in [
+                    format!("{p}.gguf.attn_qkv.weight"),
+                    format!("{p}.gguf.attn_gate.weight"),
+                    format!("{p}.gguf.ssm_conv1d.weight"),
+                    format!("{p}.gguf.ssm_a"),
+                    format!("{p}.gguf.ssm_alpha.weight"),
+                    format!("{p}.gguf.ssm_beta.weight"),
+                    format!("{p}.gguf.ssm_dt.bias"),
+                    format!("{p}.gguf.ssm_norm.weight"),
+                    format!("{p}.gguf.ssm_out.weight"),
+                ] {
+                    assert!(src.has(&n), "linear layer {i}: missing {n}");
+                }
+            } else {
+                full += 1;
+                for n in [
+                    format!("{p}.self_attn.q_proj.weight"),
+                    format!("{p}.self_attn.k_proj.weight"),
+                    format!("{p}.self_attn.v_proj.weight"),
+                    format!("{p}.self_attn.o_proj.weight"),
+                    format!("{p}.self_attn.q_norm.weight"),
+                    format!("{p}.self_attn.k_norm.weight"),
+                ] {
+                    assert!(src.has(&n), "attention layer {i}: missing {n}");
+                }
+            }
+        }
+        // full_attention_interval 4 over 24 blocks: 6 attention, 18 linear.
+        assert_eq!((linear, full), (18, 6), "hybrid split on the 2B");
+        assert!(src.has("model.embed_tokens.weight") && src.has("model.norm.weight"));
+    }
+
+    /// The shapes the kernels were written against, read off the real file
+    /// rather than assumed. conv_channels is the load-bearing one: the joint
+    /// qkv projection's output width must EQUAL 2·n_group·d_state + d_inner, or
+    /// the conv kernel is reading a differently-packed row than lane B's
+    /// reference and every gate downstream is meaningless.
+    #[test]
+    #[ignore]
+    fn qwen35_2b_shapes_match_the_kernel_assumptions() {
+        let Some(path) = qwen35_gguf() else { panic!("Qwen3.5-2B GGUF not in the HF cache") };
+        let src = LowMemSource::open(&path).expect("opens");
+        let meta = src.qwen35().expect("qwen35 meta parses");
+        let d = crate::lowmem::qwen35_ref::DeltaDims {
+            d_state: meta.d_state,
+            n_v_heads: meta.dt_rank,
+            n_k_heads: meta.n_group,
+            d_conv: meta.d_conv,
+        };
+        assert_eq!(d.d_inner(), meta.d_inner, "d_inner = dt_rank · d_state");
+        // 2B: 2·16·128 + 2048 = 6144, which must be attn_qkv's output width.
+        assert_eq!(d.conv_channels(), 6144);
+        assert_eq!(meta.conv_state_elems, (meta.d_conv - 1) * d.conv_channels());
+        assert_eq!(meta.delta_state_elems, meta.d_state * meta.d_inner);
+    }
     use super::*;
     use crate::config::EosIds;
 
@@ -1015,13 +1338,13 @@ mod tests {
     fn budget_arithmetic_refuses_impossible_budgets() {
         let cfg = qwen05b_cfg();
         let win = WindowCfg::new(2048, 4).unwrap();
-        let err = match memory_plan(&cfg, Dims::new(&cfg, None), &win, 300, None) {
+        let err = match memory_plan(&cfg, Dims::new(&cfg, None, None), &win, 300, None) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("a 300 MB budget must be refused"),
         };
         assert!(err.contains("--memory-budget 300"), "{err}");
         assert!(err.contains("weight-pool floor"), "{err}");
-        let plan = memory_plan(&cfg, Dims::new(&cfg, None), &win, 4096, None).unwrap();
+        let plan = memory_plan(&cfg, Dims::new(&cfg, None, None), &win, 4096, None).unwrap();
         let total = plan.kv_bytes
             + plan.act_bytes
             + plan.state_bytes
@@ -1060,7 +1383,7 @@ mod tests {
     fn budget_arithmetic_qwen35_kv_on_attention_layers_only() {
         let mut cfg = qwen05b_cfg();
         cfg.num_hidden_layers = 64;
-        let dims = Dims::new(&cfg, None);
+        let dims = Dims::new(&cfg, None, None);
         let meta = q35_meta_27b(64);
         assert_eq!(meta.is_recurrent.iter().filter(|&&r| !r).count(), 16);
 
