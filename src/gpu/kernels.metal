@@ -3507,3 +3507,78 @@ kernel void l2norm_rows(
         r[i] *= inv;
     }
 }
+
+struct DeltaStepParams {
+    uint d_state;   // S — both the contraction and the output extent
+    uint n_v_heads; // H_v
+    uint group;     // H_v / H_k, the K-head broadcast factor
+};
+
+/// One decode step of the gated delta rule, per V head h and output index j:
+///   q ← q/√S;  s ← s·eᵍ;  sk_j = Σ_i s[i,j]·k_i;
+///   d_j = (v_j − sk_j)·β;  s[i,j] += k_i·d_j;  o_j = Σ_i s[i,j]·q_i.
+///
+/// PARALLELISATION — why one thread per (h, j) and not a reduction:
+/// the reference's j loop has no cross-j dependency (column j of the state is
+/// read and written only by iteration j), so splitting on j is free. Splitting
+/// on i is NOT: both dots contract over i, and a simd/tree reduction sums in a
+/// different order, which forfeits bit-equality with the reference. So each
+/// thread walks its own column serially, in the reference's order.
+///
+/// The decay is fused into the first pass rather than run as a separate sweep
+/// over the whole head: every element is still multiplied by eᵍ exactly once,
+/// before that column is read, which is the reference's ordering restricted to
+/// one column.
+///
+/// State layout is ggml's: s[i + j*S + h*S*S], i the CONTRACTION index. Reading
+/// it transposed gives plausible finite numbers and wrong answers — the oracle
+/// carries a transposed negative control for exactly that.
+kernel void delta_decode_step(
+    device float *state [[buffer(0)]],       // [S*S*H_v], updated in place
+    device const float *q [[buffer(1)]],     // [S*H_k]
+    device const float *k [[buffer(2)]],     // [S*H_k]
+    device const float *v [[buffer(3)]],     // [S*H_v]
+    device const float *g [[buffer(4)]],     // [H_v] log-decay, one per V head
+    device const float *beta [[buffer(5)]],  // [H_v]
+    device float *out [[buffer(6)]],         // [S*H_v]
+    constant DeltaStepParams &p [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    // Contraction off, for the same reason as ssm_conv_decode: every one of the
+    // three accumulating loops below is a separate multiply and add in the
+    // reference, and Metal fuses them into fmas unless told not to (fast-math
+    // being off does not stop it — different switch).
+#pragma clang fp contract(off)
+    uint s_dim = p.d_state;
+    if (gid >= s_dim * p.n_v_heads) {
+        return;
+    }
+    uint h = gid / s_dim;
+    uint j = gid - h * s_dim;
+    uint kh_base = (h / p.group) * s_dim;
+
+    device float *st = state + (ulong)h * s_dim * s_dim + (ulong)j * s_dim;
+    device const float *kh = k + kh_base;
+    device const float *qh = q + kh_base;
+
+    float ge = exp(g[h]);
+    float scale = 1.0f / sqrt((float)s_dim);
+    float b = beta[h];
+
+    float sk = 0.0f;
+    for (uint i = 0; i < s_dim; i++) {
+        float s = st[i] * ge;
+        st[i] = s;
+        sk += s * kh[i];
+    }
+    float d = (v[h * s_dim + j] - sk) * b;
+    float o = 0.0f;
+    for (uint i = 0; i < s_dim; i++) {
+        float s = st[i] + kh[i] * d;
+        st[i] = s;
+        // q is scaled per element exactly as the reference does it (one
+        // rounding for q·scale, then the product, then the add).
+        o += s * (qh[i] * scale);
+    }
+    out[h * s_dim + j] = o;
+}

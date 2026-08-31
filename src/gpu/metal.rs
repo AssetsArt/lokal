@@ -2852,4 +2852,247 @@ mod qwen35_kernel_oracle {
             "a perturbed state must change the output, or the oracle proves nothing"
         );
     }
+
+    /// Run delta_decode_step for `steps` tokens against one persistent state,
+    /// returning every step's output and the final state.
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_delta(
+        d: rf::DeltaDims,
+        state0: &[f32],
+        q: &[Vec<f32>],
+        k: &[Vec<f32>],
+        v: &[Vec<f32>],
+        g: &[Vec<f32>],
+        beta: &[Vec<f32>],
+    ) -> (Vec<Vec<f32>>, Vec<f32>) {
+        let device = Device::system_default().expect("Metal device required");
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+        let f = lib.get_function("delta_decode_step", None).expect("delta_decode_step");
+        let pipe = device.new_compute_pipeline_state_with_function(&f).expect("pipeline");
+        let queue = device.new_command_queue();
+
+        let bytes = |v: &[f32]| (std::mem::size_of_val(v)) as u64;
+        let shared = MTLResourceOptions::StorageModeShared;
+        let st = device.new_buffer_with_data(state0.as_ptr() as *const _, bytes(state0), shared);
+        let n_out = d.d_state * d.n_v_heads;
+        let out = device.new_buffer((n_out * 4) as u64, shared);
+
+        #[repr(C)]
+        struct P {
+            d_state: u32,
+            n_v_heads: u32,
+            group: u32,
+        }
+        let p = P {
+            d_state: d.d_state as u32,
+            n_v_heads: d.n_v_heads as u32,
+            group: (d.n_v_heads / d.n_k_heads) as u32,
+        };
+
+        let mut outs = Vec::new();
+        for step in 0..q.len() {
+            let up = |x: &[f32]| device.new_buffer_with_data(x.as_ptr() as *const _, bytes(x), shared);
+            let (qb, kb, vb) = (up(&q[step]), up(&k[step]), up(&v[step]));
+            let (gb, bb) = (up(&g[step]), up(&beta[step]));
+            let cb = queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipe);
+            enc.set_buffer(0, Some(&st), 0);
+            enc.set_buffer(1, Some(&qb), 0);
+            enc.set_buffer(2, Some(&kb), 0);
+            enc.set_buffer(3, Some(&vb), 0);
+            enc.set_buffer(4, Some(&gb), 0);
+            enc.set_buffer(5, Some(&bb), 0);
+            enc.set_buffer(6, Some(&out), 0);
+            enc.set_bytes(7, std::mem::size_of::<P>() as u64, &p as *const P as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(((n_out + 63) / 64) as u64, 1, 1),
+                MTLSize::new(64, 1, 1),
+            );
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            outs.push(
+                unsafe { std::slice::from_raw_parts(out.contents() as *const f32, n_out) }.to_vec(),
+            );
+        }
+        let final_state =
+            unsafe { std::slice::from_raw_parts(st.contents() as *const f32, state0.len()) }.to_vec();
+        (outs, final_state)
+    }
+
+    /// Inputs for `steps` delta steps. `decay` chooses the g values: `None`
+    /// means g = 0 exactly, which is what makes the bit-exact test possible.
+    #[allow(clippy::type_complexity)]
+    fn delta_inputs(
+        d: rf::DeltaDims,
+        steps: usize,
+        seed: &mut u32,
+        decay: bool,
+    ) -> (Vec<f32>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        let (s, hv, hk) = (d.d_state, d.n_v_heads, d.n_k_heads);
+        let state0: Vec<f32> = (0..d.delta_state_elems()).map(|_| lcg(seed)).collect();
+        fn mk(n: usize, seed: &mut u32) -> Vec<f32> {
+            (0..n).map(|_| lcg(seed)).collect()
+        }
+        let q: Vec<Vec<f32>> = (0..steps).map(|_| mk(s * hk, seed)).collect();
+        let k: Vec<Vec<f32>> = (0..steps).map(|_| mk(s * hk, seed)).collect();
+        let v: Vec<Vec<f32>> = (0..steps).map(|_| mk(s * hv, seed)).collect();
+        // g is a log-decay: the model's g = a·softplus(α+bias) is <= 0, so eᵍ
+        // is a contraction. Feeding positive g would let the state blow up over
+        // steps and the comparison would be measuring overflow, not the kernel.
+        let g: Vec<Vec<f32>> = (0..steps)
+            .map(|_| {
+                (0..hv)
+                    .map(|_| if decay { -(lcg(seed).abs()) } else { 0.0 })
+                    .collect()
+            })
+            .collect();
+        let beta: Vec<Vec<f32>> = (0..steps).map(|_| mk(hv, seed)).collect();
+        (state0, q, k, v, g, beta)
+    }
+
+    /// With g = 0 the decay factor is exp(0) = 1.0 — exact in every
+    /// implementation — so the ENTIRE kernel is add/multiply and must be
+    /// bit-for-bit. This is the load-bearing test: it pins the state layout,
+    /// the K-head broadcast, the 1/√S scaling, the update-then-read ordering
+    /// inside the second loop, and the summation order of both dots. Only the
+    /// decay itself is left to the bounded test below, so nothing can hide
+    /// inside a tolerance.
+    #[test]
+    fn delta_decode_matches_reference_bit_for_bit() {
+        let d = dims();
+        let mut seed = 0x9E37_79B9u32;
+        let (state0, q, k, v, g, beta) = delta_inputs(d, 5, &mut seed, false);
+        let (gpu_outs, gpu_state) = gpu_delta(d, &state0, &q, &k, &v, &g, &beta);
+
+        let mut ref_state = state0.clone();
+        for step in 0..q.len() {
+            let want =
+                rf::delta_decode_step(&d, &mut ref_state, &q[step], &k[step], &v[step], &g[step], &beta[step]);
+            for (i, (a, b)) in want.iter().zip(&gpu_outs[step]).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "step {step} slot {i}: reference {a} vs gpu {b} — with g=0 this kernel \
+                     is pure multiply-add and has no excuse for a difference"
+                );
+            }
+        }
+        // Several steps AND the final state, because the state is the half that
+        // a single-step comparison cannot see: a kernel that writes the right
+        // outputs from a subtly wrong state passes step 0 and fails step 3.
+        for (i, (a, b)) in ref_state.iter().zip(&gpu_state).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "final state slot {i}");
+        }
+    }
+
+    /// With a live decay the kernel calls exp(), which is where bit-equality
+    /// ends: Metal's exp and the host's differ in the last bit (measured on the
+    /// conv kernel; `precise::exp` does not close it). Every element of the
+    /// state is scaled by that value every step, so that difference is carried
+    /// forward and amplified by the recurrence.
+    ///
+    /// So this test does NOT assert a hand-picked tolerance. It MEASURES the
+    /// conditioning first — how far the reference drifts from ITSELF when
+    /// exp(g) is moved by one rounding unit — and then requires the GPU to sit
+    /// inside a small multiple of that. If the kernel's only divergence is
+    /// exp's last bit, it lands there by construction; if it has a real
+    /// arithmetic bug, no amount of ill-conditioning in the recurrence excuses
+    /// it, because the yardstick is derived from the reference alone and a GPU
+    /// bug cannot inflate it.
+    ///
+    /// A fixed tolerance would have been the wrong instrument here: the first
+    /// draft of this test asserted 1e-5 and passed, and the measured drift was
+    /// 5.5e-6 — about 46 ulp. That number is neither "exp's last bit" nor a
+    /// bug; it is the recurrence's gain, and the only way to tell those apart
+    /// is to measure the gain separately.
+    #[test]
+    fn delta_decode_bounded_once_the_decay_is_live() {
+        let d = dims();
+        let mut seed = 0x0DEF_ACEDu32;
+        let (state0, q, k, v, g, beta) = delta_inputs(d, 5, &mut seed, true);
+        let (gpu_outs, gpu_state) = gpu_delta(d, &state0, &q, &k, &v, &g, &beta);
+
+        // exp(g + δ) = exp(g)·(1 + δ), so δ = 2⁻²⁴ — f32's rounding unit — is
+        // exactly a one-rounding move in the decay factor, applied to every
+        // head at once (the worst case: the GPU's per-head last-bit errors
+        // point in arbitrary directions).
+        let delta = (2f32).powi(-24);
+        let g_nudged: Vec<Vec<f32>> =
+            g.iter().map(|row| row.iter().map(|x| x + delta).collect()).collect();
+
+        let run = |gs: &[Vec<f32>]| -> (Vec<Vec<f32>>, Vec<f32>) {
+            let mut st = state0.clone();
+            let outs = (0..q.len())
+                .map(|t| rf::delta_decode_step(&d, &mut st, &q[t], &k[t], &v[t], &gs[t], &beta[t]))
+                .collect();
+            (outs, st)
+        };
+        let (ref_outs, ref_state) = run(&g);
+        let (nudged_outs, nudged_state) = run(&g_nudged);
+
+        let worst = |a: &[Vec<f32>], b: &[Vec<f32>], sa: &[f32], sb: &[f32]| -> f32 {
+            let o = a
+                .iter()
+                .zip(b)
+                .flat_map(|(x, y)| x.iter().zip(y))
+                .fold(0f32, |m, (x, y)| m.max(rel_err(*x, *y)));
+            sa.iter().zip(sb).fold(o, |m, (x, y)| m.max(rel_err(*x, *y)))
+        };
+        let yardstick = worst(&ref_outs, &nudged_outs, &ref_state, &nudged_state);
+        let measured = worst(&ref_outs, &gpu_outs, &ref_state, &gpu_state);
+
+        // The yardstick must be non-zero, or it is not measuring anything and
+        // the ratio below would be vacuous.
+        assert!(yardstick > 0.0, "one-rounding nudge changed nothing — the sensitivity probe is broken");
+        // 4x, and the factor is derived rather than chosen: the yardstick moves
+        // every head's decay in the SAME direction, and heads never mix in this
+        // kernel, so a GPU whose only fault is exp's last bit cannot exceed ~2x
+        // it (exp(g) for g<0 lands in (0,1), where one ulp is between 2⁻²⁴ and
+        // 2⁻²³ relative). 4x is that ceiling with one doubling of margin.
+        // Measured on M-series at this seed: gpu 5.5e-6, yardstick 1.9e-5,
+        // ratio 0.29 — inside the envelope and 13x below the bar.
+        assert!(
+            measured <= 4.0 * yardstick,
+            "gpu drift {measured:e} exceeds 4x the reference's own one-rounding sensitivity {yardstick:e} — that is more than exp's last bit can explain"
+        );
+    }
+
+    fn rel_err(a: f32, b: f32) -> f32 {
+        let scale = a.abs().max(b.abs());
+        if scale == 0.0 { 0.0 } else { (a - b).abs() / scale }
+    }
+
+    /// The comparison must be able to see a TRANSPOSED state. The layout is
+    /// s[i + j*S + h*S*S] with i the contraction index; a kernel that swapped
+    /// i and j would produce finite, plausible numbers. Feeding the reference a
+    /// per-head transposed state has to break the match — if it does not, the
+    /// oracle is not testing the layout at all.
+    #[test]
+    fn delta_oracle_sees_a_transposed_state() {
+        let d = dims();
+        let mut seed = 0x5EED_1234u32;
+        let (state0, q, k, v, g, beta) = delta_inputs(d, 1, &mut seed, false);
+        let (gpu_outs, _) = gpu_delta(d, &state0, &q, &k, &v, &g, &beta);
+
+        let s = d.d_state;
+        let mut transposed = state0.clone();
+        for h in 0..d.n_v_heads {
+            for j in 0..s {
+                for i in 0..s {
+                    transposed[h * s * s + j * s + i] = state0[h * s * s + i * s + j];
+                }
+            }
+        }
+        let want = rf::delta_decode_step(&d, &mut transposed, &q[0], &k[0], &v[0], &g[0], &beta[0]);
+        assert!(
+            want.iter().zip(&gpu_outs[0]).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "a transposed state must change the output, or the layout is untested"
+        );
+    }
 }
