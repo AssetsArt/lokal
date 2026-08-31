@@ -1,0 +1,1 @@
+The old lighthouse keeper's problem is a classic example of a recurrence relation. The problem is that of a lighthouse keeper who has to maintain
