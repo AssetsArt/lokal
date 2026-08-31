@@ -267,6 +267,27 @@ fn run() -> Result<()> {
         );
     }
 
+    // LOKAL_DEBUG_TOPK=N: prefill the prompt, print the final position's top-N
+    // (token id, logit) pairs, and exit. The perturbation gates assert on these
+    // directly — an argmax flip is never implied by a logits change
+    // (protocol:gate-scripts), so window semantics are proved at logit level.
+    if let Some(k) = std::env::var("LOKAL_DEBUG_TOPK").ok().and_then(|v| v.parse::<usize>().ok()) {
+        let ids = tokenizer
+            .encode(args.opt.prompt.as_str(), true)
+            .map_err(|e| format!("tokenize: {e}"))?
+            .get_ids()
+            .to_vec();
+        println!("ntok\t{}", ids.len()); // gates assert equal lengths across perturbations
+        let mut session = engine.session(ids.len() + 1)?;
+        let logits = session.prefill(&ids)?;
+        let mut ranked: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (id, logit) in ranked.into_iter().take(k) {
+            println!("topk\t{id}\t{logit:.6}");
+        }
+        return Ok(());
+    }
+
     // CLI mode: echo the prompt, then stream generated text after it.
     if args.opt.chat {
         println!("{}", args.opt.prompt); // in chat mode, put question and answer on separate lines

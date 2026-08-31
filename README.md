@@ -200,9 +200,12 @@ the flat-cost attention the lowmem backend runs by construction: each query
 attends its last W positions plus N pinned "sink" tokens, and KV memory becomes
 a fixed ring — O(window), flat in context length (Qwen 0.5B at 32k context:
 ~400 MB of full KV vs ~35 MB of ring at W=2048). The trade is real and the
-mode is DEFAULT OFF: these models were trained full-causal, so anything beyond
-the window is genuinely out of sight — without the flags, behavior is
-bit-for-bit unchanged. On `-b hybrid`, the ANE's graphs compute full causal
+mode is DEFAULT OFF: these models were trained full-causal, and each layer only
+attends its own window — though beyond-window context still influences output
+through depth (each position summarizes ITS window at the layer below, so the
+effective receptive field is roughly layers × window, the same mechanism that
+lets Mistral's sliding window carry long documents). Without the flags,
+behavior is bit-for-bit unchanged. On `-b hybrid`, the ANE's graphs compute full causal
 attention, which below position W is EXACTLY the window+sink result — so the
 ANE serves those positions and windowed Metal takes everything past them, no
 graph re-export, no approximation. In serve mode a window means per-request
