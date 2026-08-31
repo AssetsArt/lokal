@@ -3516,6 +3516,104 @@ mod qwen35_kernel_oracle {
         assert!(super::Qwen35Layout::check_rope_sections(&meta).is_err(), "all-zero sections must refuse");
     }
 
+    fn gpu_delta_gates(alpha: &[f32], beta_in: &[f32], a: &[f32], dt: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let device = Device::system_default().expect("Metal device required");
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+        let f = lib.get_function("delta_gates", None).expect("delta_gates");
+        let pipe = device.new_compute_pipeline_state_with_function(&f).expect("pipeline");
+        let queue = device.new_command_queue();
+        let shared = MTLResourceOptions::StorageModeShared;
+        let mk = |v: &[f32]| device.new_buffer_with_data(
+            v.as_ptr() as *const _, std::mem::size_of_val(v) as u64, shared);
+        let n = alpha.len();
+        let (ab, bb, aab, dtb) = (mk(alpha), mk(beta_in), mk(a), mk(dt));
+        let gout = device.new_buffer((n * 4) as u64, shared);
+        let bout = device.new_buffer((n * 4) as u64, shared);
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipe);
+        for (i, b) in [&ab, &bb, &aab, &dtb, &gout, &bout].iter().enumerate() {
+            enc.set_buffer(i as u64, Some(b), 0);
+        }
+        let n32 = n as u32;
+        enc.set_bytes(6, 4, &n32 as *const u32 as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new(((n + 63) / 64) as u64, 1, 1), MTLSize::new(64, 1, 1));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let rd = |b: &metal::Buffer| unsafe {
+            std::slice::from_raw_parts(b.contents() as *const f32, n)
+        }.to_vec();
+        (rd(&gout), rd(&bout))
+    }
+
+    /// The EXACT half. softplus's own x > 20 shortcut is what makes it
+    /// possible: above the threshold the reference returns x UNCHANGED, so no
+    /// transcendental runs on either side and g = a·(alpha+dt_bias) is pure
+    /// arithmetic. sigma is exact at the same three arguments as the out-gate.
+    /// This pins the pairing of the four inputs — the thing most likely to be
+    /// wrong — with no tolerance at all.
+    #[test]
+    fn delta_gates_are_exact_above_the_softplus_shortcut() {
+        let n = 16; // the 2B's n_v_heads
+        let mut seed = 0x5150_0001u32;
+        let dt: Vec<f32> = (0..n).map(|_| lcg(&mut seed)).collect();
+        // alpha chosen so alpha + dt_bias is comfortably past 20 in every slot.
+        let alpha: Vec<f32> = (0..n).map(|i| 40.0 + i as f32).collect();
+        let a: Vec<f32> = (0..n).map(|_| lcg(&mut seed) * 2.0).collect();
+        let beta_in: Vec<f32> = (0..n)
+            .map(|i| match i % 3 { 0 => 0.0, 1 => 100.0, _ => -100.0 })
+            .collect();
+        let (g, beta) = gpu_delta_gates(&alpha, &beta_in, &a, &dt);
+        for h in 0..n {
+            let want_g = rf::delta_gate(alpha[h], dt[h], a[h]);
+            assert_eq!(want_g.to_bits(), g[h].to_bits(), "g[{h}]: {want_g} vs {}", g[h]);
+            let want_b = rf::sigmoid(beta_in[h]);
+            assert_eq!(want_b.to_bits(), beta[h].to_bits(), "beta[{h}]");
+        }
+        // The shortcut must actually be what is being exercised, or this test
+        // is silently a transcendental comparison that happened to pass.
+        assert!(alpha.iter().zip(&dt).all(|(x, b)| x + b > 20.0));
+    }
+
+    /// The BOUNDED half, below the shortcut where log and exp both run. Bound
+    /// is measured, not chosen: nudge exp by one rounding inside the
+    /// reference's own softplus and sigma, and require the GPU inside 4x the
+    /// resulting self-drift.
+    #[test]
+    fn delta_gates_bounded_below_the_shortcut() {
+        let n = 48; // the 27B's n_v_heads
+        let mut seed = 0x5150_0002u32;
+        let alpha: Vec<f32> = (0..n).map(|_| lcg(&mut seed) * 4.0).collect();
+        let dt: Vec<f32> = (0..n).map(|_| lcg(&mut seed)).collect();
+        let a: Vec<f32> = (0..n).map(|_| lcg(&mut seed) * 2.0).collect();
+        let beta_in: Vec<f32> = (0..n).map(|_| lcg(&mut seed) * 6.0).collect();
+        let (g, beta) = gpu_delta_gates(&alpha, &beta_in, &a, &dt);
+
+        let eps = 1.0 + f32::EPSILON;
+        let mut worst = 0f32;
+        let mut yard = 0f32;
+        for h in 0..n {
+            let x = alpha[h] + dt[h];
+            assert!(x <= 20.0, "slot {h} took the shortcut — this test must exercise log/exp");
+            let want_g = rf::delta_gate(alpha[h], dt[h], a[h]);
+            let nudged_g = a[h] * (1.0 + x.exp() * eps).ln();
+            worst = worst.max(rel_err(want_g, g[h]));
+            yard = yard.max(rel_err(want_g, nudged_g));
+            let want_b = rf::sigmoid(beta_in[h]);
+            let nudged_b = 1.0 / (1.0 + (-beta_in[h]).exp() * eps);
+            worst = worst.max(rel_err(want_b, beta[h]));
+            yard = yard.max(rel_err(want_b, nudged_b));
+        }
+        assert!(yard > 0.0, "the one-rounding nudge changed nothing — probe is broken");
+        assert!(worst <= 4.0 * yard, "gpu drift {worst:e} exceeds 4x the measured floor {yard:e}");
+    }
+
     /// Run l2norm_rows over `rows` (one threadgroup per row) and read them back.
     fn gpu_l2norm(rows: &[Vec<f32>], eps: f32) -> Vec<Vec<f32>> {
         let device = Device::system_default().expect("Metal device required");

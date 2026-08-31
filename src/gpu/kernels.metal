@@ -3649,3 +3649,36 @@ kernel void gated_output_norm(
         r[i] = r[i] * scale * w[i] * (zv * (1.0f / (1.0f + exp(-zv))));
     }
 }
+
+/// The delta rule's two per-head scalars, computed together because they are
+/// produced by two tiny projections and consumed by one kernel:
+///   g[h]    = a[h] · softplus(alpha[h] + dt_bias[h])
+///   beta[h] = sigmoid(beta_proj[h])
+///
+/// THE SIGMOID ON BETA IS NOT OPTIONAL and is the easiest thing in this block
+/// to leave out: llama.cpp applies it at qwen35.cpp:366, and lane B's reference
+/// takes beta ALREADY activated (it ships a delta_gate helper for g and
+/// deliberately none for beta). Raw beta is finite, plausible, and wrong.
+///
+/// softplus keeps ggml's shortcut: x > 20 returns x unchanged. That is not an
+/// optimisation, it is the reference's exact form — and it is what lets the
+/// oracle assert a BIT-EXACT half, since above the threshold no transcendental
+/// runs at all.
+kernel void delta_gates(
+    device const float *alpha [[buffer(0)]],   // [H_v] projection output
+    device const float *beta_in [[buffer(1)]], // [H_v] projection output
+    device const float *a [[buffer(2)]],       // [H_v] ssm_a
+    device const float *dt_bias [[buffer(3)]], // [H_v] ssm_dt.bias
+    device float *g [[buffer(4)]],             // [H_v]
+    device float *beta [[buffer(5)]],          // [H_v]
+    constant uint &n_v_heads [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n_v_heads) {
+        return;
+    }
+    float x = alpha[gid] + dt_bias[gid];
+    float sp = x > 20.0f ? x : log(1.0f + exp(x));
+    g[gid] = a[gid] * sp;
+    beta[gid] = 1.0f / (1.0f + exp(-beta_in[gid]));
+}
