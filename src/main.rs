@@ -354,6 +354,26 @@ fn gguf_setup(
                  model's safetensors checkpoint"
                 .into())
         }
+        "metal" if std::env::var_os("LOKAL_GGUF_EXPAND").is_none() => {
+            // Quant execution (D1): weights stay in their on-disk encoding and
+            // dequantize on read — no f32 expansion, so the fits check is the
+            // FILE size, which is what lets a 27B Q4 run on a 32 GB machine.
+            // LOKAL_GGUF_EXPAND=1 forces the old expand-to-f32 path (the D3
+            // identity gate compares the two).
+            if arch.arch == "qwen3" || arch.qk_norm {
+                return Err(format!(
+                    "architecture {} needs per-head q/k RMSNorm, which only -b lowmem runs — \
+                     use -b lowmem",
+                    arch.arch
+                )
+                .into());
+            }
+            if args.lowmem.memory_budget_mb.is_some() {
+                return Err("--memory-budget applies to -b lowmem only".into());
+            }
+            let engine = engine::create_metal_quant(path, cfg.clone(), win)?;
+            Some(engine)
+        }
         "cpu" | "metal" => {
             if arch.arch == "qwen3" || arch.qk_norm {
                 return Err(format!(

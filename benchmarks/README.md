@@ -263,3 +263,19 @@ llama.cpp needs a GGUF and oMLX needs an MLX copy of the model; the paths are
 at the top of `engines.py` and a missing one is reported by name.
 
 Raw per-run output with machine-state stamps: [results.jsonl](results.jsonl).
+
+## The metal-quant Studio acceptance
+
+`collect-metal-quant.sh` is the one-command gate for quantized GGUF on
+`-b metal` with full attention — written for the 32 GB M2 Ultra where the 27B
+Q4_K_M should sit resident:
+
+```bash
+MODEL="owner/repo:Q4_K_M" ./benchmarks/collect-metal-quant.sh
+```
+
+It resolves the tag, refuses a non-quiet machine, reports prefill+decode
+tok/s from a timed run, proves two greedy runs byte-identical, and samples
+`phys_footprint` in a separate UNTIMED run (vmmap suspends its target) —
+asserting the footprint tracks the quant file size, not an f32 expansion.
+Paste the whole output back.

@@ -16,6 +16,8 @@
 use crate::config::ModelConfig;
 use crate::engine::{Engine, Session};
 use crate::model::Model;
+#[cfg(target_os = "macos")]
+use crate::lowmem::{LowMemSource, SrcType};
 use half::f16;
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState,
@@ -227,6 +229,9 @@ pub struct MetalEngine {
     /// constants. None = full causal, bit-for-bit the backend's only behavior
     /// before this mode existed.
     win: Option<WinState>,
+    /// Quantized-GGUF execution (weights stay quant, dequantized on read).
+    /// None = the dense f16 paths, untouched.
+    quant: Option<QuantState>,
 }
 
 /// The sliding-window add-on: geometry shared with lowmem, plus the three
@@ -237,6 +242,73 @@ pub(crate) struct WinState {
     flash: ComputePipelineState,
     fallback: ComputePipelineState,
     dec_partial: ComputePipelineState,
+}
+
+/// One quantized weight matrix, resident as a span of the checkpoint's no-copy
+/// mmap view (file pages stay reclaimable — the lowmem-proven pattern that lets
+/// a 16.5 GB file run on a 32 GB box) or, for llama-arch q/k, a small staged
+/// buffer holding the rows re-ordered out of llama.cpp's RoPE permute.
+pub(crate) struct QuantLinear {
+    w: Buffer,
+    w_off: u64,
+    bias: Buffer, // f16; the shared zero row when the projection is biasless
+    in_dim: u32,
+    out_dim: u32,
+    sel: u32, // LM_W_QTYPE selector
+}
+
+/// One transformer block's quant weights + eagerly-resident f16 norms.
+pub(crate) struct QuantBlock {
+    input_layernorm: Buffer,
+    post_attention_layernorm: Buffer,
+    q_proj: QuantLinear,
+    k_proj: QuantLinear,
+    v_proj: QuantLinear,
+    o_proj: QuantLinear,
+    gate_proj: QuantLinear,
+    up_proj: QuantLinear,
+    down_proj: QuantLinear,
+}
+
+/// The pipelines one quant selector dispatches — built from the PRECISE
+/// (fast-math-off) library so dequant math matches dequant_row_ref bit-for-bit
+/// (gguf-kernels' rule; the fast library's fma contraction disagrees in the
+/// last ulp on exactly the values a quantizer produces).
+struct QuantPipes {
+    matvec: ComputePipelineState,
+    matvec_h: ComputePipelineState,
+    matvec_acc: ComputePipelineState,
+    matvec_swiglu: ComputePipelineState,
+    matmul_pg: ComputePipelineState,
+}
+
+/// Everything the quant-GGUF execution path adds to the engine. None = the
+/// backend is exactly what it was before this mode existed.
+pub(crate) struct QuantState {
+    source: LowMemSource,
+    blocks: Vec<QuantBlock>,
+    lm_head: QuantLinear,
+    final_norm: Buffer,
+    /// f32 embedding rows come off the CPU per token (dequant_row_ref) — no
+    /// f16 table is ever materialized.
+    embed_name: &'static str,
+    pipes: std::collections::HashMap<u32, QuantPipes>,
+    zero_bias: Buffer,
+    n_params: usize,
+}
+
+impl QuantState {
+    fn pipe(&self, sel: u32) -> &QuantPipes {
+        self.pipes.get(&sel).expect("selector was built at engine construction")
+    }
+}
+
+#[repr(C)]
+struct MatmulPagedParams {
+    in_dim: u32,
+    out_dim: u32,
+    n_rows: u32,
+    y_stride: u32,
 }
 
 /// Destination spans for writing positions [pos0, pos0+n) into the windowed
@@ -329,6 +401,18 @@ impl MetalEngine {
         let lib = device
             .new_library_with_source(&shader_source(model.cfg.kv_dim()), &CompileOptions::new())
             .map_err(|e| format!("failed to compile kernels.metal: {e}"))?;
+        let pipes = Self::build_pipelines(&device, &lib, &model.cfg)?;
+        let win_state = Self::build_win_state(&device, &lib, &model.cfg, win)?;
+        Self::finish_dense(device, queue, model, pipes, win_state)
+    }
+
+    /// The full dense pipeline set — code moved verbatim from the constructor
+    /// so the quant path can build the identical set from its own library.
+    fn build_pipelines(
+        device: &Device,
+        lib: &metal::Library,
+        cfg: &ModelConfig,
+    ) -> crate::Result<Pipelines> {
         let pipe = |name: &str| -> crate::Result<ComputePipelineState> {
             let f = lib.get_function(name, None).map_err(|e| format!("kernel {name}: {e}"))?;
             device
@@ -350,8 +434,8 @@ impl MetalEngine {
         // The GQA decode kernels are specialized per model: function constant 0
         // (GQA_CHUNK) is the q-head group width one threadgroup covers, fixed here
         // so the per-head loops in the kernel unroll flat.
-        let gqa_chunk = (model.cfg.num_attention_heads / model.cfg.num_key_value_heads)
-            .min(MAX_GQA_CHUNK) as u32;
+        let gqa_chunk =
+            (cfg.num_attention_heads / cfg.num_key_value_heads).min(MAX_GQA_CHUNK) as u32;
         let gqa_pipe = |name: &str| -> crate::Result<ComputePipelineState> {
             let consts = FunctionConstantValues::new();
             consts.set_constant_value_at_index(
@@ -403,10 +487,20 @@ impl MetalEngine {
             attention_decode_partial_batch: gqa_pipe("attention_decode_partial_batch")?,
             attention_decode_reduce_batch: pipe("attention_decode_reduce_batch")?,
         };
+        Ok(pipes)
+    }
 
-        // Window mode: re-specialize the three attention kernels with the LM_*
-        // constants (indices 20-23, exactly as lowmem builds them; GQA_CHUNK
-        // rides at 0 for the decode kernel).
+    /// Window mode: re-specialize the three attention kernels with the LM_*
+    /// constants (indices 20-23, exactly as lowmem builds them; GQA_CHUNK
+    /// rides at 0 for the decode kernel).
+    fn build_win_state(
+        device: &Device,
+        lib: &metal::Library,
+        cfg: &ModelConfig,
+        win: Option<(usize, usize)>,
+    ) -> crate::Result<Option<WinState>> {
+        let gqa_chunk =
+            (cfg.num_attention_heads / cfg.num_key_value_heads).min(MAX_GQA_CHUNK) as u32;
         let win_state = match win {
             None => None,
             Some((w, sink)) => {
@@ -439,7 +533,7 @@ impl MetalEngine {
                         .new_compute_pipeline_state_with_function(&f)
                         .map_err(|e| format!("kernel {name}: {e}").into())
                 };
-                let kv_mb = model.cfg.num_hidden_layers * wc.cap * model.cfg.kv_dim() * 2 * 2;
+                let kv_mb = cfg.num_hidden_layers * wc.cap * cfg.kv_dim() * 2 * 2;
                 eprintln!(
                     "Metal window mode: window {} (+{} sink) — KV is a ring of {} slots/layer, {:.0} MB total, flat in context length",
                     wc.w,
@@ -455,7 +549,18 @@ impl MetalEngine {
                 })
             }
         };
+        Ok(win_state)
+    }
 
+    /// The tail of dense construction (weights to f16 buffers) — moved
+    /// verbatim; the quant path never enters here.
+    fn finish_dense(
+        device: Device,
+        queue: CommandQueue,
+        model: Model,
+        pipes: Pipelines,
+        win_state: Option<WinState>,
+    ) -> crate::Result<Self> {
         fn lin(device: &Device, l: &crate::model::Linear) -> GpuLinear {
             let has_bias = l.bias.is_some();
             let zero_bias;
@@ -500,8 +605,9 @@ impl MetalEngine {
             queue,
             device,
             win: win_state,
+            quant: None,
             pipes,
-        blocks,
+            blocks,
         })
     }
 
@@ -1015,9 +1121,9 @@ impl Engine for MetalEngine {
         Ok(Box::new(self.raw_session(max_seq)))
     }
     fn batcher(&self, n_slots: usize, max_seq: usize) -> Option<Box<dyn crate::engine::Batcher + '_>> {
-        if self.win.is_some() {
-            // D4: the batcher pool keeps the full-causal KV layout; window mode
-            // serves through per-request sessions (the server's existing fallback).
+        if self.win.is_some() || self.quant.is_some() {
+            // Window mode (D4) and quant-GGUF v1 both serve through per-request
+            // sessions; the batcher pool keeps the dense full-causal layout.
             return None;
         }
         self.make_batcher(n_slots, max_seq)
@@ -1027,6 +1133,201 @@ impl Engine for MetalEngine {
 
 impl MetalEngine {
     /// Build a session as a concrete type — the ane backend needs write_kv/prefill_from.
+    /// Build the engine straight from a quantized GGUF: weights stay in their
+    /// on-disk encoding behind one no-copy view, norms/biases materialize as
+    /// the usual f16 buffers, and the qtype pipelines come from the precise
+    /// library. No f32 expansion happens anywhere on this path.
+    pub fn new_gguf_quant(
+        path: &std::path::Path,
+        cfg: ModelConfig,
+        win: Option<(usize, usize)>,
+    ) -> crate::Result<Self> {
+        use std::collections::HashMap;
+        let device = Device::system_default().ok_or("no Metal-capable GPU found")?;
+        let queue = device.new_command_queue();
+        let mut source = LowMemSource::open(path)?;
+        source.make_gpu_views(&device);
+
+        let shader = shader_source(cfg.kv_dim());
+        let lib = device
+            .new_library_with_source(&shader, &CompileOptions::new())
+            .map_err(|e| format!("failed to compile kernels.metal: {e}"))?;
+        // (identical construction to new_with_window below — the dense
+        // pipelines keep the fast library and their exact existing code)
+        let dense = Self::build_pipelines(&device, &lib, &cfg)?;
+        let win_state = Self::build_win_state(&device, &lib, &cfg, win)?;
+
+        // Quant pipelines: precise fast-math-off library, one set per selector
+        // present in the file (gguf-kernels doctrine — see lowmem's twin).
+        let quant_types = source.quant_types();
+        let precise = CompileOptions::new();
+        precise.set_fast_math_enabled(false);
+        let plib = device
+            .new_library_with_source(&shader, &precise)
+            .map_err(|e| format!("failed to compile kernels.metal (precise): {e}"))?;
+        let qpipe = |name: &str, sel: u32| -> crate::Result<ComputePipelineState> {
+            let consts = FunctionConstantValues::new();
+            consts.set_constant_value_at_index(&sel as *const u32 as *const _, MTLDataType::UInt, 25);
+            let f = plib.get_function(name, Some(consts)).map_err(|e| format!("kernel {name}: {e}"))?;
+            device
+                .new_compute_pipeline_state_with_function(&f)
+                .map_err(|e| format!("kernel {name}: {e}").into())
+        };
+        let mut pipes: HashMap<u32, QuantPipes> = HashMap::new();
+        let mut f16_sel_needed = false;
+        for ty in &quant_types {
+            let sel = SrcType::Quant(*ty).qtype();
+            if sel == u32::MAX {
+                // NON-EXHAUSTIVE on purpose: the lowbit-quants lane grows the
+                // seam in parallel; a type lands here only when wired.
+                return Err(format!(
+                    "GGUF type {ty:?} has no metal quant pipeline yet — re-download as Q4_K_M or Q8_0"
+                )
+                .into());
+            }
+            if !pipes.contains_key(&sel) {
+                pipes.insert(
+                    sel,
+                    QuantPipes {
+                        matvec: qpipe("matvec", sel)?,
+                        matvec_h: qpipe("matvec_h", sel)?,
+                        matvec_acc: qpipe("matvec_acc", sel)?,
+                        matvec_swiglu: qpipe("matvec_swiglu", sel)?,
+                        matmul_pg: qpipe("matmul_pg", sel)?,
+                    },
+                );
+            }
+            let _ = &mut f16_sel_needed;
+        }
+        // F16/F32 tensors in a mixed file (fp16 GGUFs, some heads) run under
+        // selector 0 — same kernels, precise library for uniformity.
+        if !pipes.contains_key(&0) {
+            pipes.insert(
+                0,
+                QuantPipes {
+                    matvec: qpipe("matvec", 0)?,
+                    matvec_h: qpipe("matvec_h", 0)?,
+                    matvec_acc: qpipe("matvec_acc", 0)?,
+                    matvec_swiglu: qpipe("matvec_swiglu", 0)?,
+                    matmul_pg: qpipe("matmul_pg", 0)?,
+                },
+            );
+        }
+
+        let zero_bias = f16_empty_buffer(&device, cfg.hidden_size.max(cfg.intermediate_size).max(cfg.vocab_size));
+        let norm_buf = |name: &str| -> crate::Result<Buffer> {
+            Ok(f16_buffer(&device, &source.read_f32(name)?))
+        };
+        let qlin = |source: &LowMemSource, device: &Device, zero_bias: &Buffer, name: &str, in_dim: usize, out_dim: usize| -> crate::Result<QuantLinear> {
+            let ty = source.src_type(&format!("{name}.weight"))?;
+            let sel = match ty {
+                SrcType::Quant(t) => {
+                    let sel = SrcType::Quant(t).qtype();
+                    if sel == u32::MAX {
+                        return Err(format!("{name}: {t:?} has no metal quant pipeline yet").into());
+                    }
+                    sel
+                }
+                // F16/F32 rows run the selector-0 kernels; the f32 case never
+                // occurs for 2-D weights in practice (norms are the f32 ones).
+                SrcType::F16 | SrcType::F32 => 0,
+                SrcType::BF16 => return Err(format!("{name}: bf16 inside a GGUF is unsupported").into()),
+            };
+            let shape = source.shape(&format!("{name}.weight"))?;
+            if shape != vec![out_dim, in_dim] {
+                return Err(format!("{name}: shape {shape:?}, expected [{out_dim}, {in_dim}]").into());
+            }
+            let bias = match source.has(&format!("{name}.bias")) {
+                true => f16_buffer(device, &source.read_f32(&format!("{name}.bias"))?),
+                false => zero_bias.clone(),
+            };
+            let wname = format!("{name}.weight");
+            let (w, w_off) = match source.gpu_span(&wname, 0, out_dim)? {
+                Some((view, off)) => (view.clone(), off as u64),
+                None => {
+                    // llama-arch q/k: rows sit RoPE-permuted in the file, so a
+                    // single span cannot be handed to the GPU — stage the rows
+                    // re-ordered once (small: q/k only), still in quant bytes.
+                    let hd = source
+                        .unpermute_head_dim(&wname)
+                        .ok_or_else(|| format!("{name}: no GPU span and no permute reason"))?;
+                    let rb = ty.row_bytes(in_dim);
+                    let mut staged = vec![0u8; out_dim * rb];
+                    for r in 0..out_dim {
+                        let (h, j) = (r / hd, r % hd);
+                        let (a, d) = (j / (hd / 2), j % (hd / 2));
+                        let src_row = h * hd + d * 2 + a;
+                        let row = source.read_rows(&wname, src_row, src_row + 1)?;
+                        staged[r * rb..(r + 1) * rb].copy_from_slice(row);
+                    }
+                    let buf = device.new_buffer_with_data(
+                        staged.as_ptr() as *const _,
+                        staged.len() as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    );
+                    (buf, 0)
+                }
+            };
+            Ok(QuantLinear { w, w_off, bias, in_dim: in_dim as u32, out_dim: out_dim as u32, sel })
+        };
+
+        let (h, kvd, inter) = (cfg.hidden_size, cfg.kv_dim(), cfg.intermediate_size);
+        let mut blocks = Vec::with_capacity(cfg.num_hidden_layers);
+        for i in 0..cfg.num_hidden_layers {
+            let p = format!("model.layers.{i}");
+            blocks.push(QuantBlock {
+                input_layernorm: norm_buf(&format!("{p}.input_layernorm.weight"))?,
+                post_attention_layernorm: norm_buf(&format!("{p}.post_attention_layernorm.weight"))?,
+                q_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.q_proj"), h, h)?,
+                k_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.k_proj"), h, kvd)?,
+                v_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.v_proj"), h, kvd)?,
+                o_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.o_proj"), h, h)?,
+                gate_proj: qlin(&source, &device, &zero_bias, &format!("{p}.mlp.gate_proj"), h, inter)?,
+                up_proj: qlin(&source, &device, &zero_bias, &format!("{p}.mlp.up_proj"), h, inter)?,
+                down_proj: qlin(&source, &device, &zero_bias, &format!("{p}.mlp.down_proj"), inter, h)?,
+            });
+        }
+        let final_norm = norm_buf("model.norm.weight")?;
+        let lm_head_name =
+            if source.has("lm_head.weight") { "lm_head" } else { "model.embed_tokens" };
+        let lm_head = qlin(&source, &device, &zero_bias, lm_head_name, h, cfg.vocab_size)?;
+        let n_params = source.n_params();
+
+        eprintln!(
+            "Metal quant: {} stays {:?} on the GPU — dequantized on read, no f32 expansion",
+            path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            quant_types,
+        );
+
+        Ok(Self {
+            pipes: dense,
+            embed_tokens: f16_empty_buffer(&device, 1), // unused on the quant path (CPU gather)
+            blocks: Vec::new(),
+            norm: f16_empty_buffer(&device, 1),
+            lm_head: GpuLinear {
+                w: f16_empty_buffer(&device, 1),
+                bias: zero_bias.clone(),
+                has_bias: false,
+                in_dim: 0,
+                out_dim: 0,
+            },
+            cfg,
+            queue,
+            device,
+            win: win_state,
+            quant: Some(QuantState {
+                source,
+                blocks,
+                lm_head,
+                final_norm,
+                embed_name: "model.embed_tokens.weight",
+                pipes,
+                zero_bias,
+                n_params,
+            }),
+        })
+    }
+
     pub(crate) fn raw_session(&self, max_seq: usize) -> MetalSession<'_> {
         let cfg = &self.cfg;
         let d = &self.device;
@@ -1086,7 +1387,7 @@ impl MetalEngine {
             // Window mode stages fresh K/V rows in f32 here, then scatters them
             // into the ring as f16 spans (lowmem's exact write path). One float
             // of stub keeps the binding cheap when the mode is off.
-            kvs: if self.win.is_some() {
+            kvs: if self.win.is_some() || self.quant.is_some() {
                 f32_buffer(d, 2 * chunk * cfg.kv_dim())
             } else {
                 f32_buffer(d, 1)
@@ -1202,6 +1503,9 @@ impl MetalSession<'_> {
         layer0: usize,
         logits_rows: usize,
     ) -> crate::Result<Vec<f32>> {
+        if self.engine.quant.is_some() {
+            return self.run_from_quant(src, n, pos0, layer0, logits_rows);
+        }
         let e = self.engine;
         let cfg = &e.cfg;
         let h = cfg.hidden_size;
@@ -1385,6 +1689,251 @@ impl MetalSession<'_> {
             return Ok(Vec::new());
         }
         // Unified memory: read logits straight out of the buffer, no device copy.
+        let logits = unsafe {
+            std::slice::from_raw_parts(self.logits.contents() as *const f32, logits_rows * cfg.vocab_size)
+        };
+        Ok(logits.to_vec())
+    }
+
+    /// One matvec-family dispatch against a quant (or f16-in-GGUF) weight.
+    /// `y_elem` is the output element width: 4 = f32 buffers, 2 = the f16 cache.
+    #[allow(clippy::too_many_arguments)]
+    fn enc_qmv(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        pipe: &ComputePipelineState,
+        l: &QuantLinear,
+        x: &Buffer,
+        y: &Buffer,
+        y_base: u64,
+    ) {
+        let p = MatvecParams { in_dim: l.in_dim, out_dim: l.out_dim };
+        enc.set_compute_pipeline_state(pipe);
+        enc.set_buffer(0, Some(&l.w), l.w_off);
+        enc.set_buffer(1, Some(&l.bias), 0);
+        enc.set_buffer(2, Some(x), 0);
+        enc.set_buffer(3, Some(y), y_base);
+        enc.set_bytes(4, size_of::<MatvecParams>() as u64, &p as *const _ as *const _);
+        dispatch_simdgroup_rows(enc, l.out_dim);
+    }
+
+    /// One prefill GEMM through matmul_pg's dequant-tile staging: Y = X·Wᵀ+b,
+    /// X read as f32 rows at `x_off` bytes, Y written f32 at `y_base` bytes.
+    #[allow(clippy::too_many_arguments)]
+    fn enc_qmm(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        pipe: &ComputePipelineState,
+        l: &QuantLinear,
+        x: &Buffer,
+        x_off: u64,
+        y: &Buffer,
+        y_base: u64,
+        n_rows: usize,
+    ) {
+        let p = MatmulPagedParams {
+            in_dim: l.in_dim,
+            out_dim: l.out_dim,
+            n_rows: n_rows as u32,
+            y_stride: l.out_dim,
+        };
+        enc.set_compute_pipeline_state(pipe);
+        enc.set_buffer(0, Some(&l.w), l.w_off);
+        enc.set_buffer(1, Some(&l.bias), 0);
+        enc.set_buffer(2, Some(x), x_off);
+        enc.set_buffer(3, Some(y), y_base);
+        enc.set_bytes(4, size_of::<MatmulPagedParams>() as u64, &p as *const _ as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new((l.out_dim as u64).div_ceil(64), (n_rows as u64).div_ceil(32), 1),
+            MTLSize::new(128, 1, 1),
+        );
+    }
+
+    /// run_from's twin for quant-GGUF weights: same chunk walk, same attention
+    /// and KV layout (full causal unless the window is on — enc_attention and
+    /// the span writer already switch on it), weights dequantized on read via
+    /// the precise-library pipelines. Embeddings gather on the CPU per token
+    /// through dequant_row_ref — no f16 table exists.
+    fn run_from_quant(
+        &mut self,
+        src: Source<'_>,
+        n: usize,
+        pos0: usize,
+        layer0: usize,
+        logits_rows: usize,
+    ) -> crate::Result<Vec<f32>> {
+        let e = self.engine;
+        let q = e.quant.as_ref().expect("quant path entered without state");
+        let cfg = &e.cfg;
+        let (h, kvd, hd) = (cfg.hidden_size, cfg.kv_dim(), cfg.head_dim());
+        let kv_slot0 = match &e.win {
+            Some(w) => w.cfg.slot_of(pos0),
+            None => pos0,
+        };
+        let kv_byte_off = self.kv_base + (kv_slot0 * kvd * 2) as u64;
+
+        match src {
+            Source::Ids(ids) => {
+                // CPU embedding gather: one quant row per token, dequantized
+                // straight into the x buffer (unified memory).
+                let xp = self.x.contents() as *mut f32;
+                for (i, &id) in ids.iter().enumerate() {
+                    let row = q.source.read_rows(q.embed_name, id as usize, id as usize + 1)?;
+                    let ty = q.source.src_type(q.embed_name)?;
+                    let dst = unsafe { std::slice::from_raw_parts_mut(xp.add(i * h), h) };
+                    match ty {
+                        SrcType::Quant(t) => crate::lowmem::manifest::dequant_row_ref(t, row, dst),
+                        SrcType::F16 => {
+                            for (j, c) in row.chunks_exact(2).enumerate() {
+                                dst[j] = f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32();
+                            }
+                        }
+                        SrcType::F32 => {
+                            for (j, c) in row.chunks_exact(4).enumerate() {
+                                dst[j] = f32::from_le_bytes(c.try_into().unwrap());
+                            }
+                        }
+                        SrcType::BF16 => return Err("bf16 rows inside a GGUF are unsupported".into()),
+                    }
+                }
+            }
+            Source::Hidden(x) => unsafe {
+                std::ptr::copy_nonoverlapping(x.as_ptr(), self.x.contents() as *mut f32, n * h)
+            },
+        }
+
+        let cb = e.queue.new_command_buffer();
+        let fused_decode = n == 1 && hd <= DEC_TG && hd.is_multiple_of(4);
+        let enc = if fused_decode {
+            cb.new_compute_command_encoder()
+        } else {
+            cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent)
+        };
+        let conc = !fused_decode;
+        macro_rules! bar {
+            ($($b:expr),+) => { if conc { enc.memory_barrier_with_resources(&[$($b),+]) } };
+        }
+
+        let v_base = self.kvs.length() / 2;
+        for (l, blk) in q.blocks.iter().enumerate().skip(layer0) {
+            if fused_decode {
+                e.enc_rmsnorm(enc, &self.x, &blk.input_layernorm, &self.xn, 1);
+                self.enc_qmv(enc, &q.pipe(blk.q_proj.sel).matvec, &blk.q_proj, &self.xn, &self.q, 0);
+                self.enc_qmv(enc, &q.pipe(blk.k_proj.sel).matvec_h, &blk.k_proj, &self.xn, &self.k_cache[l], kv_byte_off);
+                self.enc_qmv(enc, &q.pipe(blk.v_proj.sel).matvec_h, &blk.v_proj, &self.xn, &self.v_cache[l], kv_byte_off);
+                e.enc_rope_qk(enc, &self.q, &self.k_cache[l], kv_byte_off, pos0);
+                e.enc_attention_decode(enc, &self.q, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.partials, &self.att, pos0);
+                self.enc_qmv(enc, &q.pipe(blk.o_proj.sel).matvec_acc, &blk.o_proj, &self.att, &self.x, 0);
+                e.enc_rmsnorm(enc, &self.x, &blk.post_attention_layernorm, &self.xn, 1);
+                // gate/up dispatch separately: a mixed-quant file may hold the
+                // two halves in different encodings, and matvec_swiglu assumes
+                // one selector for both.
+                self.enc_qmv(enc, &q.pipe(blk.gate_proj.sel).matvec, &blk.gate_proj, &self.xn, &self.gate, 0);
+                self.enc_qmv(enc, &q.pipe(blk.up_proj.sel).matvec, &blk.up_proj, &self.xn, &self.up, 0);
+                let p = ElemParams { dim: cfg.intermediate_size as u32 };
+                enc.set_compute_pipeline_state(&e.pipes.silu_mul);
+                enc.set_buffer(0, Some(&self.gate), 0);
+                enc.set_buffer(1, Some(&self.up), 0);
+                enc.set_bytes(2, size_of::<ElemParams>() as u64, &p as *const _ as *const _);
+                dispatch_grid(enc, cfg.intermediate_size);
+                self.enc_qmv(enc, &q.pipe(blk.down_proj.sel).matvec_acc, &blk.down_proj, &self.gate, &self.x, 0);
+                continue;
+            }
+
+            // Prefill: rmsnorm (f32), quant GEMMs, staged K/V into the cache.
+            e.enc_rmsnorm(enc, &self.x, &blk.input_layernorm, &self.xn, n);
+            bar!(&self.xn);
+            self.enc_qmm(enc, &q.pipe(blk.q_proj.sel).matmul_pg, &blk.q_proj, &self.xn, 0, &self.q, 0, n);
+            self.enc_qmm(enc, &q.pipe(blk.k_proj.sel).matmul_pg, &blk.k_proj, &self.xn, 0, &self.kvs, 0, n);
+            self.enc_qmm(enc, &q.pipe(blk.v_proj.sel).matmul_pg, &blk.v_proj, &self.xn, 0, &self.kvs, v_base, n);
+            bar!(&self.q, &self.kvs);
+            {
+                let rp = RopeParams {
+                    head_dim: hd as u32,
+                    n_heads: cfg.num_attention_heads as u32,
+                    pos0: pos0 as u32,
+                    theta: cfg.rope_theta,
+                    n_rows: n as u32,
+                };
+                enc.set_compute_pipeline_state(&e.pipes.rope);
+                enc.set_buffer(0, Some(&self.q), 0);
+                enc.set_bytes(1, size_of::<RopeParams>() as u64, &rp as *const _ as *const _);
+                dispatch_grid(enc, n * cfg.num_attention_heads * hd / 2);
+            }
+            let spans: Vec<(usize, usize, usize)> = match &e.win {
+                Some(w) => win_write_spans(&w.cfg, pos0, n),
+                None => vec![(0, pos0, n)],
+            };
+            for &(row, slot, len) in &spans {
+                let src_off = (row * kvd * 4) as u64;
+                let dst_off = self.kv_base + (slot * kvd * 2) as u64;
+                e.enc_f32_to_f16(enc, &self.kvs, src_off, &self.k_cache[l], dst_off, len * kvd);
+                e.enc_f32_to_f16(enc, &self.kvs, v_base + src_off, &self.v_cache[l], dst_off, len * kvd);
+                bar!(&self.k_cache[l]);
+                let rp = RopeParams {
+                    head_dim: hd as u32,
+                    n_heads: cfg.num_key_value_heads as u32,
+                    pos0: (pos0 + row) as u32,
+                    theta: cfg.rope_theta,
+                    n_rows: len as u32,
+                };
+                enc.set_compute_pipeline_state(&e.pipes.rope_h);
+                enc.set_buffer(0, Some(&self.k_cache[l]), dst_off);
+                enc.set_bytes(1, size_of::<RopeParams>() as u64, &rp as *const _ as *const _);
+                dispatch_grid(enc, len * cfg.num_key_value_heads * hd / 2);
+            }
+            bar!(&self.q, &self.k_cache[l], &self.v_cache[l], &self.kvs);
+            {
+                let kv_extent = match &e.win {
+                    Some(w) => w.cfg.cap,
+                    None => self.max_seq,
+                };
+                e.enc_attention(enc, &self.q, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.scores, &self.att, pos0, n, kv_extent, &self.xh);
+                bar!(&self.att);
+            }
+            self.enc_qmm(enc, &q.pipe(blk.o_proj.sel).matmul_pg, &blk.o_proj, &self.att, 0, &self.xb, 0, n);
+            bar!(&self.xb);
+            e.enc_elementwise(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
+            bar!(&self.x);
+
+            e.enc_rmsnorm(enc, &self.x, &blk.post_attention_layernorm, &self.xn, n);
+            bar!(&self.xn);
+            self.enc_qmm(enc, &q.pipe(blk.gate_proj.sel).matmul_pg, &blk.gate_proj, &self.xn, 0, &self.gate, 0, n);
+            self.enc_qmm(enc, &q.pipe(blk.up_proj.sel).matmul_pg, &blk.up_proj, &self.xn, 0, &self.up, 0, n);
+            bar!(&self.gate, &self.up);
+            {
+                let p = ElemParams { dim: (n * cfg.intermediate_size) as u32 };
+                enc.set_compute_pipeline_state(&e.pipes.silu_mul);
+                enc.set_buffer(0, Some(&self.gate), 0);
+                enc.set_buffer(1, Some(&self.up), 0);
+                enc.set_bytes(2, size_of::<ElemParams>() as u64, &p as *const _ as *const _);
+                dispatch_grid(enc, n * cfg.intermediate_size);
+            }
+            bar!(&self.gate);
+            self.enc_qmm(enc, &q.pipe(blk.down_proj.sel).matmul_pg, &blk.down_proj, &self.gate, 0, &self.xb, 0, n);
+            bar!(&self.xb);
+            e.enc_elementwise(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
+            bar!(&self.x);
+        }
+
+        if logits_rows > 0 {
+            e.enc_rmsnorm(enc, &self.x, &q.final_norm, &self.xn, n);
+            bar!(&self.xn);
+            let first = n - logits_rows;
+            if logits_rows == 1 && !conc {
+                self.enc_qmv(enc, &q.pipe(q.lm_head.sel).matvec, &q.lm_head, &self.xn, &self.logits, 0);
+            } else {
+                self.enc_qmm(enc, &q.pipe(q.lm_head.sel).matmul_pg, &q.lm_head, &self.xn, (first * h * 4) as u64, &self.logits, 0, logits_rows);
+            }
+        }
+
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        if logits_rows == 0 {
+            return Ok(Vec::new());
+        }
         let logits = unsafe {
             std::slice::from_raw_parts(self.logits.contents() as *const f32, logits_rows * cfg.vocab_size)
         };
