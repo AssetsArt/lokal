@@ -108,6 +108,49 @@ inline void lm_scale_min_k4(uint j, device const uchar *q, thread uint &sc, thre
     }
 }
 
+// Q2_K: scales[16] | qs[64] | d | dmin (84 B). Each scale byte packs a 4-bit
+// scale (low) and a 4-bit min (high) for one 16-element group.
+inline float lm_dequant_q2_K(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 8) * 84;
+    float d = lm_f16_at(b + 80);
+    float dmin = lm_f16_at(b + 82);
+    uint i = col & 255;
+    uint nh = i >> 7, r = i & 127;
+    uint j = r >> 5, w = r & 31;
+    uint hf = w >> 4, l = w & 15;
+    uchar sc = b[nh * 8 + j * 2 + hf];
+    uint q = (b[16 + nh * 32 + hf * 16 + l] >> (2 * j)) & 3;
+    return d * (float)(sc & 0x0F) * (float)q - dmin * (float)(sc >> 4);
+}
+
+// Q3_K's 16 six-bit scales live in 12 bytes. ggml unpacks all of them through a
+// u32 shuffle; here only ONE is ever wanted, so this is the same mapping solved
+// for a single index — and the oracle cross-checks it against the CPU side's
+// literal shuffle, which is the point of deriving it a second way.
+inline uint lm_q3k_scale(device const uchar *p, uint k) {
+    uint g = k >> 2, m = k & 3;
+    uint lo = (g < 2) ? (uint)(p[4 * g + m] & 0x0F) : (uint)((p[4 * (g - 2) + m] >> 4) & 0x0F);
+    uint hi = (uint)((p[8 + m] >> (2 * g)) & 3);
+    return lo | (hi << 4);
+}
+
+// Q3_K: hmask[32] | qs[64] | scales[12] | d (110 B). Scales are biased by -32,
+// and a hmask bit that is CLEAR subtracts 4 — the inverted sense is the easy
+// thing to get backwards.
+inline float lm_dequant_q3_K(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 8) * 110;
+    float d_all = lm_f16_at(b + 108);
+    uint i = col & 255;
+    uint nh = i >> 7, r = i & 127;
+    uint j = r >> 5, w = r & 31;
+    uint hf = w >> 4, l = w & 15;
+    int sc = (int)lm_q3k_scale(b + 96, nh * 8 + j * 2 + hf) - 32;
+    int q = (int)((b[32 + nh * 32 + hf * 16 + l] >> (2 * j)) & 3);
+    uchar m = (uchar)(1u << (nh * 4 + j));
+    int hi = (b[hf * 16 + l] & m) ? 0 : 4;
+    return d_all * (float)sc * (float)(q - hi);
+}
+
 inline float lm_dequant_q4_K(device const uchar *row, uint col) {
     device const uchar *b = row + (col >> 8) * 144;
     float d = lm_f16_at(b);
@@ -217,6 +260,56 @@ inline float lm_dot_run_q5_0(device const uchar *row, uint e0, device const floa
     return s * d;
 }
 
+inline float lm_dot_run_q2_K(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 8) * 84;
+    float d = lm_f16_at(b + 80);
+    float dmin = lm_f16_at(b + 82);
+    uint i = e0 & 255;
+    uint nh = i >> 7, r = i & 127;
+    uint j = r >> 5, w = r & 31;
+    // A 32-run spans TWO 16-element groups, so two scale bytes, not one.
+    uint hf = w >> 4;
+    float acc = 0.0f;
+    for (uint t = 0; t < 2; t++) {
+        uchar sc = b[nh * 8 + j * 2 + hf + t];
+        float dl = d * (float)(sc & 0x0F);
+        float ml = dmin * (float)(sc >> 4);
+        device const uchar *q = b + 16 + nh * 32 + (hf + t) * 16;
+        float sq = 0.0f, sx = 0.0f;
+        for (uint l = 0; l < 16; l++) {
+            float xv = x[e0 + t * 16 + l];
+            sq += (float)((q[l] >> (2 * j)) & 3) * xv;
+            sx += xv;
+        }
+        acc += dl * sq - ml * sx;
+    }
+    return acc;
+}
+
+inline float lm_dot_run_q3_K(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 8) * 110;
+    float d_all = lm_f16_at(b + 108);
+    uint i = e0 & 255;
+    uint nh = i >> 7, r = i & 127;
+    uint j = r >> 5, w = r & 31;
+    uint hf = w >> 4;
+    uchar m = (uchar)(1u << (nh * 4 + j));
+    float acc = 0.0f;
+    for (uint t = 0; t < 2; t++) {
+        int sc = (int)lm_q3k_scale(b + 96, nh * 8 + j * 2 + hf + t) - 32;
+        device const uchar *q = b + 32 + nh * 32 + (hf + t) * 16;
+        device const uchar *hm = b + (hf + t) * 16;
+        float sq = 0.0f;
+        for (uint l = 0; l < 16; l++) {
+            int qv = (int)((q[l] >> (2 * j)) & 3);
+            int hi = (hm[l] & m) ? 0 : 4;
+            sq += (float)(qv - hi) * x[e0 + t * 16 + l];
+        }
+        acc += d_all * (float)sc * sq;
+    }
+    return acc;
+}
+
 inline float lm_dot_run_q4_K(device const uchar *row, uint e0, device const float *x) {
     device const uchar *b = row + (e0 >> 8) * 144;
     float d = lm_f16_at(b);
@@ -301,6 +394,8 @@ inline float lm_dot_run(device const uchar *row, uint e0, device const float *x)
         case 5: return lm_dot_run_q6_K(row, e0, x);
         case 6: return lm_dot_run_q5_K(row, e0, x);
         case 7: return lm_dot_run_q5_0(row, e0, x);
+        case 8: return lm_dot_run_q2_K(row, e0, x);
+        case 9: return lm_dot_run_q3_K(row, e0, x);
         default: return 0.0f;
     }
 }
@@ -313,6 +408,8 @@ inline float lm_dequant(device const uchar *row, uint col) {
         case 5: return lm_dequant_q6_K(row, col);
         case 6: return lm_dequant_q5_K(row, col);
         case 7: return lm_dequant_q5_0(row, col);
+        case 8: return lm_dequant_q2_K(row, col);
+        case 9: return lm_dequant_q3_K(row, col);
         default: return 0.0f;
     }
 }
@@ -365,6 +462,8 @@ inline ulong lm_row_bytes(uint in_dim) {
         case 5: return (ulong)(in_dim / 256) * 210; // Q6_K
         case 6: return (ulong)(in_dim / 256) * 176; // Q5_K
         case 7: return (ulong)(in_dim / 32) * 22;   // Q5_0
+        case 8: return (ulong)(in_dim / 256) * 84;  // Q2_K
+        case 9: return (ulong)(in_dim / 256) * 110; // Q3_K
         default: return 0; // unused for element-addressable types
     }
 }

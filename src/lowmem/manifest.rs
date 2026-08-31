@@ -173,6 +173,8 @@ pub enum GgmlType {
     F32 = 0,
     F16 = 1,
     Q4_0 = 2,
+    Q2_K = 10,
+    Q3_K = 11,
     Q5_0 = 6,
     Q8_0 = 8,
     Q4_K = 12,
@@ -198,8 +200,8 @@ impl GgmlType {
             3 => return Err("Q4_1"),
             7 => return Err("Q5_1"),
             9 => return Err("Q8_1"),
-            10 => return Err("Q2_K"),
-            11 => return Err("Q3_K"),
+            10 => Self::Q2_K,
+            11 => Self::Q3_K,
             15 => return Err("Q8_K"),
             16 => return Err("IQ2_XXS"),
             17 => return Err("IQ2_XS"),
@@ -222,7 +224,7 @@ impl GgmlType {
         match self {
             Self::F32 | Self::F16 => 1,
             Self::Q4_0 | Self::Q5_0 | Self::Q8_0 => 32, // QK4_0 / QK5_0 / QK8_0
-            Self::Q4_K | Self::Q5_K | Self::Q6_K => 256, // QK_K
+            Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K => 256, // QK_K
         }
     }
 
@@ -234,6 +236,8 @@ impl GgmlType {
             Self::Q4_0 => 2 + 16,            // f16 d + 32 nibbles
             Self::Q5_0 => 2 + 4 + 16,        // f16 d + qh[4] high bits + 32 nibbles
             Self::Q8_0 => 2 + 32,            // f16 d + 32 i8
+            Self::Q2_K => 16 + 64 + 2 + 2,   // scales[QK_K/16] + qs[QK_K/4] + d + dmin
+            Self::Q3_K => 32 + 64 + 12 + 2,  // hmask[QK_K/8] + qs[QK_K/4] + scales[12] + d
             Self::Q4_K => 2 + 2 + 12 + 128,  // d + dmin + scales[12] + qs[QK_K/2]
             Self::Q5_K => 2 + 2 + 12 + 32 + 128, // … + qh[QK_K/8]
             Self::Q6_K => 128 + 64 + 16 + 2, // ql[QK_K/2] + qh[QK_K/4] + scales[16] + d
@@ -274,6 +278,27 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
             (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
         )
     }
+}
+
+/// Q3_K's 12 packed scale bytes -> 16 six-bit values, ggml's aux shuffle from
+/// dequantize_row_q3_K verbatim (kmask1 0x03030303, kmask2 0x0f0f0f0f). The
+/// caller subtracts the 32 bias. Done on u32 lanes exactly as ggml does, so the
+/// byte order that falls out is the same one its int8 view reads.
+fn q3k_scales(p: &[u8]) -> [u8; 16] {
+    let w = |i: usize| u32::from_le_bytes([p[4 * i], p[4 * i + 1], p[4 * i + 2], p[4 * i + 3]]);
+    let (k1, k2) = (0x0303_0303u32, 0x0f0f_0f0fu32);
+    let (a0, a1, tmp) = (w(0), w(1), w(2));
+    let aux = [
+        (a0 & k2) | (((tmp >> 0) & k1) << 4),
+        (a1 & k2) | (((tmp >> 2) & k1) << 4),
+        ((a0 >> 4) & k2) | (((tmp >> 4) & k1) << 4),
+        ((a1 >> 4) & k2) | (((tmp >> 6) & k1) << 4),
+    ];
+    let mut out = [0u8; 16];
+    for (i, a) in aux.iter().enumerate() {
+        out[4 * i..4 * i + 4].copy_from_slice(&a.to_le_bytes());
+    }
+    out
 }
 
 /// CPU reference dequantization of one row: exact ggml semantics per type
@@ -325,6 +350,46 @@ pub fn dequant_row_ref(ty: GgmlType, src: &[u8], out: &mut [f32]) {
                 let d = f16_bits_at(blk, 0);
                 for j in 0..32 {
                     y[j] = (blk[2 + j] as i8) as f32 * d;
+                }
+            }
+        }
+        // dequantize_row_q2_K. Block is scales[16] | qs[64] | d | dmin (84 B).
+        // Each of the 16 scale bytes packs a 4-bit scale (low) and a 4-bit min
+        // (high) for one 16-element group; the 2-bit quants for a 128-element
+        // half share one 32-byte qs run, selected by a shift of 2 per group-pair.
+        GgmlType::Q2_K => {
+            for (b, y) in out.chunks_exact_mut(256).enumerate() {
+                let blk = &src[b * 84..b * 84 + 84];
+                let d = f16_bits_at(blk, 80);
+                let dmin = f16_bits_at(blk, 82);
+                for (i, o) in y.iter_mut().enumerate() {
+                    let (nh, r) = (i >> 7, i & 127);
+                    let (j, w) = (r >> 5, r & 31);
+                    let (half, l) = (w >> 4, w & 15);
+                    let sc = blk[nh * 8 + j * 2 + half];
+                    let q = (blk[16 + nh * 32 + half * 16 + l] >> (2 * j)) & 3;
+                    *o = d * (sc & 0xF) as f32 * q as f32 - dmin * (sc >> 4) as f32;
+                }
+            }
+        }
+        // dequantize_row_q3_K. Block is hmask[32] | qs[64] | scales[12] | d
+        // (110 B). The 12 scale bytes hold 16 SIGNED 6-bit scales in ggml's
+        // aux shuffle, biased by -32; the high bit of each 3-bit quant lives in
+        // hmask, and a CLEAR bit subtracts 4 (not sets it).
+        GgmlType::Q3_K => {
+            for (b, y) in out.chunks_exact_mut(256).enumerate() {
+                let blk = &src[b * 110..b * 110 + 110];
+                let d_all = f16_bits_at(blk, 108);
+                let scales = q3k_scales(&blk[96..108]);
+                for (i, o) in y.iter_mut().enumerate() {
+                    let (nh, r) = (i >> 7, i & 127);
+                    let (j, w) = (r >> 5, r & 31);
+                    let (half, l) = (w >> 4, w & 15);
+                    let dl = d_all * (scales[nh * 8 + j * 2 + half] as i32 - 32) as f32;
+                    let q = ((blk[32 + nh * 32 + half * 16 + l] >> (2 * j)) & 3) as i32;
+                    let m = 1u8 << (nh * 4 + j);
+                    let hi = if blk[half * 16 + l] & m != 0 { 0 } else { 4 };
+                    *o = dl * (q - hi) as f32;
                 }
             }
         }
@@ -440,6 +505,74 @@ mod gguf_seam_tests {
         assert!(y[1..16].iter().chain(&y[17..]).all(|&v| v == 0.0));
     }
 
+    /// Q2_K by hand. d=0.5 at byte 80, dmin=0.25 at 82, scales[0]=0x21 so the
+    /// first 16-element group has scale 1 and min 2; qs[0]=3 so element 0's
+    /// 2-bit quant is 3. Everything else zero.
+    ///   y[0]  = 0.5*1*3 - 0.25*2 = 1.0
+    ///   y[1]  = 0.5*1*0 - 0.25*2 = -0.5   (same group, zero quant)
+    ///   y[16] = scales[1]=0 -> scale 0, min 0 -> 0.0
+    #[test]
+    fn q2_k_hand_vector() {
+        let mut blk = vec![0u8; 84];
+        blk[0] = 0x21;
+        blk[16] = 3;
+        blk[80..82].copy_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
+        blk[82..84].copy_from_slice(&half::f16::from_f32(0.25).to_bits().to_le_bytes());
+        let mut y = vec![0f32; 256];
+        dequant_row_ref(GgmlType::Q2_K, &blk, &mut y);
+        assert_eq!(y[0], 1.0);
+        assert_eq!(y[1], -0.5);
+        assert_eq!(y[16], 0.0);
+        assert_eq!(GgmlType::Q2_K.blk_bytes(), 84);
+    }
+
+    /// Q3_K by hand. All 12 scale bytes zero, so every unpacked scale is 0 and
+    /// the -32 bias makes dl = d*(0-32) = -16 with d=0.5. A hmask bit that is
+    /// CLEAR subtracts 4 — the inverted sense is the easy thing to get backwards.
+    ///   y[0]   qs[0]=1, hmask bit set   -> -16 * (1 - 0) = -16
+    ///   y[1]   qs[1]=0, hmask bit clear -> -16 * (0 - 4) = 64
+    ///   y[128] second half, m = 1<<4, hmask[0]=1 so bit clear -> 64
+    #[test]
+    fn q3_k_hand_vector() {
+        let mut blk = vec![0u8; 110];
+        blk[0] = 1; // hmask[0], bit for (nh=0, j=0)
+        blk[32] = 1; // qs[0]
+        blk[108..110].copy_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
+        let mut y = vec![0f32; 256];
+        dequant_row_ref(GgmlType::Q3_K, &blk, &mut y);
+        assert_eq!(y[0], -16.0);
+        assert_eq!(y[1], 64.0);
+        assert_eq!(y[128], 64.0);
+        assert_eq!(GgmlType::Q3_K.blk_bytes(), 110);
+    }
+
+    /// The aux shuffle is the classic silent-rot spot for Q3_K, so pin it on a
+    /// pattern where every lane differs: low nibbles come from bytes 0..7, the
+    /// top two bits of each from byte 8..11's 2-bit fields, shifted up by 4.
+    #[test]
+    fn q3_k_scale_unpack_matches_ggml_shuffle() {
+        let p: Vec<u8> = (0u8..12).map(|i| i.wrapping_mul(17)).collect();
+        let got = q3k_scales(&p);
+        // Recomputed straight from the C: aux[0..1] keep low nibbles of words
+        // 0,1; aux[2..3] take their high nibbles; word 2 donates 2 bits each.
+        let w = |i: usize| u32::from_le_bytes([p[4 * i], p[4 * i + 1], p[4 * i + 2], p[4 * i + 3]]);
+        let (k1, k2) = (0x0303_0303u32, 0x0f0f_0f0fu32);
+        let (a0, a1, t) = (w(0), w(1), w(2));
+        let want = [
+            (a0 & k2) | (((t >> 0) & k1) << 4),
+            (a1 & k2) | (((t >> 2) & k1) << 4),
+            ((a0 >> 4) & k2) | (((t >> 4) & k1) << 4),
+            ((a1 >> 4) & k2) | (((t >> 6) & k1) << 4),
+        ];
+        let mut flat = [0u8; 16];
+        for (i, a) in want.iter().enumerate() {
+            flat[4 * i..4 * i + 4].copy_from_slice(&a.to_le_bytes());
+        }
+        assert_eq!(got, flat);
+        // Every scale is a 6-bit value, so nothing may exceed 63.
+        assert!(got.iter().all(|&v| v < 64), "6-bit scales only: {got:?}");
+    }
+
     #[test]
     fn q5_0_hand_vector() {
         // d=0.5; qh = 0x00010001 (bit 0 and bit 16 set); qs[0]=0x21:
@@ -546,7 +679,9 @@ mod gguf_seam_tests {
     #[test]
     fn from_gguf_names_the_unsupported_type() {
         assert_eq!(GgmlType::from_gguf(12).unwrap(), GgmlType::Q4_K);
-        assert_eq!(GgmlType::from_gguf(10).unwrap_err(), "Q2_K");
+        assert_eq!(GgmlType::from_gguf(10).unwrap(), GgmlType::Q2_K);
+        assert_eq!(GgmlType::from_gguf(11).unwrap(), GgmlType::Q3_K);
+        assert_eq!(GgmlType::from_gguf(19).unwrap_err(), "IQ1_S");
         assert_eq!(GgmlType::from_gguf(23).unwrap_err(), "IQ4_XS");
     }
 }

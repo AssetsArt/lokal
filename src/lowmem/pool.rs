@@ -610,6 +610,8 @@ mod quant_oracle {
         Q6K = 5,
         Q5K = 6,
         Q5_0 = 7,
+        Q2K = 8,
+        Q3K = 9,
     }
 
     impl QType {
@@ -620,6 +622,8 @@ mod quant_oracle {
             match self {
                 QType::Q8_0 => G::Q8_0,
                 QType::Q4_0 => G::Q4_0,
+                QType::Q2K => G::Q2_K,
+                QType::Q3K => G::Q3_K,
                 QType::Q4K => G::Q4_K,
                 QType::Q6K => G::Q6_K,
                 QType::Q5K => G::Q5_K,
@@ -630,7 +634,7 @@ mod quant_oracle {
         fn blk_elems(self) -> usize {
             match self {
                 QType::Q8_0 | QType::Q4_0 | QType::Q5_0 => 32,
-                QType::Q4K | QType::Q6K | QType::Q5K => 256,
+                QType::Q4K | QType::Q6K | QType::Q5K | QType::Q2K | QType::Q3K => 256,
             }
         }
         fn blk_bytes(self) -> usize {
@@ -641,6 +645,8 @@ mod quant_oracle {
                 QType::Q4K => 144,
                 QType::Q6K => 210,
                 QType::Q5K => 176,
+                QType::Q2K => 84,
+                QType::Q3K => 110,
             }
         }
     }
@@ -670,6 +676,67 @@ mod quant_oracle {
         assert_eq!(src.len(), out.len() / be * bb);
         for (blk, y) in src.chunks_exact(bb).zip(out.chunks_exact_mut(be)) {
             match ty {
+                // Q2_K and Q3_K, written in ggml's SEQUENTIAL loop order
+                // (n, j, l writing forward) rather than the seam's per-element
+                // index decomposition. Two different readings of the same C: if
+                // they agree the reading is right, which one reference alone
+                // can never tell you.
+                QType::Q2K => {
+                    let d = f16_at(&blk[80..]);
+                    let dmin = f16_at(&blk[82..]);
+                    let mut o = 0usize;
+                    let mut is = 0usize;
+                    for n in 0..2 {
+                        let q = &blk[16 + n * 32..16 + n * 32 + 32];
+                        for j in 0..4 {
+                            for half in 0..2 {
+                                let sc = blk[is];
+                                is += 1;
+                                let dl = d * (sc & 0xF) as f32;
+                                let ml = dmin * (sc >> 4) as f32;
+                                for l in 0..16 {
+                                    let v = (q[half * 16 + l] >> (2 * j)) & 3;
+                                    y[o] = dl * v as f32 - ml;
+                                    o += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                QType::Q3K => {
+                    let d_all = f16_at(&blk[108..]);
+                    // Same 12->16 six-bit unpack, but read one index at a time
+                    // instead of ggml's four-word shuffle.
+                    let sc_at = |k: usize| -> u8 {
+                        let (g, m) = (k / 4, k % 4);
+                        let lo = if g < 2 {
+                            blk[96 + 4 * g + m] & 0xF
+                        } else {
+                            (blk[96 + 4 * (g - 2) + m] >> 4) & 0xF
+                        };
+                        let hi = (blk[96 + 8 + m] >> (2 * g)) & 3;
+                        lo | (hi << 4)
+                    };
+                    let mut o = 0usize;
+                    let mut is = 0usize;
+                    let mut m: u8 = 1;
+                    for n in 0..2 {
+                        let q = &blk[32 + n * 32..32 + n * 32 + 32];
+                        for j in 0..4 {
+                            for half in 0..2 {
+                                let dl = d_all * (sc_at(is) as i32 - 32) as f32;
+                                is += 1;
+                                for l in 0..16 {
+                                    let v = ((q[half * 16 + l] >> (2 * j)) & 3) as i32;
+                                    let hi = if blk[half * 16 + l] & m != 0 { 0 } else { 4 };
+                                    y[o] = dl * (v - hi) as f32;
+                                    o += 1;
+                                }
+                            }
+                            m <<= 1;
+                        }
+                    }
+                }
                 QType::Q8_0 => {
                     let d = f16_at(blk);
                     for j in 0..32 {
@@ -811,6 +878,12 @@ mod quant_oracle {
                                 b[2..4].copy_from_slice(&scale_bytes[3 - variant + 1]);
                             }
                             QType::Q6K => b[208..210].copy_from_slice(&sb),
+                            // Q2_K's d/dmin sit at the END of the block, not the start.
+                            QType::Q2K => {
+                                b[80..82].copy_from_slice(&sb);
+                                b[82..84].copy_from_slice(&scale_bytes[3 - variant + 1]);
+                            }
+                            QType::Q3K => b[108..110].copy_from_slice(&sb),
                         }
                         if variant == 3 {
                             // max-magnitude quants under the max scale
@@ -824,6 +897,15 @@ mod quant_oracle {
                                 }
                                 QType::Q5K => {
                                     b[4..176].fill(0xFF); // scales, high bits, nibbles
+                                }
+                                QType::Q2K => {
+                                    b[0..16].fill(0xFF);  // every scale AND min maxed
+                                    b[16..80].fill(0xFF); // every 2-bit quant = 3
+                                }
+                                QType::Q3K => {
+                                    b[0..32].fill(0x00);  // hmask CLEAR: the -4 path everywhere
+                                    b[32..96].fill(0xFF); // quants all 3
+                                    b[96..108].fill(0xFF); // scales all 63 -> +31 after bias
                                 }
                                 QType::Q6K => {
                                     b[0..192].fill(0xFF);
@@ -851,7 +933,16 @@ mod quant_oracle {
             .new_library_with_source(&gpu::shader_source(128), &opts)
             .expect("kernels.metal compiles");
 
-        for ty in [QType::Q8_0, QType::Q4_0, QType::Q5_0, QType::Q4K, QType::Q6K, QType::Q5K] {
+        for ty in [
+            QType::Q8_0,
+            QType::Q4_0,
+            QType::Q5_0,
+            QType::Q4K,
+            QType::Q6K,
+            QType::Q5K,
+            QType::Q2K,
+            QType::Q3K,
+        ] {
             let (n_blocks, n_rows) = (8usize, 3usize);
             let cols = n_blocks * ty.blk_elems();
             let row_bytes = n_blocks * ty.blk_bytes();
