@@ -224,6 +224,10 @@ pub(crate) struct Pipes {
     pub delta_gates: ComputePipelineState,
     pub l2norm_rows: ComputePipelineState,
     pub gated_output_norm: ComputePipelineState,
+    /// qwen35's joint Q+gate projection, de-interleaved.
+    pub split_q_gate: ComputePipelineState,
+    /// attn_out · sigmoid(gate), pre-wo.
+    pub attn_out_gate: ComputePipelineState,
 }
 
 /// The matvec family specialized with LM_W_BF16: weight buffers are RAW bf16
@@ -917,6 +921,8 @@ impl LowMemEngine {
             delta_gates: pipe("delta_gates")?,
             l2norm_rows: pipe("l2norm_rows")?,
             gated_output_norm: pipe("gated_output_norm")?,
+            split_q_gate: pipe("split_q_gate")?,
+            attn_out_gate: pipe("attn_out_gate")?,
         };
         let direct = DirectPipes {
             matvec: qtype_pipe("matvec", 1)?,

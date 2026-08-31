@@ -3690,3 +3690,37 @@ kernel void delta_gates(
     g[gid] = a[gid] * sp;
     beta[gid] = 1.0f / (1.0f + exp(-beta_in[gid]));
 }
+
+struct QGSplitParams {
+    uint head_dim;
+    uint n_heads;
+    uint n_rows;
+};
+
+/// De-interleave qwen35's joint Q+gate projection into two compact tensors.
+///
+/// The projection emits [q(head_dim) | gate(head_dim)] PER HEAD, so a row is
+/// h0_q h0_gate h1_q h1_gate ... (llama.cpp qwen35.cpp:273-296 builds exactly
+/// these two strided views). Splitting once here means qk-norm, RoPE and
+/// attention all keep operating on an ordinary compact [rows][heads][head_dim]
+/// tensor instead of every one of them learning a stride — and the gate comes
+/// out in the shape attn_out_gate already expects.
+kernel void split_q_gate(
+    device const float *src [[buffer(0)]],  // [rows][heads][2*head_dim]
+    device float *q [[buffer(1)]],          // [rows][heads][head_dim]
+    device float *gate [[buffer(2)]],       // [rows][heads][head_dim]
+    constant QGSplitParams &p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint per_row = p.n_heads * p.head_dim;
+    if (gid >= p.n_rows * per_row) {
+        return;
+    }
+    uint row = gid / per_row;
+    uint rem = gid - row * per_row;
+    uint h = rem / p.head_dim;
+    uint i = rem - h * p.head_dim;
+    ulong base = (ulong)row * per_row * 2 + (ulong)h * 2 * p.head_dim;
+    q[gid] = src[base + i];
+    gate[gid] = src[base + p.head_dim + i];
+}

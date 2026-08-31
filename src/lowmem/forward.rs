@@ -114,6 +114,12 @@ pub(super) struct LowMemSession<'a> {
     /// qwen35 only: the deltanet block's working buffers. `None` on every other
     /// architecture, so nothing else pays for them.
     ds: Option<DeltaScratch>,
+    /// qwen35 only: the joint Q+gate projection de-interleaved. Two compact
+    /// [rows][heads][head_dim] tensors, so qk-norm, RoPE and attention keep
+    /// seeing an ordinary Q and never learn the interleaved stride. Separate
+    /// buffers rather than an in-place compaction because compacting in place
+    /// races: head h's destination overlaps head h+1's source.
+    qg: Option<(Buffer, Buffer)>,
     /// Pool counters as they stood when prefill finished, so the drop line can
     /// report decode's staging on its own. Decode is where residency is proved:
     /// prefill always stages the model once, decode must stage nothing.
@@ -166,12 +172,25 @@ impl<'a> LowMemSession<'a> {
         let cap = e.win.cap;
         let chunk = gpu::PREFILL_CHUNK.min(max_seq);
         let (h, kvd) = (cfg.hidden_size, e.dims.kv_dim);
+        let recurrent = |l: usize| {
+            e.q35_layout.as_ref().is_some_and(|q| q.is_recurrent.get(l).copied().unwrap_or(false))
+        };
         Self {
+            // KV EXISTS ONLY ON THE FULL-ATTENTION LAYERS. On qwen35 that is 6 of
+            // 24 (one in full_attention_interval); the gated-deltanet blocks
+            // carry recurrent state instead and never touch a cache. Allocating
+            // all 24 would blow the budget line D computed by 4x on the KV term
+            // while nothing ever read three quarters of it.
+            //
+            // The slot is KEPT (a one-element stub) rather than the vector
+            // compacted, so `self.k_cache[l]` still means layer l everywhere and
+            // no call site needs a second index that could drift out of step
+            // with lane D's is_recurrent map — which is the source of truth.
             k_cache: (0..cfg.num_hidden_layers)
-                .map(|_| gpu::f16_empty_buffer(d, cap * kvd))
+                .map(|l| gpu::f16_empty_buffer(d, if recurrent(l) { 1 } else { cap * kvd }))
                 .collect(),
             v_cache: (0..cfg.num_hidden_layers)
-                .map(|_| gpu::f16_empty_buffer(d, cap * kvd))
+                .map(|l| gpu::f16_empty_buffer(d, if recurrent(l) { 1 } else { cap * kvd }))
                 .collect(),
             x: gpu::f32_buffer(d, chunk * h),
             xn: gpu::f32_buffer(d, chunk * h),
@@ -199,6 +218,9 @@ impl<'a> LowMemSession<'a> {
                 .as_ref()
                 .map(|l| crate::gpu::metal::Qwen35States::new(d, l)),
             ds: e.delta_dims().map(|dd| DeltaScratch::new(d, dd, chunk)),
+            qg: (e.dims.q_proj_dim != e.dims.q_dim).then(|| {
+                (gpu::f32_buffer(d, chunk * e.dims.q_dim), gpu::f32_buffer(d, chunk * e.dims.q_dim))
+            }),
             partials: gpu::f32_buffer(
                 d,
                 cfg.num_attention_heads * (cap / gpu::ATTN_SPLIT) * (e.dims.head_dim + 2),
@@ -566,6 +588,40 @@ impl<'a> LowMemSession<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// De-interleave the joint Q+gate projection, returning the buffer the
+    /// attention path should treat as Q. On every architecture without a joint
+    /// projection this is a no-op that hands back `self.q` unchanged.
+    fn enc_split_qg(&self, enc: &ComputeCommandEncoderRef, n: usize) -> &Buffer {
+        let Some((q, gate)) = &self.qg else { return &self.q };
+        let e = self.e;
+        let (hd, heads) = (e.dims.head_dim, e.cfg.num_attention_heads);
+        #[repr(C)]
+        struct P {
+            head_dim: u32,
+            n_heads: u32,
+            n_rows: u32,
+        }
+        enc.set_compute_pipeline_state(&e.pipes.split_q_gate);
+        enc.set_buffer(0, Some(&self.q), 0);
+        enc.set_buffer(1, Some(q), 0);
+        enc.set_buffer(2, Some(gate), 0);
+        set_bytes(enc, 3, &P { head_dim: hd as u32, n_heads: heads as u32, n_rows: n as u32 });
+        gpu::dispatch_grid(enc, n * heads * hd);
+        q
+    }
+
+    /// qwen35's attention output gate: attn · sigmoid(gate), applied AFTER
+    /// attention and BEFORE wo (qwen35.cpp:327-331). A no-op elsewhere.
+    fn enc_apply_qgate(&self, enc: &ComputeCommandEncoderRef, n: usize) {
+        let Some((_, gate)) = &self.qg else { return };
+        let e = self.e;
+        enc.set_compute_pipeline_state(&e.pipes.attn_out_gate);
+        enc.set_buffer(0, Some(&self.att), 0);
+        enc.set_buffer(1, Some(gate), 0);
+        set_bytes(enc, 2, &((n * e.dims.q_dim) as u32));
+        gpu::dispatch_grid(enc, n * e.dims.q_dim);
+    }
+
     /// qwen35's linear block, prefill form: the four projections, the deltanet
     /// chain token by token, then the output projection and the residual add.
     /// Mirrors what the attention half does around it, so the caller's shared
@@ -633,13 +689,16 @@ impl<'a> LowMemSession<'a> {
 
         // Attention half.
         self.enc_matmul_paged(enc, pool, &fa.q, &self.xn, &self.q, n, 0, self.e.dims.q_proj_dim);
+        // qwen35 projects Q and the output gate together, interleaved per head.
+        // De-interleave once here so everything downstream sees an ordinary Q.
+        let qbuf = self.enc_split_qg(enc, n);
         self.enc_matmul_paged(enc, pool, &fa.k, &self.xn, &self.kvs, n, 0, kvd);
         self.enc_matmul_paged(enc, pool, &fa.v, &self.xn, &self.kvs, n, v_base, kvd);
         // qwen3 normalizes every head of q and k before RoPE. q is f32 in its
         // own buffer; k is still in the f32 staging half, which is why this
         // lands BEFORE the f32_to_f16 spans below rather than after.
         if let (Some(qn), Some(kn)) = (&fa.q_norm, &fa.k_norm) {
-            self.enc_rmsnorm_dim(enc, &self.q, 0, qn, n * cfg.num_attention_heads, hd);
+            self.enc_rmsnorm_dim(enc, qbuf, 0, qn, n * cfg.num_attention_heads, hd);
             self.enc_rmsnorm_dim(enc, &self.kvs, 0, kn, n * cfg.num_key_value_heads, hd);
         }
         // RoPE q as one launch, then per destination span: convert the fresh
@@ -654,7 +713,7 @@ impl<'a> LowMemSession<'a> {
                 rot_dim: rot as u32,
             };
             enc.set_compute_pipeline_state(&e.pipes.rope);
-            enc.set_buffer(0, Some(&self.q), 0);
+            enc.set_buffer(0, Some(qbuf), 0);
             set_bytes(enc, 1, &p);
             gpu::dispatch_grid(enc, n * cfg.num_attention_heads * rot / 2);
         }
@@ -686,7 +745,7 @@ impl<'a> LowMemSession<'a> {
         };
         if hd == gpu::FLASH_HEAD_DIM {
             enc.set_compute_pipeline_state(&e.pipes.attention_flash);
-            enc.set_buffer(0, Some(&self.q), 0);
+            enc.set_buffer(0, Some(qbuf), 0);
             enc.set_buffer(1, Some(&self.k_cache[l]), 0);
             enc.set_buffer(2, Some(&self.v_cache[l]), 0);
             enc.set_buffer(3, Some(&self.att), 0);
@@ -702,7 +761,7 @@ impl<'a> LowMemSession<'a> {
             );
         } else {
             enc.set_compute_pipeline_state(&e.pipes.attention_fallback);
-            enc.set_buffer(0, Some(&self.q), 0);
+            enc.set_buffer(0, Some(qbuf), 0);
             enc.set_buffer(1, Some(&self.k_cache[l]), 0);
             enc.set_buffer(2, Some(&self.v_cache[l]), 0);
             enc.set_buffer(3, Some(&self.scores), 0);
@@ -713,6 +772,7 @@ impl<'a> LowMemSession<'a> {
                 MTLSize::new(256, 1, 1),
             );
         }
+        self.enc_apply_qgate(enc, n);
         self.enc_matmul_paged(enc, pool, &fa.o, &self.att, &self.xb, n, 0, h);
         self.enc_elem(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
     }
@@ -767,10 +827,11 @@ impl<'a> LowMemSession<'a> {
         let kv_byte_off = (e.win.slot_of(pos) * e.dims.kv_dim * 2) as u64;
 
         self.enc_matvec_bound(enc, Fam::Mv, &fa.q, pq, &self.xn, &self.q, 0, 4);
+        let qbuf = self.enc_split_qg(enc, 1);
         self.enc_matvec_bound(enc, Fam::MvH, &fa.k, pk, &self.xn, &self.k_cache[l], kv_byte_off, 2);
         self.enc_matvec_bound(enc, Fam::MvH, &fa.v, pv, &self.xn, &self.v_cache[l], kv_byte_off, 2);
         if let (Some(qn), Some(kn)) = (&fa.q_norm, &fa.k_norm) {
-            self.enc_rmsnorm_dim(enc, &self.q, 0, qn, cfg.num_attention_heads, hd);
+            self.enc_rmsnorm_dim(enc, qbuf, 0, qn, cfg.num_attention_heads, hd);
             self.enc_rmsnorm_h(enc, &self.k_cache[l], kv_byte_off, kn, cfg.num_key_value_heads, hd);
         }
         {
@@ -782,7 +843,7 @@ impl<'a> LowMemSession<'a> {
                 theta: cfg.rope_theta,
             };
             enc.set_compute_pipeline_state(&e.pipes.rope_qk_decode);
-            enc.set_buffer(0, Some(&self.q), 0);
+            enc.set_buffer(0, Some(qbuf), 0);
             enc.set_buffer(1, Some(&self.k_cache[l]), kv_byte_off);
             set_bytes(enc, 2, &p);
             gpu::dispatch_grid(enc, (cfg.num_attention_heads + cfg.num_key_value_heads) * hd / 2);
@@ -798,7 +859,7 @@ impl<'a> LowMemSession<'a> {
             };
             let (grid_x, tg_mem) = e.gqa;
             enc.set_compute_pipeline_state(&e.pipes.attn_dec_partial);
-            enc.set_buffer(0, Some(&self.q), 0);
+            enc.set_buffer(0, Some(qbuf), 0);
             enc.set_buffer(1, Some(&self.k_cache[l]), 0);
             enc.set_buffer(2, Some(&self.v_cache[l]), 0);
             enc.set_buffer(3, Some(&self.partials), 0);
@@ -819,6 +880,7 @@ impl<'a> LowMemSession<'a> {
                 MTLSize::new(hd as u64, 1, 1),
             );
         }
+        self.enc_apply_qgate(enc, 1);
         self.enc_matvec_bound(enc, Fam::MvA, &fa.o, po, &self.att, &self.x, 0, 4);
     }
 
