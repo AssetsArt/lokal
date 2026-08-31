@@ -185,6 +185,9 @@ impl GgufFile {
         // Tensor infos: name, n_dims (u32), ne[] (u64 each, fastest first),
         // ggml type (u32), offset (u64, relative to the data section).
         let mut raw = Vec::with_capacity(n_tensors);
+        // type name -> (tensor count, first tensor seen with it)
+        let mut unsupported: std::collections::BTreeMap<&'static str, (usize, String)> =
+            std::collections::BTreeMap::new();
         for _ in 0..n_tensors {
             let name = rd.str()?;
             let n_dims = rd.u32()? as usize;
@@ -197,14 +200,19 @@ impl GgufFile {
             }
             let ty_id = rd.u32()?;
             let offset = rd.u64()? as usize;
-            let ty = GgmlType::from_gguf(ty_id).map_err(|tyname| {
-                // With Q5_0 in the set (ruling daa86b0f), Q4_K_M is a safe
-                // recommendation again — small models' mixed files load.
-                format!(
-                    "tensor {name} is {tyname}, which lokal does not run — \
-                     re-download the model as Q4_K_M or Q8_0"
-                )
-            })?;
+            // Unsupported types are COLLECTED, not raised here. Failing on the
+            // first offending tensor made the human discover this file's
+            // requirements one re-download at a time; a mixed low-bit file can
+            // carry four or five types at once, and they should learn all of
+            // them from one run. Every field for this tensor has been read, so
+            // skipping it keeps the reader in sync.
+            let ty = match GgmlType::from_gguf(ty_id) {
+                Ok(t) => t,
+                Err(tyname) => {
+                    unsupported.entry(tyname).or_insert((0usize, name)).0 += 1;
+                    continue;
+                }
+            };
             if ne[0] % ty.blk_elems() != 0 {
                 return Err(format!(
                     "tensor {name}: row length {} is not a whole number of {:?} blocks",
@@ -213,6 +221,28 @@ impl GgufFile {
                 .into());
             }
             raw.push((name, ne, ty, offset));
+        }
+
+        // One sweep, one verdict: every type this build cannot run, with how
+        // many tensors carry it and one example each, so a mixed low-bit file
+        // costs the reader one run rather than one re-download per type.
+        if !unsupported.is_empty() {
+            let n_types = unsupported.len();
+            let total: usize = unsupported.values().map(|(c, _)| c).sum();
+            let detail = unsupported
+                .iter()
+                .map(|(ty, (count, example))| {
+                    let plural = if *count == 1 { "tensor" } else { "tensors" };
+                    format!("{ty} ({count} {plural}, e.g. {example})")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "this checkpoint uses {n_types} quantization type(s) lokal does not run, \
+                 across {total} of {n_tensors} tensors: {detail}. \
+                 Re-download the model as Q4_K_M or Q8_0."
+            )
+            .into());
         }
 
         // Data section starts at the next alignment boundary after the header;
@@ -677,6 +707,70 @@ mod tests {
             .join(format!("lokal-gguf-test-{}-{label}.gguf", std::process::id()));
         std::fs::write(&p, bytes).unwrap();
         p
+    }
+
+    /// A file mixing several types this build cannot run, the shape unsloth's
+    /// UD 1-2-bit checkpoints actually have: 3 unsupported types across 4 of 5
+    /// tensors, plus one that IS supported.
+    fn mixed_lowbit_gguf() -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&5u64.to_le_bytes()); // n_tensors
+        b.extend_from_slice(&1u64.to_le_bytes()); // n_kv
+        let put_str = |b: &mut Vec<u8>, s: &str| {
+            b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            b.extend_from_slice(s.as_bytes());
+        };
+        put_str(&mut b, "general.architecture");
+        b.extend_from_slice(&8u32.to_le_bytes());
+        put_str(&mut b, "llama");
+        // (name, ggml type id): Q2_K=10, IQ1_S=19, IQ2_XXS=16, Q8_0=8
+        for (name, ty) in [
+            ("token_embd.weight", 10u32),
+            ("blk.0.ffn_down.weight", 10),
+            ("blk.0.attn_q.weight", 19),
+            ("blk.1.attn_q.weight", 16),
+            ("output_norm.weight", 8),
+        ] {
+            put_str(&mut b, name);
+            b.extend_from_slice(&2u32.to_le_bytes());
+            b.extend_from_slice(&256u64.to_le_bytes());
+            b.extend_from_slice(&2u64.to_le_bytes());
+            b.extend_from_slice(&ty.to_le_bytes());
+            b.extend_from_slice(&0u64.to_le_bytes());
+        }
+        while b.len() % 32 != 0 {
+            b.push(0);
+        }
+        b.extend_from_slice(&vec![0u8; 4096]);
+        b
+    }
+
+    /// D3: ONE sweep, ONE verdict. The old behaviour raised on the first
+    /// offending tensor, so a mixed file taught its requirements one
+    /// re-download at a time — the human hit exactly that.
+    #[test]
+    fn refusal_names_every_unsupported_type_at_once() {
+        let p = write_tmp("lowbit", &mixed_lowbit_gguf());
+        let err = match GgufFile::open(&p) {
+            Ok(_) => panic!("a file of unsupported types must not open"),
+            Err(e) => e.to_string(),
+        };
+        std::fs::remove_file(p).ok();
+        for want in ["Q2_K", "IQ1_S", "IQ2_XXS"] {
+            assert!(err.contains(want), "error should name {want}: {err}");
+        }
+        // Counts and an example per type, so the reader can see which tensors.
+        assert!(err.contains("Q2_K (2 tensors, e.g. token_embd.weight)"), "{err}");
+        assert!(err.contains("IQ1_S (1 tensor, e.g."), "singular reads right: {err}");
+        assert!(err.contains("3 quantization type(s)"), "{err}");
+        assert!(err.contains("across 4 of 5 tensors"), "{err}");
+        // The supported type must not be listed as a PROBLEM — it may still
+        // appear in the recommendation, which is the point of the sentence.
+        let listed = err.split(". Re-download").next().unwrap();
+        assert!(!listed.contains("Q8_0"), "Q8_0 is supported and must not be listed: {err}");
+        assert!(err.contains("Re-download the model as Q4_K_M or Q8_0"), "{err}");
     }
 
     #[test]
