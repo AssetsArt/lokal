@@ -590,7 +590,7 @@ mod quant_oracle {
     //! adversarial blocks. Until gguf-loader's seam freezes, `ref_dequant_row`
     //! below is a placeholder implementing exact ggml semantics (transcribed
     //! from ggml-quants.c); at seam-freeze it is swapped for
-    //! `manifest::dequant_row_ref` in one line — and because this shim was
+    //! `gguf::dequant_row_ref` in one line — and because this shim was
     //! derived independently of Tiësto's, the swap also cross-checks HIS
     //! implementation against ggml.
     //!
@@ -626,8 +626,8 @@ mod quant_oracle {
     impl QType {
         /// The seam's enum for the same encoding. The oracle keys types by the
         /// kernel's LM_W_QTYPE selector, which is deliberately not ggml's id.
-        fn seam(self) -> super::super::manifest::GgmlType {
-            use super::super::manifest::GgmlType as G;
+        fn seam(self) -> crate::gguf::GgmlType {
+            use crate::gguf::GgmlType as G;
             match self {
                 QType::Q8_0 => G::Q8_0,
                 QType::Q4_0 => G::Q4_0,
@@ -688,7 +688,7 @@ mod quant_oracle {
         IQ1S_GRID as IQ1S, IQ2S_GRID as IQ2S, IQ2XS_GRID as IQ2XS, IQ2XXS_GRID as IQ2XXS, IQ3S_GRID as IQ3S,
         IQ3XXS_GRID as IQ3XXS, KMASK_IQ2XS as KMASK, KSIGNS_IQ2XS as KSIGNS,
     };
-    use super::super::manifest::KVALUES_IQ4NL as KV;
+    use crate::gguf::dequant::KVALUES_IQ4NL as KV;
 
     fn f16_at(b: &[u8]) -> f32 {
         f16::from_le_bytes([b[0], b[1]]).to_f32()
@@ -1239,7 +1239,7 @@ mod quant_oracle {
             let mut shim = vec![0f32; n_rows * cols];
             for r in 0..n_rows {
                 let row = &src[r * row_bytes..(r + 1) * row_bytes];
-                super::super::manifest::dequant_row_ref(
+                crate::gguf::dequant_row_ref(
                     ty.seam(),
                     row,
                     &mut want[r * cols..(r + 1) * cols],

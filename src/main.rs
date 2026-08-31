@@ -14,8 +14,10 @@
 mod ane;
 mod batch;
 mod config;
+mod deltanet_ref;
 mod engine;
 mod generate;
+mod gguf;
 mod gpu;
 mod hub;
 #[cfg(target_os = "macos")]
@@ -314,6 +316,44 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+
+/// The GGUF rows of the backend×format matrix (docs/gguf-design.md), as one
+/// pure function: None = this backend runs this GGUF; Some(reason) = the
+/// refusal the CLI prints VERBATIM — the tests assert on the same string, so
+/// the printed reason and the tested reason cannot drift. The qwen35 check
+/// outranks the hybrid check on purpose: naming the missing mechanism beats
+/// naming the missing export.
+fn gguf_backend_refusal(
+    backend: &str,
+    arch: &str,
+    m: Option<&gguf::Qwen35Meta>,
+) -> Option<String> {
+    if arch == "qwen35" {
+        let m = m.expect("qwen35 meta is parsed before routing");
+        if backend != "lowmem" {
+            return Some(format!(
+                "qwen35 runs on -b lowmem only ({} trunk layers: {} full-attention + {} \
+                 gated-deltanet{}); -b {} has no gated-deltanet path yet",
+                m.trunk_layers,
+                m.is_recurrent.iter().filter(|r| !**r).count(),
+                m.is_recurrent.iter().filter(|r| **r).count(),
+                if m.nextn_layers > 0 { ", +1 MTP block (skipped)" } else { "" },
+                backend,
+            ));
+        }
+        return None;
+    }
+    if matches!(backend, "hybrid" | "ane") {
+        return Some(
+            "the hybrid backend cannot run a GGUF: its ANE prefill graphs are \
+             exported from safetensors (tools/export_prefill.py) — use -b metal, or the \
+             model's safetensors checkpoint"
+                .into(),
+        );
+    }
+    None
+}
+
 /// Build (config, tokenizer, engine) from a GGUF checkpoint (revised D6):
 /// cpu/metal dequantize everything to f32 when the EXPANDED weights fit RAM,
 /// lowmem is the bounded path, hybrid cannot run GGUF at all.
@@ -323,8 +363,7 @@ fn gguf_setup(
     path: &std::path::Path,
     win: Option<(usize, usize)>,
 ) -> Result<(config::ModelConfig, tokenizers::Tokenizer, Option<Box<dyn engine::Engine>>)> {
-    use lowmem::gguf;
-    let g = gguf::GgufFile::open(path)?;
+        let g = gguf::GgufFile::open(path)?;
     // LOKAL_GGUF_INFO=1: dump the tensor table and exit — the cross-check gate
     // diffs this against `llama-cli --verbose` (parser-only, so it works even
     // on files whose tokenizer lokal refuses).
@@ -350,7 +389,7 @@ fn gguf_setup(
     // than attempted, because both would otherwise produce plausible wrong
     // output instead of an error:
     //   * a checkpoint whose rope sections are not the text-broadcast layout
-    //     the MRoPE equivalence was verified on (see Qwen35Layout::
+    //     the MRoPE equivalence was verified on (see Qwen35Meta::
     //     check_rope_sections — this engine has no sectioned rope kernel and
     //     would silently rotate a vision variant as if it were text);
     //   * every backend except lowmem, which is where the gated-deltanet block
@@ -358,19 +397,10 @@ fn gguf_setup(
     //     no linear-block path yet, so it would fail on a tensor name at best
     //     and mis-read the joint Q+gate projection at worst.
     if arch.arch == "qwen35" {
-        let m = lowmem::gguf::qwen35_meta(&g)?;
-        crate::gpu::metal::Qwen35Layout::check_rope_sections(&m)?;
-        if args.backend != "lowmem" {
-            return Err(format!(
-                "qwen35 runs on -b lowmem only ({} trunk layers: {} full-attention + {} \
-                 gated-deltanet{}); -b {} has no gated-deltanet path yet",
-                m.trunk_layers,
-                m.is_recurrent.iter().filter(|r| !**r).count(),
-                m.is_recurrent.iter().filter(|r| **r).count(),
-                if m.nextn_layers > 0 { ", +1 MTP block (skipped)" } else { "" },
-                args.backend,
-            )
-            .into());
+        let m = gguf::qwen35_meta(&g)?;
+        m.check_rope_sections()?;
+        if let Some(reason) = gguf_backend_refusal(&args.backend, "qwen35", Some(&m)) {
+            return Err(reason.into());
         }
         eprintln!(
             "qwen35: {} trunk layers — {} full-attention + {} gated-deltanet{}",
@@ -383,10 +413,9 @@ fn gguf_setup(
     let engine = match args.backend.as_str() {
         "lowmem" => Some(engine::create_lowmem(path, cfg.clone(), &args.lowmem)?),
         "hybrid" | "ane" => {
-            return Err("the hybrid backend cannot run a GGUF: its ANE prefill graphs are \
-                 exported from safetensors (tools/export_prefill.py) — use -b metal, or the \
-                 model's safetensors checkpoint"
-                .into())
+            let reason = gguf_backend_refusal(&args.backend, &arch.arch, None)
+                .expect("the matrix refuses hybrid+GGUF for every non-qwen35 arch");
+            return Err(reason.into());
         }
         "metal" if std::env::var_os("LOKAL_GGUF_EXPAND").is_none() => {
             // Quant execution (D1): weights stay in their on-disk encoding and
@@ -446,4 +475,54 @@ fn gguf_setup(
         }
     };
     Ok((cfg, tokenizer, engine))
+}
+
+#[cfg(test)]
+mod matrix_tests {
+    use super::*;
+
+    fn meta_2b() -> gguf::Qwen35Meta {
+        gguf::Qwen35Meta {
+            trunk_layers: 24,
+            nextn_layers: 1,
+            full_attention_interval: 4,
+            is_recurrent: (0..24).map(|i| (i + 1) % 4 != 0).collect(),
+            d_conv: 4,
+            d_state: 128,
+            n_group: 8,
+            dt_rank: 16,
+            d_inner: 2048,
+            rope_sections: [11, 11, 10, 0],
+            conv_state_elems: 3 * (2048 + 2 * 8 * 128),
+            delta_state_elems: 128 * 2048,
+        }
+    }
+
+    /// The GGUF rows of the backend×format matrix (docs/gguf-design.md): every
+    /// refusal cell by name, every running cell None — the strings here are
+    /// the strings the CLI prints, because both read gguf_backend_refusal.
+    #[test]
+    fn gguf_matrix_refusals_by_name() {
+        let m = meta_2b();
+        // qwen35 column: lowmem runs, everything else names the missing mechanism.
+        assert_eq!(gguf_backend_refusal("lowmem", "qwen35", Some(&m)), None);
+        for b in ["cpu", "metal", "hybrid", "ane"] {
+            let r = gguf_backend_refusal(b, "qwen35", Some(&m)).expect(b);
+            assert!(r.contains("qwen35 runs on -b lowmem only"), "{r}");
+            assert!(r.contains("24 trunk layers: 6 full-attention + 18"), "{r}");
+            assert!(r.contains(&format!("-b {b} has no gated-deltanet path")), "{r}");
+        }
+        // dense rows: cpu/metal/lowmem run; hybrid (and its ane alias) refuses
+        // with the export reason, never a silent fallback.
+        for arch in ["llama", "qwen2", "qwen3"] {
+            for b in ["cpu", "metal", "lowmem"] {
+                assert_eq!(gguf_backend_refusal(b, arch, None), None, "{b}/{arch}");
+            }
+            for b in ["hybrid", "ane"] {
+                let r = gguf_backend_refusal(b, arch, None).expect(b);
+                assert!(r.contains("cannot run a GGUF"), "{r}");
+                assert!(r.contains("exported from safetensors"), "{r}");
+            }
+        }
+    }
 }

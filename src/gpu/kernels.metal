@@ -3406,7 +3406,7 @@ kernel void add_inplace(
     }
 }
 
-// ---- qwen35 (gated deltanet) ----
+// ---- gated deltanet (qwen35 is the first user) ----
 //
 // Kernels for the hybrid recurrent blocks. Semantics are transcribed from
 // llama.cpp's CPU path, not from the fused upstream Metal kernel, so that the

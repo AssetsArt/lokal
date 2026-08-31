@@ -110,7 +110,7 @@ pub(super) struct LowMemSession<'a> {
     /// read-modify-written once per step by the kernel lane. ONE live state
     /// per sequence — no rollback in v1: a session serves exactly one prompt
     /// and serve builds a fresh session per request, so nothing ever rewinds.
-    q35: Option<crate::gpu::metal::Qwen35States>,
+    deltanet: Option<crate::gpu::metal::DeltaNetStates>,
     /// qwen35 only: the deltanet block's working buffers. `None` on every other
     /// architecture, so nothing else pays for them.
     ds: Option<DeltaScratch>,
@@ -150,7 +150,7 @@ struct DeltaScratch {
 }
 
 impl DeltaScratch {
-    fn new(d: &metal::Device, dims: crate::lowmem::qwen35_ref::DeltaDims, chunk: usize) -> Self {
+    fn new(d: &metal::Device, dims: crate::deltanet_ref::DeltaDims, chunk: usize) -> Self {
         let (c, inner, hv) = (dims.conv_channels(), dims.d_inner(), dims.n_v_heads);
         Self {
             qkv: gpu::f32_buffer(d, chunk * c),
@@ -173,7 +173,7 @@ impl<'a> LowMemSession<'a> {
         let chunk = gpu::PREFILL_CHUNK.min(max_seq);
         let (h, kvd) = (cfg.hidden_size, e.dims.kv_dim);
         let recurrent = |l: usize| {
-            e.q35_layout.as_ref().is_some_and(|q| q.is_recurrent.get(l).copied().unwrap_or(false))
+            e.deltanet_layout.as_ref().is_some_and(|q| q.is_recurrent.get(l).copied().unwrap_or(false))
         };
         Self {
             // KV EXISTS ONLY ON THE FULL-ATTENTION LAYERS. On qwen35 that is 6 of
@@ -213,10 +213,10 @@ impl<'a> LowMemSession<'a> {
             } else {
                 gpu::f32_buffer(d, chunk * cfg.num_attention_heads * cap)
             },
-            q35: e
-                .q35_layout
+            deltanet: e
+                .deltanet_layout
                 .as_ref()
-                .map(|l| crate::gpu::metal::Qwen35States::new(d, l)),
+                .map(|l| crate::gpu::metal::DeltaNetStates::new(d, l)),
             ds: e.delta_dims().map(|dd| DeltaScratch::new(d, dd, chunk)),
             qg: (e.dims.q_proj_dim != e.dims.q_dim).then(|| {
                 (gpu::f32_buffer(d, chunk * e.dims.q_dim), gpu::f32_buffer(d, chunk * e.dims.q_dim))
@@ -510,7 +510,7 @@ impl<'a> LowMemSession<'a> {
         let e = self.e;
         let d = e.delta_dims().expect("deltanet dims on a qwen35 checkpoint");
         let ds = self.ds.as_ref().expect("deltanet scratch on a qwen35 session");
-        let st = self.q35.as_ref().expect("qwen35 states").layers[l]
+        let st = self.deltanet.as_ref().expect("qwen35 states").layers[l]
             .as_ref()
             .expect("every linear layer owns recurrent state");
         let eps = e.cfg.rms_norm_eps;

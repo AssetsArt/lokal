@@ -157,12 +157,22 @@ not otherwise fit, not to go faster. Every type is verified bit-for-bit against
 ggml's reference dequantization, so what you get is exactly what llama.cpp
 would compute from the same file — including its quality loss.
 
-The hybrid backend cannot run GGUF (its ANE graphs are exported
-from safetensors). GGUF architectures: `llama`, `qwen2`, `qwen3`
-(per-head q/k norm runs on cpu, metal, and lowmem — hybrid's ANE graphs
-cannot compute it), and `qwen35` — Qwen3.5's gated-deltanet hybrid, which
-**runs on `-b lowmem` only** (the Metal engine has no linear-block path yet;
-`-b metal` refuses it by name). Byte-level BPE tokenizers.
+GGUF architectures: `llama`, `qwen2`, `qwen3` (per-head q/k norm on cpu,
+metal, and lowmem), and `qwen35` — Qwen3.5's gated-deltanet hybrid. Byte-level
+BPE tokenizers. What runs where — the backend × format matrix, every cell
+proven by running it (see docs/gguf-design.md); an unsupported cell refuses
+with a one-line reason, never a silent fallback:
+
+| backend | safetensors (dense) | GGUF (dense) | GGUF (qwen35 deltanet) |
+|---|---|---|---|
+| `cpu` | runs | runs (f32 expansion) | refuses by name |
+| `metal` | runs | runs (direct quant execution) | refuses by name |
+| `lowmem` | runs | runs (budgeted streaming) | **runs** |
+| `hybrid` (alias `ane`) | runs | refuses (ANE prefill graphs are exported from safetensors) | refuses by name |
+
+Safetensors Qwen3/Qwen3.5 checkpoints are refused by name on every backend
+(explicit head_dim + qk-norm do not fit the Llama walk) — run the GGUF.
+qwen35 stays `-b lowmem` only until the metal-deltanet lane lands.
 
 ## Backends
 
