@@ -198,9 +198,13 @@ impl GgufFile {
             let ty_id = rd.u32()?;
             let offset = rd.u64()? as usize;
             let ty = GgmlType::from_gguf(ty_id).map_err(|tyname| {
+                // Q4_K_M is NOT a safe recommendation here: llama.cpp's
+                // quantizer mixes Q5_0 into small models' Q4_K_M files
+                // (challenge daa86b0f) — Q8_0 is the one label that holds.
                 format!(
                     "tensor {name} is {tyname}, which lokal does not run — \
-                     re-download the model as Q4_K_M or Q8_0"
+                     re-download the model as Q8_0 (small models' Q4_K_M files \
+                     can carry {tyname} tensors)"
                 )
             })?;
             if ne[0] % ty.blk_elems() != 0 {
@@ -441,7 +445,10 @@ pub fn hf_name(gguf: &str) -> Option<String> {
 // ---------- the fits-in-RAM loader (revised D6) ----------
 
 /// Every tensor's f32 expansion, summed — the honest RAM cost of running a
-/// quantized file on the full-materialization backends.
+/// quantized file on the full-materialization backends. Note this can
+/// legitimately exceed the safetensors twin's params x 4: some GGUFs
+/// materialize a duplicate output.weight where safetensors ties it to the
+/// embedding table, and we materialize what the file carries.
 pub fn expanded_f32_bytes(g: &GgufFile) -> usize {
     g.infos.iter().map(|i| i.dims.iter().product::<usize>() * 4).sum()
 }
