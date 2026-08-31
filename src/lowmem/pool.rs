@@ -616,6 +616,9 @@ mod quant_oracle {
         IQ4XS = 11,
         IQ3XXS = 12,
         IQ3S = 13,
+        IQ2XXS = 14,
+        IQ2XS = 15,
+        IQ2S = 16,
     }
 
     impl QType {
@@ -626,6 +629,9 @@ mod quant_oracle {
             match self {
                 QType::Q8_0 => G::Q8_0,
                 QType::Q4_0 => G::Q4_0,
+                QType::IQ2XXS => G::IQ2_XXS,
+                QType::IQ2XS => G::IQ2_XS,
+                QType::IQ2S => G::IQ2_S,
                 QType::IQ3XXS => G::IQ3_XXS,
                 QType::IQ3S => G::IQ3_S,
                 QType::IQ4NL => G::IQ4_NL,
@@ -643,7 +649,8 @@ mod quant_oracle {
             match self {
                 QType::Q8_0 | QType::Q4_0 | QType::Q5_0 | QType::IQ4NL => 32,
                 QType::Q4K | QType::Q6K | QType::Q5K | QType::Q2K | QType::Q3K
-                | QType::IQ4XS | QType::IQ3XXS | QType::IQ3S => 256,
+                | QType::IQ4XS | QType::IQ3XXS | QType::IQ3S
+                | QType::IQ2XXS | QType::IQ2XS | QType::IQ2S => 256,
             }
         }
         fn blk_bytes(self) -> usize {
@@ -660,6 +667,9 @@ mod quant_oracle {
                 QType::IQ4XS => 136,
                 QType::IQ3XXS => 98,
                 QType::IQ3S => 110,
+                QType::IQ2XXS => 66,
+                QType::IQ2XS => 74,
+                QType::IQ2S => 82,
             }
         }
     }
@@ -668,7 +678,8 @@ mod quant_oracle {
     /// impossible by construction — the shim's independence is in how it
     /// INDEXES the table, not in retyping 16 magic numbers.
     use super::super::iq_grids::{
-        IQ3S_GRID as IQ3S, IQ3XXS_GRID as IQ3XXS, KMASK_IQ2XS as KMASK, KSIGNS_IQ2XS as KSIGNS,
+        IQ2S_GRID as IQ2S, IQ2XS_GRID as IQ2XS, IQ2XXS_GRID as IQ2XXS, IQ3S_GRID as IQ3S,
+        IQ3XXS_GRID as IQ3XXS, KMASK_IQ2XS as KMASK, KSIGNS_IQ2XS as KSIGNS,
     };
     use super::super::manifest::KVALUES_IQ4NL as KV;
 
@@ -707,6 +718,71 @@ mod quant_oracle {
                 // The IQ3 pair in ggml's sequential order: walk ib32 groups
                 // forward writing y as it goes, rather than the seam's
                 // per-element index decomposition.
+                // The IQ2 trio in ggml's sequential order.
+                QType::IQ2XXS => {
+                    let d = f16_at(blk);
+                    let mut o = 0usize;
+                    for ib32 in 0..8 {
+                        let base = 2 + 8 * ib32;
+                        let a1 = u32::from_le_bytes([
+                            blk[base + 4], blk[base + 5], blk[base + 6], blk[base + 7],
+                        ]);
+                        let db = d * (0.5 + (a1 >> 28) as f32) * 0.25;
+                        for l in 0..4 {
+                            let signs = KSIGNS[((a1 >> (7 * l)) & 127) as usize];
+                            let g = IQ2XXS[blk[base + l] as usize];
+                            for j in 0..8 {
+                                let sg = if signs & KMASK[j] != 0 { -1.0 } else { 1.0 };
+                                y[o + j] = db * ((g >> (8 * j)) & 0xFF) as f32 * sg;
+                            }
+                            o += 8;
+                        }
+                    }
+                }
+                QType::IQ2XS => {
+                    let d = f16_at(blk);
+                    let mut o = 0usize;
+                    for ib32 in 0..8 {
+                        let sc = blk[66 + ib32];
+                        let dbs = [
+                            d * (0.5 + (sc & 0xF) as f32) * 0.25,
+                            d * (0.5 + (sc >> 4) as f32) * 0.25,
+                        ];
+                        for l in 0..4 {
+                            let off = 2 + 2 * (4 * ib32 + l);
+                            let qv = u16::from_le_bytes([blk[off], blk[off + 1]]);
+                            let signs = KSIGNS[(qv >> 9) as usize];
+                            let g = IQ2XS[(qv & 511) as usize];
+                            for j in 0..8 {
+                                let sg = if signs & KMASK[j] != 0 { -1.0 } else { 1.0 };
+                                y[o + j] = dbs[l / 2] * ((g >> (8 * j)) & 0xFF) as f32 * sg;
+                            }
+                            o += 8;
+                        }
+                    }
+                }
+                QType::IQ2S => {
+                    let d = f16_at(blk);
+                    let mut o = 0usize;
+                    for ib32 in 0..8 {
+                        let sc = blk[74 + ib32];
+                        let dbs = [
+                            d * (0.5 + (sc & 0xF) as f32) * 0.25,
+                            d * (0.5 + (sc >> 4) as f32) * 0.25,
+                        ];
+                        let qh = blk[66 + ib32] as usize;
+                        for l in 0..4 {
+                            let gi = blk[2 + 4 * ib32 + l] as usize | ((qh << (8 - 2 * l)) & 0x300);
+                            let g = IQ2S[gi];
+                            let signs = blk[2 + 32 + 4 * ib32 + l];
+                            for j in 0..8 {
+                                let sg = if signs & KMASK[j] != 0 { -1.0 } else { 1.0 };
+                                y[o + j] = dbs[l / 2] * ((g >> (8 * j)) & 0xFF) as f32 * sg;
+                            }
+                            o += 8;
+                        }
+                    }
+                }
                 QType::IQ3XXS => {
                     let d = f16_at(blk);
                     let mut o = 0usize;
@@ -979,7 +1055,8 @@ mod quant_oracle {
                                 b[82..84].copy_from_slice(&scale_bytes[3 - variant + 1]);
                             }
                             QType::Q3K => b[108..110].copy_from_slice(&sb),
-                            QType::IQ4NL | QType::IQ4XS | QType::IQ3XXS | QType::IQ3S => {
+                            QType::IQ4NL | QType::IQ4XS | QType::IQ3XXS | QType::IQ3S
+                            | QType::IQ2XXS | QType::IQ2XS | QType::IQ2S => {
                                 b[0..2].copy_from_slice(&sb)
                             }
                         }
@@ -1000,6 +1077,19 @@ mod quant_oracle {
                                 // is a valid but singular grid entry); what the
                                 // max case drives is scales and signs.
                                 QType::IQ3XXS => b[66..98].fill(0xFF),
+                                QType::IQ2XXS => {
+                                    // top nibble of each group's second u32 is
+                                    // the scale; leave grid indices random
+                                    for g in 0..8 {
+                                        b[2 + 8 * g + 7] = 0xFF;
+                                    }
+                                }
+                                QType::IQ2XS => b[66..74].fill(0xFF),
+                                QType::IQ2S => {
+                                    b[34..66].fill(0xFF);  // the SIGN half of qs
+                                    b[66..74].fill(0xFF);  // qh: both extra index bits
+                                    b[74..82].fill(0xFF);  // scales maxed
+                                }
                                 QType::IQ3S => {
                                     b[66..74].fill(0xFF);  // qh: ninth bit set everywhere
                                     b[74..106].fill(0xFF); // all signs negative
@@ -1058,6 +1148,9 @@ mod quant_oracle {
             QType::IQ4XS,
             QType::IQ3XXS,
             QType::IQ3S,
+            QType::IQ2XXS,
+            QType::IQ2XS,
+            QType::IQ2S,
         ] {
             let (n_blocks, n_rows) = (8usize, 3usize);
             let cols = n_blocks * ty.blk_elems();

@@ -673,6 +673,61 @@ constant int lm_kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
 };
 
+// IQ2_XXS: d | qs[32 u16] (66 B). Per 32-element group two u32: the first
+// four bytes are grid indices, the second holds a 4-bit scale on top and four
+// 7-bit sign selectors below.
+inline float lm_dequant_iq2_xxs(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 8) * 66;
+    float d = lm_f16_at(b);
+    uint i = col & 255;
+    uint ib32 = i >> 5, r = i & 31;
+    uint l = r >> 3, j = r & 7;
+    device const uchar *p = b + 2 + 8 * ib32;
+    uint a1 = (uint)p[4] | ((uint)p[5] << 8) | ((uint)p[6] << 16) | ((uint)p[7] << 24);
+    float db = d * (0.5f + (float)(a1 >> 28)) * 0.25f;
+    uchar signs = lm_ksigns_iq2xs[(a1 >> (7 * l)) & 127];
+    ulong g = (lm_iq2xxs_grid[p[l]] >> (8 * j)) & 0xFF;
+    float sgn = (signs & lm_kmask_iq2xs[j]) ? -1.0f : 1.0f;
+    return db * (float)g * sgn;
+}
+
+// IQ2_XS: d | qs[32 u16] | scales[8] (74 B). Each u16 splits into a 9-bit grid
+// index and a 7-bit sign selector.
+inline float lm_dequant_iq2_xs(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 8) * 74;
+    float d = lm_f16_at(b);
+    uint i = col & 255;
+    uint ib32 = i >> 5, r = i & 31;
+    uint l = r >> 3, j = r & 7;
+    uchar sc = b[66 + ib32];
+    uint nib = (l / 2 == 0) ? (uint)(sc & 0x0F) : (uint)(sc >> 4);
+    float db = d * (0.5f + (float)nib) * 0.25f;
+    uint off = 2 + 2 * (4 * ib32 + l);
+    uint qv = (uint)b[off] | ((uint)b[off + 1] << 8);
+    uchar signs = lm_ksigns_iq2xs[qv >> 9];
+    ulong g = (lm_iq2xs_grid[qv & 511] >> (8 * j)) & 0xFF;
+    float sgn = (signs & lm_kmask_iq2xs[j]) ? -1.0f : 1.0f;
+    return db * (float)g * sgn;
+}
+
+// IQ2_S: d | qs[64] | qh[8] | scales[8] (82 B). The SIGNS live in the SECOND
+// HALF of qs (ggml takes signs = qs + QK_K/8), not in a field of their own.
+inline float lm_dequant_iq2_s(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 8) * 82;
+    float d = lm_f16_at(b);
+    uint i = col & 255;
+    uint ib32 = i >> 5, r = i & 31;
+    uint l = r >> 3, j = r & 7;
+    uchar sc = b[74 + ib32];
+    uint nib = (l / 2 == 0) ? (uint)(sc & 0x0F) : (uint)(sc >> 4);
+    float db = d * (0.5f + (float)nib) * 0.25f;
+    uint qh = b[66 + ib32];
+    uint gi = (uint)b[2 + 4 * ib32 + l] | ((qh << (8 - 2 * l)) & 0x300);
+    ulong g = (lm_iq2s_grid[gi] >> (8 * j)) & 0xFF;
+    float sgn = (b[2 + 32 + 4 * ib32 + l] & lm_kmask_iq2xs[j]) ? -1.0f : 1.0f;
+    return db * (float)g * sgn;
+}
+
 // IQ3_XXS: d | qs[64 grid indices] | 8 u32 of packed scale+signs (98 B). Each
 // u32 carries a 4-bit scale in its top nibble and four 7-bit sign selectors.
 inline float lm_dequant_iq3_xxs(device const uchar *row, uint col) {
@@ -887,6 +942,70 @@ inline float lm_dot_run_q5_0(device const uchar *row, uint e0, device const floa
         s += (float)((int)((by >> 4) | xh) - 16) * x[e0 + j + 16];
     }
     return s * d;
+}
+
+inline float lm_dot_run_iq2_xxs(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 8) * 66;
+    float d = lm_f16_at(b);
+    device const uchar *p = b + 2 + 8 * ((e0 & 255) >> 5);
+    uint a1 = (uint)p[4] | ((uint)p[5] << 8) | ((uint)p[6] << 16) | ((uint)p[7] << 24);
+    float db = d * (0.5f + (float)(a1 >> 28)) * 0.25f;
+    float acc = 0.0f;
+    for (uint l = 0; l < 4; l++) {
+        uchar signs = lm_ksigns_iq2xs[(a1 >> (7 * l)) & 127];
+        ulong g = lm_iq2xxs_grid[p[l]];
+        for (uint j = 0; j < 8; j++) {
+            float sgn = (signs & lm_kmask_iq2xs[j]) ? -1.0f : 1.0f;
+            acc += (float)((g >> (8 * j)) & 0xFF) * sgn * x[e0 + l * 8 + j];
+        }
+    }
+    return db * acc;
+}
+
+inline float lm_dot_run_iq2_xs(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 8) * 74;
+    float d = lm_f16_at(b);
+    uint ib32 = (e0 & 255) >> 5;
+    uchar sc = b[66 + ib32];
+    float dlo = d * (0.5f + (float)(sc & 0x0F)) * 0.25f;
+    float dhi = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+    float acc = 0.0f;
+    for (uint l = 0; l < 4; l++) {
+        uint off = 2 + 2 * (4 * ib32 + l);
+        uint qv = (uint)b[off] | ((uint)b[off + 1] << 8);
+        uchar signs = lm_ksigns_iq2xs[qv >> 9];
+        ulong g = lm_iq2xs_grid[qv & 511];
+        float part = 0.0f;
+        for (uint j = 0; j < 8; j++) {
+            float sgn = (signs & lm_kmask_iq2xs[j]) ? -1.0f : 1.0f;
+            part += (float)((g >> (8 * j)) & 0xFF) * sgn * x[e0 + l * 8 + j];
+        }
+        acc += ((l / 2 == 0) ? dlo : dhi) * part;
+    }
+    return acc;
+}
+
+inline float lm_dot_run_iq2_s(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 8) * 82;
+    float d = lm_f16_at(b);
+    uint ib32 = (e0 & 255) >> 5;
+    uchar sc = b[74 + ib32];
+    float dlo = d * (0.5f + (float)(sc & 0x0F)) * 0.25f;
+    float dhi = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+    uint qh = b[66 + ib32];
+    float acc = 0.0f;
+    for (uint l = 0; l < 4; l++) {
+        uint gi = (uint)b[2 + 4 * ib32 + l] | ((qh << (8 - 2 * l)) & 0x300);
+        ulong g = lm_iq2s_grid[gi];
+        uchar signs = b[2 + 32 + 4 * ib32 + l];
+        float part = 0.0f;
+        for (uint j = 0; j < 8; j++) {
+            float sgn = (signs & lm_kmask_iq2xs[j]) ? -1.0f : 1.0f;
+            part += (float)((g >> (8 * j)) & 0xFF) * sgn * x[e0 + l * 8 + j];
+        }
+        acc += ((l / 2 == 0) ? dlo : dhi) * part;
+    }
+    return acc;
 }
 
 inline float lm_dot_run_iq3_xxs(device const uchar *row, uint e0, device const float *x) {
@@ -1104,6 +1223,9 @@ inline float lm_dot_run(device const uchar *row, uint e0, device const float *x)
         case 11: return lm_dot_run_iq4_xs(row, e0, x);
         case 12: return lm_dot_run_iq3_xxs(row, e0, x);
         case 13: return lm_dot_run_iq3_s(row, e0, x);
+        case 14: return lm_dot_run_iq2_xxs(row, e0, x);
+        case 15: return lm_dot_run_iq2_xs(row, e0, x);
+        case 16: return lm_dot_run_iq2_s(row, e0, x);
         default: return 0.0f;
     }
 }
@@ -1122,6 +1244,9 @@ inline float lm_dequant(device const uchar *row, uint col) {
         case 11: return lm_dequant_iq4_xs(row, col);
         case 12: return lm_dequant_iq3_xxs(row, col);
         case 13: return lm_dequant_iq3_s(row, col);
+        case 14: return lm_dequant_iq2_xxs(row, col);
+        case 15: return lm_dequant_iq2_xs(row, col);
+        case 16: return lm_dequant_iq2_s(row, col);
         default: return 0.0f;
     }
 }
@@ -1180,6 +1305,9 @@ inline ulong lm_row_bytes(uint in_dim) {
         case 11: return (ulong)(in_dim / 256) * 136; // IQ4_XS
         case 12: return (ulong)(in_dim / 256) * 98;  // IQ3_XXS
         case 13: return (ulong)(in_dim / 256) * 110; // IQ3_S
+        case 14: return (ulong)(in_dim / 256) * 66;  // IQ2_XXS
+        case 15: return (ulong)(in_dim / 256) * 74;  // IQ2_XS
+        case 16: return (ulong)(in_dim / 256) * 82;  // IQ2_S
         default: return 0; // unused for element-addressable types
     }
 }
