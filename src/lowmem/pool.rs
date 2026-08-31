@@ -14,11 +14,10 @@
 //! one opens. The epoch machinery for overlapped submission arrives with the
 //! per-layer pipeline phase.
 
-use super::manifest::WeightManifest;
+use super::{LowMemSource, SrcType};
 use half::f16;
 use metal::{Buffer, Device, MTLResourceOptions};
 use rayon::prelude::*;
-use safetensors::Dtype;
 use std::collections::HashMap;
 
 /// Upper bound on one page's staged f16 bytes — row blocks are sized to it.
@@ -30,6 +29,10 @@ pub(super) struct PagedTensor {
     pub name: String,
     pub in_dim: usize,
     pub out_dim: usize,
+    /// What the CHECKPOINT holds. Quant pages stay quantized in the pool — the
+    /// 4x residency is the whole point — so this drives page sizing, the
+    /// pipeline selector, and whether a page can be bound direct.
+    pub ty: SrcType,
     pub rows_per_page: usize,
     pub n_pages: usize,
     /// Eagerly-resident f16 bias; encode binds the engine's shared zero buffer
@@ -39,27 +42,47 @@ pub(super) struct PagedTensor {
 
 impl PagedTensor {
     pub fn new(
-        mf: &WeightManifest,
+        src: &LowMemSource,
         id: u32,
         name: String,
         in_dim: usize,
         out_dim: usize,
         bias: Option<Buffer>,
     ) -> crate::Result<Self> {
-        let m = mf.meta(&name)?;
-        if m.shape != [out_dim, in_dim] {
+        let shape = src.shape(&name)?;
+        if shape != [out_dim, in_dim] {
             return Err(format!(
-                "{name} has shape {:?} but the config implies [{out_dim}, {in_dim}]",
-                m.shape
+                "{name} has shape {shape:?} but the config implies [{out_dim}, {in_dim}]"
             )
             .into());
         }
-        let rows_per_page = (PAGE_BYTES / (in_dim * 2)).clamp(1, out_dim);
+        let ty = src.src_type(&name)?;
+        if let SrcType::Quant(t) = ty {
+            // A row must be a whole number of blocks: rows are the unit the pool
+            // pages and the kernels index, and a block straddling two rows has
+            // no meaning. K-quants block by 256, and every real checkpoint's
+            // in_dim is a multiple of it — name the tensor when one is not.
+            let be = t.blk_elems();
+            if in_dim % be != 0 {
+                return Err(format!(
+                    "{name}: {t:?} blocks {be} elements but the row is {in_dim} wide \
+                     ({in_dim} % {be} != 0) — this checkpoint cannot be paged"
+                )
+                .into());
+            }
+            if ty.qtype() == u32::MAX {
+                return Err(format!("{name}: {t:?} has no GPU dequant path yet").into());
+            }
+        }
+        // Pages are sized in CHECKPOINT bytes, so a Q4 page carries ~4x the rows
+        // a bf16 page does at the same byte cost — which is the residency win.
+        let rows_per_page = (PAGE_BYTES / ty.row_bytes(in_dim).max(1)).clamp(1, out_dim);
         Ok(Self {
             id,
             name,
             in_dim,
             out_dim,
+            ty,
             rows_per_page,
             n_pages: out_dim.div_ceil(rows_per_page),
             bias,
@@ -72,9 +95,10 @@ impl PagedTensor {
         (r0, self.rows_per_page.min(self.out_dim - r0))
     }
 
-    /// Staged f16 bytes of one block.
+    /// Pool bytes of one block. Quant blocks are stored raw, so this is the
+    /// checkpoint's own row size, not an f16 expansion.
     fn block_bytes(&self, block: usize) -> usize {
-        self.block_rows(block).1 * self.in_dim * 2
+        self.block_rows(block).1 * self.ty.row_bytes(self.in_dim)
     }
 }
 
@@ -218,7 +242,7 @@ impl WeightPool {
     /// only eviction candidates belong to in-flight command buffers.
     pub fn make_resident(
         &mut self,
-        mf: &WeightManifest,
+        src: &LowMemSource,
         pages: &[(&PagedTensor, usize)],
         epoch: u64,
     ) -> crate::Result<Admit> {
@@ -279,7 +303,7 @@ impl WeightPool {
                     .device
                     .new_buffer(need as u64, MTLResourceOptions::StorageModeShared),
             };
-            self.stage(mf, t, *b, &buf)?;
+            self.stage(src, t, *b, &buf)?;
             self.stats.stage_ins += 1;
             self.stats.stage_bytes += need as u64;
             self.clock += 1;
@@ -303,7 +327,7 @@ impl WeightPool {
     /// path (with eviction) when the span has no usable GPU view.
     pub fn bind_decode(
         &mut self,
-        mf: &WeightManifest,
+        src: &LowMemSource,
         t: &PagedTensor,
         block: usize,
         epoch: u64,
@@ -318,10 +342,10 @@ impl WeightPool {
         }
         let need = t.block_bytes(block);
         if self.used + self.free_bytes + need > self.budget
-            && mf.meta(&t.name)?.dtype == Dtype::BF16 // the direct pipes read raw bf16
+            && t.ty == SrcType::BF16 // the direct pipes read raw bf16
         {
             let (r0, rows) = t.block_rows(block);
-            if let Some((view, off)) = mf.gpu_span(&t.name, r0, r0 + rows)? {
+            if let Some((view, off)) = src.gpu_span(&t.name, r0, r0 + rows)? {
                 if off % 4 == 0 {
                     self.stats.direct_binds += 1;
                     self.stats.direct_bytes += need as u64;
@@ -329,7 +353,7 @@ impl WeightPool {
                 }
             }
         }
-        match self.make_resident(mf, &[(t, block)], epoch)? {
+        match self.make_resident(src, &[(t, block)], epoch)? {
             Admit::Ready => Ok(Ok(Bind::Pool(self.get(t, block).clone()))),
             Admit::NeedWait => Ok(Err(Admit::NeedWait)),
         }
@@ -379,36 +403,75 @@ impl WeightPool {
         }
     }
 
-    /// Read the block's rows from the mmap and convert into the buffer — the
+    /// Which checkpoint row holds output row `r`, undoing llama.cpp's q/k permute.
+/// The converter reshapes (n_head, 2, hd/2, cols) and swaps the middle axes, so
+/// output row h*hd + d*2 + p came from h*hd + p*(hd/2) + d. The mapping stays
+/// inside one head, and is its own inverse only when hd == 2.
+fn unpermuted_src_row(r: usize, head_dim: usize) -> usize {
+    let (h, rem) = (r / head_dim, r % head_dim);
+    let (d, p) = (rem / 2, rem % 2);
+    h * head_dim + p * (head_dim / 2) + d
+}
+
+/// Read the block's rows from the mmap and convert into the buffer — the
     /// ONLY place weight bytes are copied, and only ever one page's worth.
     fn stage(
         &mut self,
-        mf: &WeightManifest,
+        src: &LowMemSource,
         t: &PagedTensor,
         block: usize,
         dst: &Buffer,
     ) -> crate::Result<()> {
         let (r0, rows) = t.block_rows(block);
-        let (src, dtype) = mf.read_rows(&t.name, r0, r0 + rows)?;
+        // llama.cpp stores llama-arch q/k under a row permute that matches
+        // GGML's adjacent-pair RoPE; lokal rotates halves, so the permute is
+        // undone HERE, as the page materializes. It is a pure row reorder, so
+        // it works on quant blocks untouched — and it keeps the kernels clean,
+        // which is the point: a compensating shuffle inside dequant would make
+        // every future llama-arch GGUF silently wrong.
+        let gathered;
+        let bytes: &[u8] = match src.unpermute_head_dim(&t.name) {
+            Some(hd) => {
+                let rb = t.ty.row_bytes(t.in_dim);
+                let mut v = Vec::with_capacity(rows * rb);
+                for i in 0..rows {
+                    let sr = Self::unpermuted_src_row(r0 + i, hd);
+                    v.extend_from_slice(src.read_rows(&t.name, sr, sr + 1)?);
+                }
+                gathered = v;
+                &gathered
+            }
+            None => src.read_rows(&t.name, r0, r0 + rows)?,
+        };
         let dp = dst.contents() as *mut u16;
+        // Quantized pages are stored EXACTLY as the checkpoint holds them: the
+        // pool's whole reason to exist is that a Q4 model needs a quarter of the
+        // bytes, and dequantizing at stage time would hand all of it back.
+        if t.ty.is_quant() {
+            assert_eq!(bytes.len(), t.block_bytes(block), "quant page size mismatch");
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dp as *mut u8, bytes.len());
+            }
+            return Ok(());
+        }
         // The mmap slice can be unaligned (safetensors headers are arbitrary
         // lengths), so conversion walks byte pairs/quads — never typed pointers.
         // Rows convert in parallel: staging is the disk-side "CPU load" bar of
         // the overlap diagram, and a serial convert would cap it at ~2 GB/s.
         let out = unsafe { std::slice::from_raw_parts_mut(dp, rows * t.in_dim) };
-        let clipped = match dtype {
-            Dtype::F16 => {
+        let clipped = match t.ty {
+            SrcType::F16 => {
                 unsafe {
-                    std::ptr::copy_nonoverlapping(src.as_ptr(), dp as *mut u8, src.len());
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), dp as *mut u8, bytes.len());
                 }
                 false
             }
-            Dtype::BF16 => {
+            SrcType::BF16 => {
                 // The GPU stages the page itself, reading the checkpoint bytes
                 // through the mmap's no-copy view — zero CPU bytes moved. The
                 // CPU fallback (view missing or an unaligned span) converts in
                 // parallel like the F32 path.
-                if let Some((view, off)) = mf.gpu_span(&t.name, r0, r0 + rows)? {
+                if let Some((view, off)) = src.gpu_span(&t.name, r0, r0 + rows)? {
                     self.pending_convert.push(PendingConvert {
                         src: view.clone(),
                         src_off: off,
@@ -418,7 +481,7 @@ impl WeightPool {
                     false
                 } else {
                     out.par_chunks_mut(t.in_dim)
-                        .zip(src.par_chunks(t.in_dim * 2))
+                        .zip(bytes.par_chunks(t.in_dim * 2))
                         .map(|(d, s)| {
                             let mut c = false;
                             for (o, b) in d.iter_mut().zip(s.chunks_exact(2)) {
@@ -431,9 +494,9 @@ impl WeightPool {
                         .reduce(|| false, |a, b| a | b)
                 }
             }
-            Dtype::F32 => out
+            SrcType::F32 => out
                 .par_chunks_mut(t.in_dim)
-                .zip(src.par_chunks(t.in_dim * 4))
+                .zip(bytes.par_chunks(t.in_dim * 4))
                 .map(|(d, s)| {
                     let mut c = false;
                     for (o, b) in d.iter_mut().zip(s.chunks_exact(4)) {
@@ -444,7 +507,7 @@ impl WeightPool {
                     c
                 })
                 .reduce(|| false, |a, b| a | b),
-            other => return Err(format!("unsupported dtype {other:?} in {}", t.name).into()),
+            SrcType::Quant(_) => unreachable!("quant pages return above"),
         };
         if clipped && !self.overflow_warned {
             self.overflow_warned = true;

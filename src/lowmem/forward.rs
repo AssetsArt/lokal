@@ -11,12 +11,11 @@
 //!     keeping a vocab × hidden table resident.
 
 use super::pool::{Admit, Bind, PagedTensor, PendingConvert, PoolStats, WeightPool};
-use super::{LayerWeights, LowMemEngine};
+use super::{dequant_row_ref, LayerWeights, LowMemEngine, SrcType};
 use crate::engine::Session;
 use crate::gpu::metal as gpu;
 use half::{bf16, f16};
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, MTLSize};
-use safetensors::Dtype;
 
 // ---- kernel parameter structs: byte-exact mirrors of kernels.metal ----
 // (kernels.metal is the contract; the metal backend keeps its own copies.)
@@ -175,27 +174,32 @@ impl<'a> LowMemSession<'a> {
     fn embed_gather(&self, ids: &[u32]) -> crate::Result<()> {
         let h = self.e.cfg.hidden_size;
         let xp = self.x.contents() as *mut f32;
+        const EMBED: &str = "model.embed_tokens.weight";
+        let ty = self.e.source.src_type(EMBED)?;
         for (i, &id) in ids.iter().enumerate() {
-            let (row, dtype) =
-                self.e.manifest.read_rows("model.embed_tokens.weight", id as usize, id as usize + 1)?;
+            let row = self.e.source.read_rows(EMBED, id as usize, id as usize + 1)?;
             let dst = unsafe { std::slice::from_raw_parts_mut(xp.add(i * h), h) };
-            match dtype {
-                Dtype::F32 => {
+            match ty {
+                SrcType::F32 => {
                     for (o, b) in dst.iter_mut().zip(row.chunks_exact(4)) {
                         *o = f32::from_le_bytes(b.try_into().unwrap());
                     }
                 }
-                Dtype::BF16 => {
+                SrcType::BF16 => {
                     for (o, b) in dst.iter_mut().zip(row.chunks_exact(2)) {
                         *o = bf16::from_le_bytes([b[0], b[1]]).to_f32();
                     }
                 }
-                Dtype::F16 => {
+                SrcType::F16 => {
                     for (o, b) in dst.iter_mut().zip(row.chunks_exact(2)) {
                         *o = f16::from_le_bytes([b[0], b[1]]).to_f32();
                     }
                 }
-                other => return Err(format!("unsupported embed dtype {other:?}").into()),
+                // A quantized embedding table stays quantized on disk and is
+                // gathered a row at a time — 512 scattered rows per chunk never
+                // justified a resident vocab x hidden table, quantized or not,
+                // and the reference dequant is exact (D3).
+                SrcType::Quant(t) => dequant_row_ref(t, row, dst),
             }
         }
         Ok(())
@@ -585,10 +589,10 @@ impl<'a> LowMemSession<'a> {
 
         for (l, lw) in e.layers.iter().enumerate() {
             let (ep, plan) = if fused_decode {
-                let (ep, plan) = plan_decode(&mut pool, &e.manifest, lw, &mut inflight)?;
+                let (ep, plan) = plan_decode(&mut pool, &e.source, lw, &mut inflight)?;
                 (ep, Some(plan))
             } else {
-                (admit(&mut pool, &e.manifest, &layer_pages(lw), &mut inflight)?, None)
+                (admit(&mut pool, &e.source, &layer_pages(lw), &mut inflight)?, None)
             };
             let conv = pool.take_pending_converts();
             let cb = e.queue.new_command_buffer();
@@ -610,7 +614,7 @@ impl<'a> LowMemSession<'a> {
             // checkpoint directly — the vocab × hidden matrix never needs to
             // sit resident, staged, or grouped.
             let lm = &e.lm_head;
-            let (ep, binds) = plan_tensor(&mut pool, &e.manifest, lm, &mut inflight)?;
+            let (ep, binds) = plan_tensor(&mut pool, &e.source, lm, &mut inflight)?;
             let conv = pool.take_pending_converts();
             let cb = e.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
@@ -663,13 +667,13 @@ impl<'a> LowMemSession<'a> {
 /// GPU. Returns the epoch the caller's command buffer must retire under.
 fn admit(
     pool: &mut WeightPool,
-    mf: &super::manifest::WeightManifest,
+    src: &super::LowMemSource,
     pages: &[(&PagedTensor, usize)],
     inflight: &mut Vec<(metal::CommandBuffer, u64)>,
 ) -> crate::Result<u64> {
     let ep = pool.begin_cb();
     loop {
-        match pool.make_resident(mf, pages, ep)? {
+        match pool.make_resident(src, pages, ep)? {
             Admit::Ready => return Ok(ep),
             Admit::NeedWait => {
                 if inflight.is_empty() {
@@ -734,7 +738,7 @@ struct LayerPlan {
 /// command buffers when a staging admission needs room.
 fn plan_tensor(
     pool: &mut WeightPool,
-    mf: &super::manifest::WeightManifest,
+    src: &super::LowMemSource,
     t: &PagedTensor,
     inflight: &mut Vec<(metal::CommandBuffer, u64)>,
 ) -> crate::Result<(u64, Vec<Bind>)> {
@@ -742,7 +746,7 @@ fn plan_tensor(
     let mut binds = Vec::with_capacity(t.n_pages);
     let mut blk = 0;
     while blk < t.n_pages {
-        match pool.bind_decode(mf, t, blk, ep)? {
+        match pool.bind_decode(src, t, blk, ep)? {
             Ok(b) => {
                 binds.push(b);
                 blk += 1;
@@ -764,7 +768,7 @@ fn plan_tensor(
 /// The whole layer's decode plan under ONE epoch.
 fn plan_decode(
     pool: &mut WeightPool,
-    mf: &super::manifest::WeightManifest,
+    src: &super::LowMemSource,
     lw: &LayerWeights,
     inflight: &mut Vec<(metal::CommandBuffer, u64)>,
 ) -> crate::Result<(u64, LayerPlan)> {
@@ -773,7 +777,7 @@ fn plan_decode(
         let mut binds = Vec::with_capacity(t.n_pages);
         let mut blk = 0;
         while blk < t.n_pages {
-            match pool.bind_decode(mf, t, blk, ep)? {
+            match pool.bind_decode(src, t, blk, ep)? {
                 Ok(b) => {
                     binds.push(b);
                     blk += 1;

@@ -19,9 +19,11 @@ mod pool;
 use crate::config::ModelConfig;
 use crate::engine::{Engine, Session};
 use crate::gpu::metal as gpu;
-use manifest::WeightManifest;
+use manifest::{dequant_row_ref, GgmlType, WeightManifest};
 use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, FunctionConstantValues, MTLDataType};
 use pool::{PagedTensor, WeightPool, PAGE_BYTES};
+use safetensors::Dtype;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -159,9 +161,234 @@ pub(crate) struct LayerWeights {
     pub down: PagedTensor,
 }
 
+/// What a weight's elements are, across both checkpoint formats. Safetensors
+/// gives f32/f16/bf16; GGUF adds the quantized block types, whose rows are not
+/// element-addressable — a row is a whole number of blocks, and the pool holds
+/// those blocks RAW (dequantizing at stage time would forfeit the 4x residency
+/// that is this backend's reason to exist).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SrcType {
+    F32,
+    F16,
+    BF16,
+    Quant(GgmlType),
+}
+
+impl SrcType {
+    /// Bytes one row of `cols` elements occupies in the checkpoint.
+    pub fn row_bytes(self, cols: usize) -> usize {
+        match self {
+            SrcType::F32 => cols * 4,
+            SrcType::F16 | SrcType::BF16 => cols * 2,
+            SrcType::Quant(t) => t.row_bytes(cols),
+        }
+    }
+
+    pub fn is_quant(self) -> bool {
+        matches!(self, SrcType::Quant(_))
+    }
+
+    /// The LM_W_QTYPE function-constant selector this type builds pipelines
+    /// under. Kept beside row_bytes so the two never drift apart.
+    pub fn qtype(self) -> u32 {
+        match self {
+            SrcType::F32 | SrcType::F16 => 0,
+            SrcType::BF16 => 1,
+            SrcType::Quant(GgmlType::Q8_0) => 2,
+            SrcType::Quant(GgmlType::Q4_0) => 3,
+            SrcType::Quant(GgmlType::Q4_K) => 4,
+            SrcType::Quant(GgmlType::Q6_K) => 5,
+            SrcType::Quant(GgmlType::Q5_K) => 6,
+            // Q5_0 is selector 7 in the kernels already (95103e7); the seam
+            // enum gains the variant on task q5-0-seam, and this arm with it.
+            SrcType::Quant(_) => u32::MAX, // refused at PagedTensor::new
+        }
+    }
+}
+
+/// The checkpoint behind the pool. Safetensors and GGUF differ in how a row is
+/// found and what it holds, and in nothing else the pool cares about, so the
+/// difference is confined here rather than smeared through pool.rs.
+///
+/// This lives in lowmem's own module, not in the seam: manifest.rs belongs to
+/// the loader lane, and the abstraction the seam ruling named never landed
+/// (challenge on gguf-kernels). Both variants are built from public seam items.
+pub(crate) enum LowMemSource {
+    Safetensors(WeightManifest),
+    Gguf(Box<GgufSource>),
+}
+
+/// A GGUF file plus the HF-name index lowmem addresses tensors by. The rest of
+/// the backend speaks HF names (`model.layers.0.self_attn.q_proj.weight`); the
+/// file speaks `blk.0.attn_q.weight`.
+pub(crate) struct GgufSource {
+    file: gguf::GgufFile,
+    /// HF name -> the GGUF name that carries it.
+    by_hf: HashMap<String, String>,
+    arch: gguf::GgufArch,
+    n_params: usize,
+}
+
+impl LowMemSource {
+    pub fn open(path: &Path) -> crate::Result<Self> {
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
+            let file = gguf::GgufFile::open(path)?;
+            let (_, arch) = gguf::model_config(&file)?;
+            let mut by_hf = HashMap::new();
+            let mut n_params = 0;
+            for t in file.tensors() {
+                n_params += t.dims.iter().product::<usize>();
+                if let Some(hf) = gguf::hf_name(&t.name) {
+                    by_hf.insert(hf, t.name.clone());
+                }
+            }
+            Ok(LowMemSource::Gguf(Box::new(GgufSource { file, by_hf, arch, n_params })))
+        } else {
+            Ok(LowMemSource::Safetensors(WeightManifest::open(path)?))
+        }
+    }
+
+    pub fn make_gpu_views(&mut self, device: &Device) {
+        if let LowMemSource::Safetensors(mf) = self {
+            mf.make_gpu_views(device);
+        }
+        // GGUF direct-read views land with the streaming path; a None span
+        // simply routes staging through the CPU copy, which is correct either way.
+    }
+
+    pub fn n_tensors(&self) -> usize {
+        match self {
+            LowMemSource::Safetensors(mf) => mf.n_tensors(),
+            LowMemSource::Gguf(g) => g.file.n_tensors(),
+        }
+    }
+
+    pub fn n_params(&self) -> usize {
+        match self {
+            LowMemSource::Safetensors(mf) => mf.n_params,
+            LowMemSource::Gguf(g) => g.n_params,
+        }
+    }
+
+    pub fn is_gguf(&self) -> bool {
+        matches!(self, LowMemSource::Gguf(_))
+    }
+
+    /// qwen3-style per-head q/k norm, straight from the file's metadata.
+    pub fn qk_norm(&self) -> bool {
+        match self {
+            LowMemSource::Safetensors(mf) => mf.has("model.layers.0.self_attn.q_norm.weight"),
+            LowMemSource::Gguf(g) => g.arch.qk_norm,
+        }
+    }
+
+    pub fn has(&self, name: &str) -> bool {
+        match self {
+            LowMemSource::Safetensors(mf) => mf.has(name),
+            LowMemSource::Gguf(g) => g.by_hf.contains_key(name),
+        }
+    }
+
+    pub fn shape(&self, name: &str) -> crate::Result<Vec<usize>> {
+        match self {
+            LowMemSource::Safetensors(mf) => Ok(mf.meta(name)?.shape.clone()),
+            LowMemSource::Gguf(g) => Ok(g.tensor(name)?.dims.clone()),
+        }
+    }
+
+    pub fn src_type(&self, name: &str) -> crate::Result<SrcType> {
+        match self {
+            LowMemSource::Safetensors(mf) => Ok(match mf.meta(name)?.dtype {
+                Dtype::F32 => SrcType::F32,
+                Dtype::F16 => SrcType::F16,
+                Dtype::BF16 => SrcType::BF16,
+                other => return Err(format!("unsupported dtype {other:?} in {name}").into()),
+            }),
+            LowMemSource::Gguf(g) => Ok(match g.tensor(name)?.ty {
+                GgmlType::F32 => SrcType::F32,
+                GgmlType::F16 => SrcType::F16,
+                t => SrcType::Quant(t),
+            }),
+        }
+    }
+
+    /// Rows `r0..r1` as the checkpoint stores them. Rows are contiguous in both
+    /// formats, so this is a slice, never a copy.
+    pub fn read_rows(&self, name: &str, r0: usize, r1: usize) -> crate::Result<&[u8]> {
+        match self {
+            LowMemSource::Safetensors(mf) => Ok(mf.read_rows(name, r0, r1)?.0),
+            LowMemSource::Gguf(g) => {
+                let t = g.tensor(name)?;
+                let cols = *t.dims.last().ok_or("gguf tensor has no dims")?;
+                let rb = t.ty.row_bytes(cols);
+                let rows = t.dims[0];
+                if r1 > rows || r0 >= r1 {
+                    return Err(format!("read_rows({name}, {r0}..{r1}): tensor has {rows} rows").into());
+                }
+                Ok(&t.data[r0 * rb..r1 * rb])
+            }
+        }
+    }
+
+    pub fn gpu_span(
+        &self,
+        name: &str,
+        r0: usize,
+        r1: usize,
+    ) -> crate::Result<Option<(&Buffer, usize)>> {
+        match self {
+            LowMemSource::Safetensors(mf) => mf.gpu_span(name, r0, r1),
+            LowMemSource::Gguf(_) => Ok(None),
+        }
+    }
+
+    /// Whole tensor as f32 — for the eagerly-resident small tensors (norms,
+    /// biases) and the embedding gather. llama-arch q/k come back UNPERMUTED:
+    /// llama.cpp stores them rotated for GGML's adjacent-pair RoPE, and lokal
+    /// rotates halves (kernels.metal rope pairs head[i] with head[i+half_dim]).
+    pub fn read_f32(&self, name: &str) -> crate::Result<Vec<f32>> {
+        match self {
+            LowMemSource::Safetensors(mf) => mf.read_f32(name),
+            LowMemSource::Gguf(g) => {
+                let t = g.tensor(name)?;
+                let cols = *t.dims.last().unwrap_or(&1);
+                let rows = t.dims.iter().product::<usize>() / cols.max(1);
+                let mut out = vec![0f32; rows * cols];
+                for r in 0..rows {
+                    let rb = t.ty.row_bytes(cols);
+                    dequant_row_ref(t.ty, &t.data[r * rb..(r + 1) * rb], &mut out[r * cols..(r + 1) * cols]);
+                }
+                if let Some(hd) = self.unpermute_head_dim(name) {
+                    gguf::unpermute_llama_qk(&mut out, rows, cols, hd);
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Some(head_dim) when this tensor is a llama-arch GGUF q/k that must have
+    /// llama.cpp's RoPE permute undone as it materializes. None everywhere else
+    /// — safetensors is never permuted, and neither is any non-q/k tensor.
+    pub fn unpermute_head_dim(&self, name: &str) -> Option<usize> {
+        let LowMemSource::Gguf(g) = self else { return None };
+        if g.arch.arch != "llama" {
+            return None;
+        }
+        (name.ends_with("self_attn.q_proj.weight") || name.ends_with("self_attn.k_proj.weight"))
+            .then_some(g.arch.head_dim)
+    }
+}
+
+impl GgufSource {
+    fn tensor(&self, hf: &str) -> crate::Result<manifest::GgufTensor<'_>> {
+        let gg = self.by_hf.get(hf).ok_or_else(|| format!("{hf}: not in this GGUF"))?;
+        self.file.tensor(gg)
+    }
+}
+
 pub struct LowMemEngine {
     cfg: ModelConfig,
-    manifest: WeightManifest,
+    source: LowMemSource,
     device: Device,
     queue: CommandQueue,
     pipes: Pipes,
@@ -196,16 +423,17 @@ impl LowMemEngine {
     /// materializes the full model in RAM.
     pub fn new(dir: &Path, cfg: ModelConfig, opts: &LowMemOpts) -> crate::Result<Self> {
         let t0 = Instant::now();
-        let mut manifest = WeightManifest::open(dir)?;
+        let mut source = LowMemSource::open(dir)?;
         eprintln!(
-            "lowmem: manifest {} tensors | {:.1}M params (headers parsed in {:.2}s)",
-            manifest.n_tensors(),
-            manifest.n_params as f64 / 1e6,
+            "lowmem: {} {} tensors | {:.1}M params (headers parsed in {:.2}s)",
+            if source.is_gguf() { "gguf" } else { "manifest" },
+            source.n_tensors(),
+            source.n_params() as f64 / 1e6,
             t0.elapsed().as_secs_f64(),
         );
 
         let device = Device::system_default().ok_or("no Metal-capable GPU found")?;
-        manifest.make_gpu_views(&device);
+        source.make_gpu_views(&device);
         let queue = device.new_command_queue();
         let lib = device
             .new_library_with_source(&gpu::shader_source(cfg.kv_dim()), &CompileOptions::new())
@@ -306,18 +534,18 @@ impl LowMemEngine {
         // Small weights (norms, biases): eagerly resident, a few hundred KB —
         // they land in D9's fixed-overhead term, not the pool.
         let small = |name: String| -> crate::Result<Buffer> {
-            Ok(gpu::f16_buffer(&device, &manifest.read_f32(&name)?))
+            Ok(gpu::f16_buffer(&device, &source.read_f32(&name)?))
         };
         let mut next_id = 0u32;
         let mut mk = |prefix: String, in_dim: usize, out_dim: usize| -> crate::Result<PagedTensor> {
             let bias_name = format!("{prefix}.bias");
-            let bias = if manifest.has(&bias_name) {
-                Some(gpu::f16_buffer(&device, &manifest.read_f32(&bias_name)?))
+            let bias = if source.has(&bias_name) {
+                Some(gpu::f16_buffer(&device, &source.read_f32(&bias_name)?))
             } else {
                 None
             };
             let t = PagedTensor::new(
-                &manifest,
+                &source,
                 next_id,
                 format!("{prefix}.weight"),
                 in_dim,
@@ -348,7 +576,7 @@ impl LowMemEngine {
         // Tied weights: no lm_head tensor means the pager reads the embedding
         // table's rows — same bytes, no copy anywhere.
         let lm_name =
-            if manifest.has("lm_head.weight") { "lm_head" } else { "model.embed_tokens" };
+            if source.has("lm_head.weight") { "lm_head" } else { "model.embed_tokens" };
         let lm_head = mk(lm_name.into(), h, cfg.vocab_size)?;
 
         let max_rows = layers
@@ -369,7 +597,7 @@ impl LowMemEngine {
             Err(_) => plan.pool_bytes,
         };
         let pool = WeightPool::new(&device, pool_bytes);
-        let staged_bytes = manifest.n_params * 2; // f16 in the pool, whatever the disk dtype
+        let staged_bytes = source.n_params() * 2; // f16 in the pool, whatever the disk dtype
         if staged_bytes > pool_bytes {
             // The ANE-compile lesson: long silent work must announce itself. And
             // the decode line pre-answers "why is the GPU idle": past the budget
@@ -416,7 +644,7 @@ impl LowMemEngine {
             clip_flag,
             clip_warned: std::sync::atomic::AtomicBool::new(false),
             cfg,
-            manifest,
+            source,
             device,
             queue,
             pipes,
