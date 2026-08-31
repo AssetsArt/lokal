@@ -452,6 +452,12 @@ is [docs/gguf-design.md](docs/gguf-design.md). GGUF code lives in `src/gguf/`
 (container / dequant / arch / tokenizer): a checkpoint format every backend
 reads, never a backend detail. The CPU deltanet oracle is `src/deltanet_ref.rs`.
 
+The §6–§11 abstraction seams are LANDED (lane arch-abstractions): `TensorStore`
+(weights.rs) over both checkpoint formats, `Activation`/`NormType` resolved from
+metadata on ModelConfig, `LayerStateKind` + `state_schedule` for the two-kind
+per-layer state, and the `FeedForward::{Dense, MoE-shell}` shape seam — each cut
+only where a second variant already exists, per the doc's variant-inventory rule.
+
 **The naming rule (binding for new code):** an architecture name appears ONLY
 where behavior is keyed on the arch string — metadata parsing (`Qwen35Meta`,
 `qwen35_meta`), tokenizer splits, refusal text, and their tests. Everything

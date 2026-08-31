@@ -91,9 +91,10 @@ sliding window (shipped as window-mode), MLA (deferred, L6), and — beyond the
 generic spec — gated deltanet (shipped, qwen35). GQA-aware kernels exist on the
 metal path; the flash prefill/decode kernels are the reuse targets.
 
-State seam (L3): the layer-state abstraction covers TWO kinds — `KvCache`
-(write/read/len over the F16 KV cache) and recurrent deltanet state
-(conv window + delta state, today `DeltaNetStates` after the L1 rename). A
+State seam (LANDED, L3): per-layer state is explicitly two-kind —
+`LayerStateKind::{Kv, Recurrent}` with `state_schedule()` as the one deriving
+function (gpu/metal.rs), adopted at session construction; recurrent state is
+`DeltaNetStates` (conv window + delta state). A
 hybrid-recurrent model schedules both kinds across its layer list (qwen35:
 KV on 6 attention layers, interval-4 schedule from gguf/arch.rs metadata).
 
@@ -108,15 +109,18 @@ level variants only when a target model needs them.
 ## FFN / activation / normalization
 
 Today: SwiGLU with a fused Metal kernel — the reuse target for every compatible
-model. `Activation` enum (SiLU/GELU/GeGLU/ReLU) and `NormType` enum
-(RMSNorm/LayerNorm + placement) arrive in L3 with this rule: an enum variant is
-added when a target model actually needs it; until then the seam exists but
-stays single-variant. Do not assume Llama-style RMSNorm in new code — read it
+model. LANDED (L3): `Activation::SwiGLU` and `NormType::RmsNormPre` on
+ModelConfig (config.rs), resolved from checkpoint metadata (`hidden_act`;
+unknown names refuse by name) and matched exhaustively at construction, before
+any layer loop. The rule stands: an enum variant is added when a target model
+actually needs it; until then the seam stays single-variant. Do not assume Llama-style RMSNorm in new code — read it
 from ModelConfig.
 
 ## MoE
 
-`FeedForward::{Dense, MoE}` shell lands in L3 so interfaces are shaped for it.
+`FeedForward::{Dense(DenseFfn), MoE}` LANDED (L3, model.rs): Dense is the only
+constructor; the MoE arm is an unreachable shell carrying no invented router
+layout, so L5 changes shape (a constructor + an arm), not seams.
 Real MoE (router, top-k experts, combine) is L5 and BLOCKED on the human naming
 a target model — expert layouts in GGUF vary by family and we do not build
 against a hypothetical checkpoint.
@@ -204,7 +208,7 @@ constructor-side and backend-specific.
 | 1 GGUFLoader | done |
 | 2 metadata → ModelConfig | done (gguf/arch.rs); ONE shared type verified in L1-B3 |
 | 3 architecture detection | done (arch string + refusal-by-name honesty) |
-| 4 tensor abstraction | L3 (TensorStore trait) |
+| 4 tensor abstraction | done (L3: `TensorStore` in weights.rs — eager map + LowMemSource behind one trait, `Model::from_store` consumes it) |
 | 5 F16 GGUF | done |
 | 6 GQA/MHA mapping | done |
 | 7 RoPE parameters | done (partial rope incl.) |

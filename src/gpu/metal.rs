@@ -912,9 +912,9 @@ impl MetalEngine {
                 v_proj: lin(&device, &b.v_proj),
                 o_proj: lin(&device, &b.o_proj),
                 post_attention_layernorm: f16_buffer(&device, &b.post_attention_layernorm),
-                gate_proj: lin(&device, &b.gate_proj),
-                up_proj: lin(&device, &b.up_proj),
-                down_proj: lin(&device, &b.down_proj),
+                gate_proj: lin(&device, &b.ffn.dense().gate_proj),
+                up_proj: lin(&device, &b.ffn.dense().up_proj),
+                down_proj: lin(&device, &b.ffn.dense().down_proj),
             })
             .collect();
 

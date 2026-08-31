@@ -35,6 +35,35 @@ impl Linear {
     }
 }
 
+/// docs/gguf-design.md §MoE: the FFN shape seam. Dense is the only
+/// constructor on main; the MoE arm is a SHELL — it constructs nowhere and
+/// carries no invented router layout (building one against a hypothetical
+/// checkpoint is exactly the creep the design forbids). It exists so L5
+/// changes shape — a constructor and an arm — rather than cutting a new seam.
+pub(crate) enum FeedForward {
+    Dense(DenseFfn),
+    #[allow(dead_code)]
+    MoE {},
+}
+
+/// The dense silu-gated FFN every shipped model uses (SwiGLU per T2's enum).
+pub(crate) struct DenseFfn {
+    pub(crate) gate_proj: Linear,
+    pub(crate) up_proj: Linear,
+    pub(crate) down_proj: Linear,
+}
+
+impl FeedForward {
+    /// The dense projections, for backends that upload weights (GPU engines).
+    /// Panics on the MoE shell — nothing can construct it yet.
+    pub(crate) fn dense(&self) -> &DenseFfn {
+        match self {
+            FeedForward::Dense(f) => f,
+            FeedForward::MoE {} => unreachable!("no MoE constructor exists (L5)"),
+        }
+    }
+}
+
 /// One transformer block's weights — field names match the safetensors tensor names.
 pub(crate) struct Block {
     pub(crate) input_layernorm: Vec<f32>, // norm before attention
@@ -46,9 +75,7 @@ pub(crate) struct Block {
     pub(crate) q_norm: Option<Vec<f32>>,
     pub(crate) k_norm: Option<Vec<f32>>,
     pub(crate) post_attention_layernorm: Vec<f32>, // norm before the MLP
-    pub(crate) gate_proj: Linear,
-    pub(crate) up_proj: Linear,
-    pub(crate) down_proj: Linear,
+    pub(crate) ffn: FeedForward,
 }
 
 impl Block {
@@ -58,7 +85,10 @@ impl Block {
             + self.post_attention_layernorm.len()
             + self.q_norm.as_ref().map_or(0, Vec::len)
             + self.k_norm.as_ref().map_or(0, Vec::len)
-            + [&self.q_proj, &self.k_proj, &self.v_proj, &self.o_proj, &self.gate_proj, &self.up_proj, &self.down_proj]
+            + {
+                let f = self.ffn.dense();
+                [&self.q_proj, &self.k_proj, &self.v_proj, &self.o_proj, &f.gate_proj, &f.up_proj, &f.down_proj]
+            }
                 .into_iter()
                 .map(lin)
                 .sum::<usize>()
@@ -139,9 +169,11 @@ impl Model {
                 q_norm: take_opt(t, &format!("{p}.self_attn.q_norm.weight"))?,
                 k_norm: take_opt(t, &format!("{p}.self_attn.k_norm.weight"))?,
                 post_attention_layernorm: take(t, &format!("{p}.post_attention_layernorm.weight"))?,
-                gate_proj: linear(t, &format!("{p}.mlp.gate_proj"), h, cfg.intermediate_size)?,
-                up_proj: linear(t, &format!("{p}.mlp.up_proj"), h, cfg.intermediate_size)?,
-                down_proj: linear(t, &format!("{p}.mlp.down_proj"), cfg.intermediate_size, h)?,
+                ffn: FeedForward::Dense(DenseFfn {
+                    gate_proj: linear(t, &format!("{p}.mlp.gate_proj"), h, cfg.intermediate_size)?,
+                    up_proj: linear(t, &format!("{p}.mlp.up_proj"), h, cfg.intermediate_size)?,
+                    down_proj: linear(t, &format!("{p}.mlp.down_proj"), cfg.intermediate_size, h)?,
+                }),
             });
         }
         let embed_tokens = take(t, "model.embed_tokens.weight")?;
@@ -204,13 +236,20 @@ impl Model {
                 x[i] += att[i]; // residual connection
             }
 
-            // Second half: SwiGLU MLP (per-token computation on what attention gathered).
+            // Second half: the FFN — matched through the shape seam (the MoE
+            // arm is an unreachable shell until L5 builds it).
             let xn = rmsnorm(&x, &blk.post_attention_layernorm, cfg.rms_norm_eps);
-            let gate = blk.gate_proj.forward(&xn);
-            let up = blk.up_proj.forward(&xn);
-            // silu(gate) acts as a per-dimension gate over the up projection.
-            let inner: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| silu(*g) * u).collect();
-            let out = blk.down_proj.forward(&inner);
+            let out = match &blk.ffn {
+                FeedForward::Dense(f) => {
+                    // SwiGLU: silu(gate) acts as a per-dimension gate over up.
+                    let gate = f.gate_proj.forward(&xn);
+                    let up = f.up_proj.forward(&xn);
+                    let inner: Vec<f32> =
+                        gate.iter().zip(&up).map(|(g, u)| silu(*g) * u).collect();
+                    f.down_proj.forward(&inner)
+                }
+                FeedForward::MoE {} => unreachable!("no MoE constructor exists (L5)"),
+            };
             for i in 0..h {
                 x[i] += out[i]; // residual connection
             }
