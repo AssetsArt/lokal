@@ -57,6 +57,7 @@ kernel void embed(
 //   4 = Q4_K  144 B / 256      : f16 d,dmin, 6-bit packed scales/mins ×8, nibbles
 //   5 = Q6_K  210 B / 256      : ql nibbles + qh 2-bit highs, int8 scales ×16, f16 d
 //   6 = Q5_K  176 B / 256      : Q4_K plus one high bit per element (qh[32])
+//   7 = Q5_0   22 B / 32       : Q4_0 plus one high bit per element (qh u32) → (q-16)*d
 constant uint LM_W_QTYPE_FC [[function_constant(25)]];
 constant uint LM_W_QTYPE = is_function_constant_defined(LM_W_QTYPE_FC) ? LM_W_QTYPE_FC : 0;
 
@@ -79,6 +80,19 @@ inline float lm_dequant_q4_0(device const uchar *row, uint col) {
     uchar byte = b[2 + (j & 15)];
     int q = (int)((j < 16) ? (byte & 0x0F) : (byte >> 4)) - 8;
     return (float)q * d;
+}
+
+inline float lm_dequant_q5_0(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 5) * 22;
+    float d = lm_f16_at(b);
+    // qh is a little-endian u32 of per-element fifth bits; assembled byte-wise
+    // because 22-byte blocks leave it unaligned half the time.
+    uint qh = (uint)b[2] | ((uint)b[3] << 8) | ((uint)b[4] << 16) | ((uint)b[5] << 24);
+    uint j = col & 31;
+    uchar byte = b[6 + (j & 15)];
+    uint xh = (j < 16) ? (((qh >> j) << 4) & 0x10) : ((qh >> (j - 16 + 12)) & 0x10);
+    uint nib = (j < 16) ? (byte & 0x0F) : (byte >> 4);
+    return (float)((int)(nib | xh) - 16) * d;
 }
 
 // The 6-bit packed scale/min unpack — THE classic silent-rot spot. Mirrors
@@ -157,6 +171,7 @@ inline float lm_dequant(device const uchar *row, uint col) {
         case 4: return lm_dequant_q4_K(row, col);
         case 5: return lm_dequant_q6_K(row, col);
         case 6: return lm_dequant_q5_K(row, col);
+        case 7: return lm_dequant_q5_0(row, col);
         default: return 0.0f;
     }
 }
@@ -208,6 +223,7 @@ inline ulong lm_row_bytes(uint in_dim) {
         case 4: return (ulong)(in_dim / 256) * 144; // Q4_K
         case 5: return (ulong)(in_dim / 256) * 210; // Q6_K
         case 6: return (ulong)(in_dim / 256) * 176; // Q5_K
+        case 7: return (ulong)(in_dim / 32) * 22;   // Q5_0
         default: return 0; // unused for element-addressable types
     }
 }
