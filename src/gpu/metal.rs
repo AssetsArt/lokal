@@ -239,7 +239,7 @@ pub struct MetalEngine {
     /// qwen35 only: the recurrency map + state sizes sessions allocate from.
     /// None on every other architecture. Set by the engine constructor that
     /// lane C lands; sessions honor it today.
-    pub(crate) q35_layout: Option<Qwen35Layout>,
+    pub(crate) deltanet_layout: Option<DeltaNetLayout>,
     /// True geometry, derived from the checkpoint (qwen3 violates the
     /// hidden/n_heads identity, so cfg.head_dim()/kv_dim() are never read on
     /// hot paths — these are).
@@ -357,14 +357,14 @@ struct MatmulPagedParams {
 /// allocator). One live state per sequence: no rollback in v1 — greedy CLI and
 /// per-request serve sessions never rewind (documented limitation; llama.cpp's
 /// snapshot ring is the reference if speculative decoding ever needs it).
-pub(crate) struct Qwen35States {
+pub(crate) struct DeltaNetStates {
     /// Index = trunk layer id. None = full-attention layer (KV lives there instead).
-    pub layers: Vec<Option<Qwen35LayerState>>,
+    pub layers: Vec<Option<DeltaNetLayerState>>,
     pub conv_elems: usize,
     pub delta_elems: usize,
 }
 
-pub(crate) struct Qwen35LayerState {
+pub(crate) struct DeltaNetLayerState {
     /// Rolling conv history, (d_conv−1)·C f32 — layout [channel][d_conv−1],
     /// oldest first (matches deltanet_ref::conv_step).
     pub conv: Buffer,
@@ -377,53 +377,13 @@ pub(crate) struct Qwen35LayerState {
 /// the per-trunk-layer recurrency map plus the two per-layer element counts.
 /// The C/D seam — changes go through the lead, never pairwise.
 #[derive(Clone)]
-pub(crate) struct Qwen35Layout {
+pub(crate) struct DeltaNetLayout {
     pub is_recurrent: Vec<bool>,
     pub conv_elems: usize,
     pub delta_elems: usize,
 }
 
-impl Qwen35Layout {
-    /// MRoPE'S PRECONDITION, refused by name rather than silently assumed.
-    ///
-    /// qwen35 carries `rope.dimension_sections` and llama.cpp routes it through
-    /// ggml_mrope_cache_init. For a TEXT batch that function is a no-op relative
-    /// to plain rope — llama-batch.cpp:781-787 broadcasts ONE position into all
-    /// four components, ops.cpp sets indep_sects = is_vision so the per-section
-    /// resets never fire, and every one of the four thetas is multiplied by the
-    /// same theta_scale each pair. All four therefore stay equal for the whole
-    /// sequence, so whichever theta a sector selects is the plain-rope theta.
-    /// `mrope_degenerates_to_rope_for_text_batches` pins that numerically.
-    ///
-    /// The REAL precondition is a property of the batch, not the checkpoint:
-    /// this engine never constructs a vision batch. What metadata CAN tell us is
-    /// whether a checkpoint belongs to the family that equivalence was verified
-    /// on. A vision-capable variant reaches the same rope path and would be
-    /// silently rotated with the wrong thetas — the one way this bites — so an
-    /// unrecognised section layout is refused by name here instead.
-    ///
-    /// Deliberately NOT done: a sectioned rope kernel. Its best possible outcome
-    /// is bit-identity with the rope we already ship, against a hand-derived
-    /// index mapping that could be wrong (Detoro's ruling, task note e0449773).
-    pub fn check_rope_sections(m: &crate::gguf::Qwen35Meta) -> Result<(), String> {
-        let s = &m.rope_sections;
-        let sum: usize = s.iter().sum();
-        if sum == 0 {
-            return Err(format!(
-                "qwen35: rope.dimension_sections is all zeros {s:?} — no rotary sections to \
-                 map; refusing rather than rotating with an undefined layout"
-            ));
-        }
-        if s[3] != 0 {
-            return Err(format!(
-                "qwen35: rope.dimension_sections {s:?} has a non-zero 4th (vision 'extra') \
-                 section — this is a vision-capable variant. This engine only builds text \
-                 batches, which is what makes MRoPE equivalent to plain rope, and it has no \
-                 sectioned rope kernel. Refusing by name rather than rotating it as text."
-            ));
-        }
-        Ok(())
-    }
+impl DeltaNetLayout {
 
     /// The one meta→layout translation, so no caller re-derives sizes (where
     /// the 17-layer misconception would creep back in): the map is exactly the
@@ -437,15 +397,15 @@ impl Qwen35Layout {
     }
 }
 
-impl Qwen35States {
+impl DeltaNetStates {
     /// Zero-initialized states — zeroing is load-bearing: an empty conv
     /// history contributes silence and an empty delta state attends nothing.
-    pub fn new(device: &Device, layout: &Qwen35Layout) -> Self {
+    pub fn new(device: &Device, layout: &DeltaNetLayout) -> Self {
         let layers = layout
             .is_recurrent
             .iter()
             .map(|&r| {
-                r.then(|| Qwen35LayerState {
+                r.then(|| DeltaNetLayerState {
                     conv: f32_zero_buffer(device, layout.conv_elems),
                     delta: f32_zero_buffer(device, layout.delta_elems),
                 })
@@ -810,7 +770,7 @@ impl MetalEngine {
             device,
             win: win_state,
             quant: None,
-            q35_layout: None,
+            deltanet_layout: None,
             dims,
             pipes,
             blocks,
@@ -1223,9 +1183,9 @@ impl MetalEngine {
     // rope as this one: one position is broadcast into all four components, so
     // the four thetas start equal and are all scaled by theta_scale every pair,
     // and the sector select can never pick a different value. Pinned by
-    // qwen35_kernel_oracle::mrope_degenerates_to_rope_for_text_batches (with a
+    // deltanet_kernel_oracle::mrope_degenerates_to_rope_for_text_batches (with a
     // vision-path negative control), and vision-capable checkpoints are refused
-    // by name in Qwen35Layout::check_rope_sections. A sectioned kernel's best
+    // by name in Qwen35Meta::check_rope_sections. A sectioned kernel's best
     // possible outcome is bit-identity with this one.
     fn enc_rope_qk(
         &self,
@@ -1401,12 +1361,12 @@ impl MetalEngine {
         let queue = device.new_command_queue();
         let mut source = LowMemSource::open(path)?;
         source.make_gpu_views(&device);
-        let q35m = source.qwen35();
+        let dn_meta = source.qwen35();
         let dims = dims_of(
             &cfg,
             source.head_dim(),
-            q35m.is_some(),
-            q35m.as_ref().map(|m| 2 * m.rope_sections.iter().sum::<usize>()),
+            dn_meta.is_some(),
+            dn_meta.as_ref().map(|m| 2 * m.rope_sections.iter().sum::<usize>()),
         );
 
         let shader = shader_source(dims.kv_dim);
@@ -1585,7 +1545,7 @@ impl MetalEngine {
             queue,
             device,
             win: win_state,
-            q35_layout: None, // lane C's constructor sets this for qwen35 files
+            deltanet_layout: None, // lane C's constructor sets this for qwen35 files
             dims,
             quant: Some(QuantState {
                 source,
@@ -1699,7 +1659,7 @@ impl MetalEngine {
             partials,
             xh,
             kvs,
-            q35: self.q35_layout.as_ref().map(|l| Qwen35States::new(&self.device, l)),
+            deltanet: self.deltanet_layout.as_ref().map(|l| DeltaNetStates::new(&self.device, l)),
             k_cache,
             v_cache,
             kv_base,
@@ -1755,7 +1715,7 @@ pub(crate) struct MetalSession<'a> {
     xh: Buffer,       // half staging for tensor-ops matmul inputs
     kvs: Buffer,      // window mode: fresh K/V f32 staging before the ring scatter
     /// qwen35: the per-linear-layer recurrent states (None elsewhere).
-    q35: Option<Qwen35States>,
+    deltanet: Option<DeltaNetStates>,
     k_cache: Vec<Buffer>,
     v_cache: Vec<Buffer>,
     kv_base: u64, // byte offset of this session's slot when the cache is pooled
@@ -2393,7 +2353,7 @@ impl MetalEngine {
         // fresh slot_session would hand every step a zeroed state). Serve
         // falls back to per-request sessions, each owning its own state —
         // the same v1 shape as quant files in the batcher.
-        if self.q35_layout.is_some() {
+        if self.deltanet_layout.is_some() {
             return None;
         }
         // The batched kernels are the fused-decode family — same requirements.
@@ -2712,15 +2672,15 @@ mod tests {
     /// no state; the map's length is exactly the trunk (the MTP block cannot
     /// even be expressed, so its attention can never allocate).
     #[test]
-    fn qwen35_states_lifecycle() {
+    fn deltanet_states_lifecycle() {
         let device = Device::system_default().expect("metal device");
         // Interval-4 trunk of 8: layers 3 and 7 are attention.
-        let layout = Qwen35Layout {
+        let layout = DeltaNetLayout {
             is_recurrent: (0..8).map(|i| (i + 1) % 4 != 0).collect(),
             conv_elems: 6,
             delta_elems: 10,
         };
-        let st = Qwen35States::new(&device, &layout);
+        let st = DeltaNetStates::new(&device, &layout);
         assert_eq!(st.layers.len(), 8, "map length is the trunk, nothing more");
         for (i, l) in st.layers.iter().enumerate() {
             assert_eq!(l.is_some(), (i + 1) % 4 != 0, "layer {i}");
@@ -2758,7 +2718,7 @@ mod tests {
     /// The one canonical meta→layout translation carries the real sizes and
     /// only the trunk's map.
     #[test]
-    fn qwen35_layout_from_meta_is_trunk_shaped() {
+    fn deltanet_layout_from_meta_is_trunk_shaped() {
         let meta = crate::gguf::Qwen35Meta {
             trunk_layers: 64,
             nextn_layers: 1,
@@ -2773,7 +2733,7 @@ mod tests {
             conv_state_elems: 30_720,
             delta_state_elems: 786_432,
         };
-        let layout = Qwen35Layout::from_meta(&meta);
+        let layout = DeltaNetLayout::from_meta(&meta);
         assert_eq!(layout.is_recurrent.len(), 64);
         assert_eq!(layout.is_recurrent.iter().filter(|&&r| r).count(), 48);
         assert_eq!(layout.conv_elems, 30_720);
@@ -2788,7 +2748,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod qwen35_kernel_oracle {
+mod deltanet_kernel_oracle {
     //! GPU kernels vs lane B's CPU reference (src/deltanet_ref.rs),
     //! bit-for-bit. Same doctrine as the quant oracle: the reference is the
     //! subject, the GPU is the thing under test, and a negative control proves
@@ -3543,14 +3503,14 @@ mod qwen35_kernel_oracle {
             conv_state_elems: 30_720,
             delta_state_elems: 786_432,
         };
-        assert!(super::Qwen35Layout::check_rope_sections(&meta).is_ok(), "the real 27B layout must pass");
+        assert!(meta.check_rope_sections().is_ok(), "the real 27B layout must pass");
 
         meta.rope_sections = [11, 11, 10, 4];
-        let err = super::Qwen35Layout::check_rope_sections(&meta).unwrap_err();
+        let err = meta.check_rope_sections().unwrap_err();
         assert!(err.contains("vision"), "the refusal must name why: {err}");
 
         meta.rope_sections = [0, 0, 0, 0];
-        assert!(super::Qwen35Layout::check_rope_sections(&meta).is_err(), "all-zero sections must refuse");
+        assert!(meta.check_rope_sections().is_err(), "all-zero sections must refuse");
     }
 
     fn gpu_delta_gates(alpha: &[f32], beta_in: &[f32], a: &[f32], dt: &[f32]) -> (Vec<f32>, Vec<f32>) {

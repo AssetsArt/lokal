@@ -86,7 +86,7 @@ pub(crate) struct Dims {
 }
 
 impl Dims {
-    fn new(cfg: &ModelConfig, head_dim: Option<usize>, q35: Option<&gguf::Qwen35Meta>) -> Self {
+    fn new(cfg: &ModelConfig, head_dim: Option<usize>, deltanet: Option<&gguf::Qwen35Meta>) -> Self {
         let head_dim = head_dim.unwrap_or_else(|| cfg.head_dim());
         let q_dim = cfg.num_attention_heads * head_dim;
         Dims {
@@ -94,8 +94,8 @@ impl Dims {
             head_dim,
             q_dim,
             kv_dim: cfg.num_key_value_heads * head_dim,
-            q_proj_dim: if q35.is_some() { 2 * q_dim } else { q_dim },
-            rot_dim: q35.map_or(head_dim, |m| 2 * m.rope_sections.iter().sum::<usize>()),
+            q_proj_dim: if deltanet.is_some() { 2 * q_dim } else { q_dim },
+            rot_dim: deltanet.map_or(head_dim, |m| 2 * m.rope_sections.iter().sum::<usize>()),
         }
     }
 }
@@ -105,7 +105,7 @@ fn memory_plan(
     dims: Dims,
     win: &WindowCfg,
     budget_mb: usize,
-    q35: Option<&gguf::Qwen35Meta>,
+    deltanet: Option<&gguf::Qwen35Meta>,
 ) -> crate::Result<MemoryPlan> {
     let (h, hd, kvd) = (dims.hidden, dims.head_dim, dims.kv_dim);
     let chunk = gpu::PREFILL_CHUNK;
@@ -114,11 +114,11 @@ fn memory_plan(
     // the 27B); the 48 linear layers carry the fixed recurrent state instead.
     // The MTP block is outside the meta's map entirely, so its attention can
     // never be counted here (the "17th attention layer" misconception).
-    let n_kv_layers = match q35 {
+    let n_kv_layers = match deltanet {
         Some(m) => m.is_recurrent.iter().filter(|&&r| !r).count(),
         None => cfg.num_hidden_layers,
     };
-    let state_bytes = q35.map_or(0, |m| {
+    let state_bytes = deltanet.map_or(0, |m| {
         let n_linear = m.is_recurrent.iter().filter(|&&r| r).count();
         n_linear * (m.conv_state_elems + m.delta_state_elems) * 4
     });
@@ -454,7 +454,7 @@ impl LowMemEngine {
     /// The deltanet geometry, in the form the kernels and the reference both
     /// speak. None on every non-qwen35 checkpoint.
     pub(crate) fn delta_dims(&self) -> Option<deltanet_ref::DeltaDims> {
-        self.q35_dims
+        self.deltanet_dims
     }
 }
 
@@ -742,13 +742,13 @@ pub struct LowMemEngine {
     win: WindowCfg,
     /// qwen35 only: what sessions allocate their recurrent state from.
     /// None on every other architecture (existing paths untouched).
-    q35_layout: Option<crate::gpu::metal::Qwen35Layout>,
+    deltanet_layout: Option<crate::gpu::metal::DeltaNetLayout>,
     /// qwen35 only: the deltanet geometry the kernels take as parameters.
     /// Stored as DeltaDims rather than the raw Qwen35Meta because that is what
     /// both the kernels and lane B's reference speak, it is Copy, and it avoids
     /// this file depending on a `Clone` that gguf.rs (the loader lane's file)
     /// does not derive.
-    q35_dims: Option<deltanet_ref::DeltaDims>,
+    deltanet_dims: Option<deltanet_ref::DeltaDims>,
     /// LOKAL_LOWMEM_SYNC=1: wait out every command buffer before the next —
     /// the bisect mode for anything that smells like an eviction race.
     sync: bool,
@@ -962,8 +962,8 @@ impl LowMemEngine {
         // GGUF mapper leaves under its `gguf.` fallback rather than folding into
         // llama's `ffn_norm` -> `post_attention_layernorm`. Both kinds of trunk
         // layer carry it, so it is resolved once here, not per arm.
-        let q35 = source.qwen35();
-        let post_ln_name = |p: &str| match q35.is_some() {
+        let deltanet = source.qwen35();
+        let post_ln_name = |p: &str| match deltanet.is_some() {
             true => format!("{p}.gguf.post_attention_norm.weight"),
             false => format!("{p}.post_attention_layernorm.weight"),
         };
@@ -973,9 +973,9 @@ impl LowMemEngine {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{i}");
-            let recurrent = q35.as_ref().is_some_and(|m| m.is_recurrent[i]);
+            let recurrent = deltanet.as_ref().is_some_and(|m| m.is_recurrent[i]);
             let attn = if recurrent {
-                let m = q35.as_ref().expect("recurrent implies qwen35 meta");
+                let m = deltanet.as_ref().expect("recurrent implies qwen35 meta");
                 AttnWeights::Linear(Box::new(LinearAttn {
                     qkv: mk(format!("{p}.gguf.attn_qkv"), h, 2 * m.n_group * m.d_state + m.d_inner)?,
                     z_gate: mk(format!("{p}.gguf.attn_gate"), h, m.d_inner)?,
@@ -1031,10 +1031,10 @@ impl LowMemEngine {
         // The budget split (D9). LOKAL_LOWMEM_POOL_MB stays as a debug override
         // that pins the pool directly, bypassing the arithmetic.
         let budget_mb = opts.memory_budget_mb.unwrap_or(BUDGET_MB_DEFAULT);
-        let q35_meta = source.qwen35();
-        let plan = memory_plan(&cfg, dims, &win, budget_mb, q35_meta.as_ref())?;
-        let q35_layout =
-            q35_meta.as_ref().map(crate::gpu::metal::Qwen35Layout::from_meta);
+        let deltanet_meta = source.qwen35();
+        let plan = memory_plan(&cfg, dims, &win, budget_mb, deltanet_meta.as_ref())?;
+        let deltanet_layout =
+            deltanet_meta.as_ref().map(crate::gpu::metal::DeltaNetLayout::from_meta);
         let pool_bytes = match std::env::var("LOKAL_LOWMEM_POOL_MB") {
             Ok(v) => v.parse::<usize>().map(|mb| mb << 20).unwrap_or(plan.pool_bytes),
             Err(_) => plan.pool_bytes,
@@ -1067,7 +1067,7 @@ impl LowMemEngine {
             );
         }
         // The one-line budget arithmetic, printed at load (D9).
-        let n_kv_layers = q35_meta
+        let n_kv_layers = deltanet_meta
             .as_ref()
             .map_or(cfg.num_hidden_layers, |m| {
                 m.is_recurrent.iter().filter(|&&r| !r).count()
@@ -1099,8 +1099,8 @@ impl LowMemEngine {
             gqa: gpu::gqa_decode_dims(&cfg, dims.head_dim),
             sync: std::env::var("LOKAL_LOWMEM_SYNC").is_ok_and(|v| v == "1"),
             win,
-            q35_layout,
-            q35_dims: q35_meta.as_ref().map(|m| deltanet_ref::DeltaDims {
+            deltanet_layout,
+            deltanet_dims: deltanet_meta.as_ref().map(|m| deltanet_ref::DeltaDims {
                 d_state: m.d_state,
                 n_v_heads: m.dt_rank,
                 n_k_heads: m.n_group,

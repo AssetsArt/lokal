@@ -667,5 +667,5 @@ The qwen35 architecture is a full-attention / gated-deltanet hybrid with an
 optional MTP block that standard generation skips. `docs/qwen35.md` is the
 canonical map — op inventory for both block kinds, recurrent-state formulas
 and sizes, the MTP verdict, and the lane plan. The loader side
-(`lowmem::gguf::qwen35_meta`) parses the hybrid layout from metadata alone;
+(`gguf::qwen35_meta`) parses the hybrid layout from metadata alone;
 execution lands with the kernels and session-state lanes.

@@ -351,7 +351,7 @@ fn gguf_setup(
     // than attempted, because both would otherwise produce plausible wrong
     // output instead of an error:
     //   * a checkpoint whose rope sections are not the text-broadcast layout
-    //     the MRoPE equivalence was verified on (see Qwen35Layout::
+    //     the MRoPE equivalence was verified on (see Qwen35Meta::
     //     check_rope_sections — this engine has no sectioned rope kernel and
     //     would silently rotate a vision variant as if it were text);
     //   * every backend except lowmem, which is where the gated-deltanet block
@@ -360,7 +360,7 @@ fn gguf_setup(
     //     and mis-read the joint Q+gate projection at worst.
     if arch.arch == "qwen35" {
         let m = gguf::qwen35_meta(&g)?;
-        crate::gpu::metal::Qwen35Layout::check_rope_sections(&m)?;
+        m.check_rope_sections()?;
         if args.backend != "lowmem" {
             return Err(format!(
                 "qwen35 runs on -b lowmem only ({} trunk layers: {} full-attention + {} \

@@ -35,6 +35,47 @@ pub struct Qwen35Meta {
 }
 
 impl Qwen35Meta {
+    /// MRoPE'S PRECONDITION, refused by name rather than silently assumed.
+    ///
+    /// qwen35 carries `rope.dimension_sections` and llama.cpp routes it through
+    /// ggml_mrope_cache_init. For a TEXT batch that function is a no-op relative
+    /// to plain rope — llama-batch.cpp:781-787 broadcasts ONE position into all
+    /// four components, ops.cpp sets indep_sects = is_vision so the per-section
+    /// resets never fire, and every one of the four thetas is multiplied by the
+    /// same theta_scale each pair. All four therefore stay equal for the whole
+    /// sequence, so whichever theta a sector selects is the plain-rope theta.
+    /// `mrope_degenerates_to_rope_for_text_batches` pins that numerically.
+    ///
+    /// The REAL precondition is a property of the batch, not the checkpoint:
+    /// this engine never constructs a vision batch. What metadata CAN tell us is
+    /// whether a checkpoint belongs to the family that equivalence was verified
+    /// on. A vision-capable variant reaches the same rope path and would be
+    /// silently rotated with the wrong thetas — the one way this bites — so an
+    /// unrecognised section layout is refused by name here instead.
+    ///
+    /// Deliberately NOT done: a sectioned rope kernel. Its best possible outcome
+    /// is bit-identity with the rope we already ship, against a hand-derived
+    /// index mapping that could be wrong (Detoro's ruling, task note e0449773).
+    pub fn check_rope_sections(&self) -> Result<(), String> {
+        let s = &self.rope_sections;
+        let sum: usize = s.iter().sum();
+        if sum == 0 {
+            return Err(format!(
+                "qwen35: rope.dimension_sections is all zeros {s:?} — no rotary sections to \
+                 map; refusing rather than rotating with an undefined layout"
+            ));
+        }
+        if s[3] != 0 {
+            return Err(format!(
+                "qwen35: rope.dimension_sections {s:?} has a non-zero 4th (vision 'extra') \
+                 section — this is a vision-capable variant. This engine only builds text \
+                 batches, which is what makes MRoPE equivalent to plain rope, and it has no \
+                 sectioned rope kernel. Refusing by name rather than rotating it as text."
+            ));
+        }
+        Ok(())
+    }
+
     /// True for any tensor standard generation must ignore: the nextn.* head
     /// tensors and every block at or past the trunk (the MTP block carries its
     /// own attention stack — the census's "17th attention layer").
