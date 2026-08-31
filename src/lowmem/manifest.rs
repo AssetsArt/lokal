@@ -175,6 +175,8 @@ pub enum GgmlType {
     Q4_0 = 2,
     Q2_K = 10,
     Q3_K = 11,
+    IQ3_XXS = 18,
+    IQ3_S = 21,
     IQ4_NL = 20,
     IQ4_XS = 23,
     Q5_0 = 6,
@@ -207,10 +209,10 @@ impl GgmlType {
             15 => return Err("Q8_K"),
             16 => return Err("IQ2_XXS"),
             17 => return Err("IQ2_XS"),
-            18 => return Err("IQ3_XXS"),
+            18 => Self::IQ3_XXS,
             19 => return Err("IQ1_S"),
             20 => Self::IQ4_NL,
-            21 => return Err("IQ3_S"),
+            21 => Self::IQ3_S,
             22 => return Err("IQ2_S"),
             23 => Self::IQ4_XS,
             24..=27 => return Err("integer tensor"),
@@ -226,7 +228,7 @@ impl GgmlType {
         match self {
             Self::F32 | Self::F16 => 1,
             Self::Q4_0 | Self::Q5_0 | Self::Q8_0 | Self::IQ4_NL => 32, // QK4_0 / QK5_0 / QK8_0 / QK4_NL
-            Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::IQ4_XS => 256, // QK_K
+            Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::IQ4_XS | Self::IQ3_XXS | Self::IQ3_S => 256, // QK_K
         }
     }
 
@@ -238,6 +240,8 @@ impl GgmlType {
             Self::Q4_0 => 2 + 16,            // f16 d + 32 nibbles
             Self::Q5_0 => 2 + 4 + 16,        // f16 d + qh[4] high bits + 32 nibbles
             Self::Q8_0 => 2 + 32,            // f16 d + 32 i8
+            Self::IQ3_XXS => 2 + 96,         // d + qs[3*QK_K/8] (64 grid idx + 32 scale/sign)
+            Self::IQ3_S => 2 + 64 + 8 + 32 + 4, // d + qs + qh + signs + scales[QK_K/64]
             Self::IQ4_NL => 2 + 16,          // d + qs[QK4_NL/2]
             Self::IQ4_XS => 2 + 2 + 4 + 128, // d + scales_h + scales_l[QK_K/64] + qs[QK_K/2]
             Self::Q2_K => 16 + 64 + 2 + 2,   // scales[QK_K/16] + qs[QK_K/4] + d + dmin
@@ -283,6 +287,8 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
         )
     }
 }
+
+use super::iq_grids::{IQ3S_GRID, IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS};
 
 /// ggml's `kvalues_iq4nl` (ggml-common.h) — the 16-entry non-linear codebook
 /// both IQ4 types index with a 4-bit quant. Copied verbatim; the values are not
@@ -369,6 +375,51 @@ pub fn dequant_row_ref(ty: GgmlType, src: &[u8], out: &mut [f32]) {
         // half share one 32-byte qs run, selected by a shift of 2 per group-pair.
         // dequantize_row_iq4_nl: d | qs[16] (18 B). Low nibbles fill the first
         // 16 outputs, high nibbles the second 16 — not interleaved.
+        // dequantize_row_iq3_xxs: d | qs[64 grid indices] | 8 u32 of packed
+        // scale+signs (98 B). Each u32 holds a 4-bit scale in its top nibble
+        // and four 7-bit sign selectors below it.
+        GgmlType::IQ3_XXS => {
+            for (b, y) in out.chunks_exact_mut(256).enumerate() {
+                let blk = &src[b * 98..b * 98 + 98];
+                let d = f16_bits_at(blk, 0);
+                for (i, o) in y.iter_mut().enumerate() {
+                    let (ib32, r) = (i >> 5, i & 31);
+                    let (l, jj) = (r >> 3, r & 7);
+                    let (hf, j) = (jj >> 2, jj & 3);
+                    let sas = 2 + 64 + 4 * ib32;
+                    let aux32 = u32::from_le_bytes([blk[sas], blk[sas + 1], blk[sas + 2], blk[sas + 3]]);
+                    let db = d * (0.5 + (aux32 >> 28) as f32) * 0.5;
+                    let signs = KSIGNS_IQ2XS[((aux32 >> (7 * l)) & 127) as usize];
+                    let gi = blk[2 + ib32 * 8 + 2 * l + hf] as usize;
+                    let g = (IQ3XXS_GRID[gi] >> (8 * j)) & 0xFF;
+                    let sgn = if signs & KMASK_IQ2XS[jj] != 0 { -1.0 } else { 1.0 };
+                    *o = db * g as f32 * sgn;
+                }
+            }
+        }
+        // dequantize_row_iq3_s: d | qs[64] | qh[8] | signs[32] | scales[4]
+        // (110 B). qh donates a NINTH grid-index bit per half; scales pack two
+        // 4-bit values per byte, each used as 1 + 2*s.
+        GgmlType::IQ3_S => {
+            for (b, y) in out.chunks_exact_mut(256).enumerate() {
+                let blk = &src[b * 110..b * 110 + 110];
+                let d = f16_bits_at(blk, 0);
+                for (i, o) in y.iter_mut().enumerate() {
+                    let (g, r) = (i >> 5, i & 31);
+                    let (l, jj) = (r >> 3, r & 7);
+                    let (hf, j) = (jj >> 2, jj & 3);
+                    let sc_byte = blk[106 + g / 2];
+                    let sc = if g % 2 == 0 { sc_byte & 0xF } else { sc_byte >> 4 };
+                    let db = d * (1 + 2 * sc as u32) as f32;
+                    let qh = blk[66 + g] as usize;
+                    let gi = blk[2 + g * 8 + 2 * l + hf] as usize
+                        | ((qh << (8 - 2 * l - hf)) & 256);
+                    let gv = (IQ3S_GRID[gi] >> (8 * j)) & 0xFF;
+                    let sgn = if blk[74 + g * 4 + l] & KMASK_IQ2XS[jj] != 0 { -1.0 } else { 1.0 };
+                    *o = db * gv as f32 * sgn;
+                }
+            }
+        }
         GgmlType::IQ4_NL => {
             for (b, y) in out.chunks_exact_mut(32).enumerate() {
                 let blk = &src[b * 18..b * 18 + 18];

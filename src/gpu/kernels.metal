@@ -673,6 +673,44 @@ constant int lm_kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
 };
 
+// IQ3_XXS: d | qs[64 grid indices] | 8 u32 of packed scale+signs (98 B). Each
+// u32 carries a 4-bit scale in its top nibble and four 7-bit sign selectors.
+inline float lm_dequant_iq3_xxs(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 8) * 98;
+    float d = lm_f16_at(b);
+    uint i = col & 255;
+    uint ib32 = i >> 5, r = i & 31;
+    uint l = r >> 3, jj = r & 7;
+    uint hf = jj >> 2, j = jj & 3;
+    device const uchar *sas = b + 2 + 64 + 4 * ib32;
+    uint aux32 = (uint)sas[0] | ((uint)sas[1] << 8) | ((uint)sas[2] << 16) | ((uint)sas[3] << 24);
+    float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+    uchar signs = lm_ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+    uint gi = b[2 + ib32 * 8 + 2 * l + hf];
+    uint g = (lm_iq3xxs_grid[gi] >> (8 * j)) & 0xFF;
+    float sgn = (signs & lm_kmask_iq2xs[jj]) ? -1.0f : 1.0f;
+    return db * (float)g * sgn;
+}
+
+// IQ3_S: d | qs[64] | qh[8] | signs[32] | scales[4] (110 B). qh donates a
+// NINTH grid-index bit per half; each scale nibble is used as 1 + 2*s.
+inline float lm_dequant_iq3_s(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 8) * 110;
+    float d = lm_f16_at(b);
+    uint i = col & 255;
+    uint g = i >> 5, r = i & 31;
+    uint l = r >> 3, jj = r & 7;
+    uint hf = jj >> 2, j = jj & 3;
+    uchar sc_byte = b[106 + g / 2];
+    uint sc = (g % 2 == 0) ? (uint)(sc_byte & 0x0F) : (uint)(sc_byte >> 4);
+    float db = d * (float)(1 + 2 * sc);
+    uint qh = b[66 + g];
+    uint gi = (uint)b[2 + g * 8 + 2 * l + hf] | ((qh << (8 - 2 * l - hf)) & 256);
+    uint gv = (lm_iq3s_grid[gi] >> (8 * j)) & 0xFF;
+    float sgn = (b[74 + g * 4 + l] & lm_kmask_iq2xs[jj]) ? -1.0f : 1.0f;
+    return db * (float)gv * sgn;
+}
+
 // IQ4_NL: d | qs[16] (18 B). Low nibbles are the first 16 outputs, high
 // nibbles the second 16 — not interleaved.
 inline float lm_dequant_iq4_nl(device const uchar *row, uint col) {
@@ -851,6 +889,49 @@ inline float lm_dot_run_q5_0(device const uchar *row, uint e0, device const floa
     return s * d;
 }
 
+inline float lm_dot_run_iq3_xxs(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 8) * 98;
+    float d = lm_f16_at(b);
+    uint ib32 = (e0 & 255) >> 5;
+    device const uchar *sas = b + 2 + 64 + 4 * ib32;
+    uint aux32 = (uint)sas[0] | ((uint)sas[1] << 8) | ((uint)sas[2] << 16) | ((uint)sas[3] << 24);
+    float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+    device const uchar *qs = b + 2 + ib32 * 8;
+    float acc = 0.0f;
+    for (uint l = 0; l < 4; l++) {
+        uchar signs = lm_ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+        for (uint jj = 0; jj < 8; jj++) {
+            uint g = (lm_iq3xxs_grid[qs[2 * l + (jj >> 2)]] >> (8 * (jj & 3))) & 0xFF;
+            float sgn = (signs & lm_kmask_iq2xs[jj]) ? -1.0f : 1.0f;
+            acc += (float)g * sgn * x[e0 + l * 8 + jj];
+        }
+    }
+    return db * acc;
+}
+
+inline float lm_dot_run_iq3_s(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 8) * 110;
+    float d = lm_f16_at(b);
+    uint g = (e0 & 255) >> 5;
+    uchar sc_byte = b[106 + g / 2];
+    uint sc = (g % 2 == 0) ? (uint)(sc_byte & 0x0F) : (uint)(sc_byte >> 4);
+    float db = d * (float)(1 + 2 * sc);
+    uint qh = b[66 + g];
+    device const uchar *qs = b + 2 + g * 8;
+    device const uchar *sg = b + 74 + g * 4;
+    float acc = 0.0f;
+    for (uint l = 0; l < 4; l++) {
+        for (uint jj = 0; jj < 8; jj++) {
+            uint hf = jj >> 2;
+            uint gi = (uint)qs[2 * l + hf] | ((qh << (8 - 2 * l - hf)) & 256);
+            uint gv = (lm_iq3s_grid[gi] >> (8 * (jj & 3))) & 0xFF;
+            float sgn = (sg[l] & lm_kmask_iq2xs[jj]) ? -1.0f : 1.0f;
+            acc += (float)gv * sgn * x[e0 + l * 8 + jj];
+        }
+    }
+    return db * acc;
+}
+
 inline float lm_dot_run_iq4_nl(device const uchar *row, uint e0, device const float *x) {
     device const uchar *b = row + (e0 >> 5) * 18;
     float d = lm_f16_at(b);
@@ -1021,6 +1102,8 @@ inline float lm_dot_run(device const uchar *row, uint e0, device const float *x)
         case 9: return lm_dot_run_q3_K(row, e0, x);
         case 10: return lm_dot_run_iq4_nl(row, e0, x);
         case 11: return lm_dot_run_iq4_xs(row, e0, x);
+        case 12: return lm_dot_run_iq3_xxs(row, e0, x);
+        case 13: return lm_dot_run_iq3_s(row, e0, x);
         default: return 0.0f;
     }
 }
@@ -1037,6 +1120,8 @@ inline float lm_dequant(device const uchar *row, uint col) {
         case 9: return lm_dequant_q3_K(row, col);
         case 10: return lm_dequant_iq4_nl(row, col);
         case 11: return lm_dequant_iq4_xs(row, col);
+        case 12: return lm_dequant_iq3_xxs(row, col);
+        case 13: return lm_dequant_iq3_s(row, col);
         default: return 0.0f;
     }
 }
@@ -1093,6 +1178,8 @@ inline ulong lm_row_bytes(uint in_dim) {
         case 9: return (ulong)(in_dim / 256) * 110; // Q3_K
         case 10: return (ulong)(in_dim / 32) * 18;  // IQ4_NL
         case 11: return (ulong)(in_dim / 256) * 136; // IQ4_XS
+        case 12: return (ulong)(in_dim / 256) * 98;  // IQ3_XXS
+        case 13: return (ulong)(in_dim / 256) * 110; // IQ3_S
         default: return 0; // unused for element-addressable types
     }
 }
