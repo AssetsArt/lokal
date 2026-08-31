@@ -489,6 +489,22 @@ pub(crate) fn f16_buffer(device: &Device, data: &[f32]) -> Buffer {
     )
 }
 
+/// Width of one activation row that carries Q or attention output.
+///
+/// NOT hidden_size. q_dim = n_heads·head_dim is independent of hidden_size and
+/// is LARGER on real configs — Qwen3-0.6B is hidden 1024 / q_dim 2048, and
+/// qwen35's is hidden 5120 / q_dim 6144 — so a buffer sized by hidden_size is
+/// overrun by the q/att writes, and the first symptom is nondeterminism rather
+/// than a crash.
+///
+/// This exists as one function because the bug has now been found twice in two
+/// places: once in session_scratch and once in the serve batcher, which was
+/// missed when the first was fixed. Every path that allocates a Q- or
+/// attention-width row goes through here so there is no third place.
+pub(crate) fn attn_row_width(hidden: usize, q_dim: usize) -> usize {
+    hidden.max(q_dim)
+}
+
 pub(crate) fn f32_buffer(device: &Device, len: usize) -> Buffer {
     device.new_buffer((len * 4) as u64, MTLResourceOptions::StorageModeShared)
 }
@@ -1544,8 +1560,8 @@ impl MetalEngine {
             // q and attention rows are q_dim wide — qwen3's q_dim (heads x 128)
             // is 2x hidden, so sizing these by hidden overflows into whatever
             // the allocator placed next (the first symptom is nondeterminism).
-            q: f32_buffer(d, chunk * cfg.hidden_size.max(self.dims.q_dim)),
-            att: f32_buffer(d, chunk * cfg.hidden_size.max(self.dims.q_dim)),
+            q: f32_buffer(d, chunk * attn_row_width(cfg.hidden_size, self.dims.q_dim)),
+            att: f32_buffer(d, chunk * attn_row_width(cfg.hidden_size, self.dims.q_dim)),
             xb: f32_buffer(d, chunk * cfg.hidden_size),
             gate: f32_buffer(d, chunk * cfg.intermediate_size),
             up: f32_buffer(d, chunk * cfg.intermediate_size),
@@ -2320,8 +2336,13 @@ impl MetalEngine {
             ),
             x: f32_buffer(d, n_slots * h),
             xn: f32_buffer(d, n_slots * h),
-            q: f32_buffer(d, n_slots * h),
-            att: f32_buffer(d, n_slots * h),
+            // q and att are Q-WIDTH, not hidden-width — matvec_qkv_batch below
+            // writes blk.q_proj.out_dim per row. Sizing these by hidden_size
+            // overran them on every config where q_dim > hidden_size (Qwen3-0.6B
+            // and 4B among them); session_scratch had the same bug and this
+            // path was missed when that one was fixed.
+            q: f32_buffer(d, n_slots * attn_row_width(h, self.dims.q_dim)),
+            att: f32_buffer(d, n_slots * attn_row_width(h, self.dims.q_dim)),
             gate: f32_buffer(d, n_slots * cfg.intermediate_size),
             logits: f32_buffer(d, n_slots * cfg.vocab_size),
             partials: f32_buffer(
@@ -2539,6 +2560,29 @@ impl Session for MetalSession<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// q_dim is NOT hidden_size, and on real configs it is bigger. This pins
+    /// the invariant that every Q/attention-width allocation must use, because
+    /// getting it wrong overruns the buffer silently — the failure shows up as
+    /// nondeterminism, not as a crash, which is the worst way to find it.
+    ///
+    /// Found twice: session_scratch first, then the serve batcher, which was
+    /// still sizing q/att by hidden_size long after the first fix. The numbers
+    /// below are real configs, not invented ones.
+    #[test]
+    fn attn_rows_are_q_wide_not_hidden_wide() {
+        use super::attn_row_width;
+        // Qwen3-0.6B: hidden 1024, 16 heads x 128 = q_dim 2048.
+        assert_eq!(attn_row_width(1024, 2048), 2048, "0.6B q rows are 2x hidden");
+        // qwen35 27B: hidden 5120, q_dim 6144.
+        assert_eq!(attn_row_width(5120, 6144), 6144, "qwen35 q rows exceed hidden");
+        // Qwen3-8B: hidden 4096, 32 heads x 128 = q_dim 4096 — equal, and the
+        // reason the bug hid for so long: the models people tested were exactly
+        // the ones where the two happen to coincide.
+        assert_eq!(attn_row_width(4096, 4096), 4096);
+        // A hidden-dominant config must still get hidden.
+        assert_eq!(attn_row_width(8192, 4096), 8192);
+    }
+
     #[test]
     fn window_cfg_mirror_matches_lowmem_formula() {
         // Pins the metal-side mirror (challenge 7c1a09cf) to lowmem's values:
