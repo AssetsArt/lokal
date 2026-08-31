@@ -375,6 +375,47 @@ pub(crate) struct Qwen35Layout {
 }
 
 impl Qwen35Layout {
+    /// MRoPE'S PRECONDITION, refused by name rather than silently assumed.
+    ///
+    /// qwen35 carries `rope.dimension_sections` and llama.cpp routes it through
+    /// ggml_mrope_cache_init. For a TEXT batch that function is a no-op relative
+    /// to plain rope — llama-batch.cpp:781-787 broadcasts ONE position into all
+    /// four components, ops.cpp sets indep_sects = is_vision so the per-section
+    /// resets never fire, and every one of the four thetas is multiplied by the
+    /// same theta_scale each pair. All four therefore stay equal for the whole
+    /// sequence, so whichever theta a sector selects is the plain-rope theta.
+    /// `mrope_degenerates_to_rope_for_text_batches` pins that numerically.
+    ///
+    /// The REAL precondition is a property of the batch, not the checkpoint:
+    /// this engine never constructs a vision batch. What metadata CAN tell us is
+    /// whether a checkpoint belongs to the family that equivalence was verified
+    /// on. A vision-capable variant reaches the same rope path and would be
+    /// silently rotated with the wrong thetas — the one way this bites — so an
+    /// unrecognised section layout is refused by name here instead.
+    ///
+    /// Deliberately NOT done: a sectioned rope kernel. Its best possible outcome
+    /// is bit-identity with the rope we already ship, against a hand-derived
+    /// index mapping that could be wrong (Detoro's ruling, task note e0449773).
+    pub fn check_rope_sections(m: &crate::lowmem::gguf::Qwen35Meta) -> Result<(), String> {
+        let s = &m.rope_sections;
+        let sum: usize = s.iter().sum();
+        if sum == 0 {
+            return Err(format!(
+                "qwen35: rope.dimension_sections is all zeros {s:?} — no rotary sections to \
+                 map; refusing rather than rotating with an undefined layout"
+            ));
+        }
+        if s[3] != 0 {
+            return Err(format!(
+                "qwen35: rope.dimension_sections {s:?} has a non-zero 4th (vision 'extra') \
+                 section — this is a vision-capable variant. This engine only builds text \
+                 batches, which is what makes MRoPE equivalent to plain rope, and it has no \
+                 sectioned rope kernel. Refusing by name rather than rotating it as text."
+            ));
+        }
+        Ok(())
+    }
+
     /// The one meta→layout translation, so no caller re-derives sizes (where
     /// the 17-layer misconception would creep back in): the map is exactly the
     /// TRUNK's is_recurrent — the MTP block is not in the meta's map at all.
@@ -1152,6 +1193,16 @@ impl MetalEngine {
     }
 
     /// Decode-only: RoPE on q and this position's new k cache row, one dispatch.
+    // qwen35 NOTE — do not "fix" this by adding MRoPE sectioning. qwen35 ships
+    // rope.dimension_sections and llama.cpp routes it through
+    // ggml_mrope_cache_init, but for a TEXT batch that is provably the same
+    // rope as this one: one position is broadcast into all four components, so
+    // the four thetas start equal and are all scaled by theta_scale every pair,
+    // and the sector select can never pick a different value. Pinned by
+    // qwen35_kernel_oracle::mrope_degenerates_to_rope_for_text_batches (with a
+    // vision-path negative control), and vision-capable checkpoints are refused
+    // by name in Qwen35Layout::check_rope_sections. A sectioned kernel's best
+    // possible outcome is bit-identity with this one.
     fn enc_rope_qk(
         &self,
         enc: &ComputeCommandEncoderRef,
@@ -3321,6 +3372,133 @@ mod qwen35_kernel_oracle {
             want.iter().zip(&got).any(|(a, b)| a.to_bits() != b.to_bits()),
             "a rotated ssm_norm weight must change the output, or w's indexing is untested"
         );
+    }
+
+    /// (a) of the MRoPE ruling: the equivalence PINNED, not remembered.
+    ///
+    /// Both theta sequences are transcribed from ggml (ops.cpp
+    /// ggml_rope_cache_init and ggml_mrope_cache_init, read on this box, not
+    /// recalled) — only the theta each pair uses, since that is the entire
+    /// claim; rope_yarn is common to both paths and would only add noise.
+    ///
+    /// For a text batch all four position components carry the SAME position,
+    /// so theta_t/h/w/e start equal, and the loop multiplies all four by
+    /// theta_scale every pair — they can never diverge, so the sector select is
+    /// a no-op. That is why no sectioned kernel is needed.
+    ///
+    /// The negative control is in the same test on purpose: flipping
+    /// indep_sects (llama.cpp's vision path, where the thetas ARE reset at
+    /// section boundaries) must make the sequences differ. Without it, a
+    /// transcription that accidentally computed plain rope twice would "prove"
+    /// the equivalence while checking nothing.
+    #[test]
+    fn mrope_degenerates_to_rope_for_text_batches() {
+        // ops.cpp: theta_scale = powf(freq_base, -2/n_dims).
+        let (ne0, freq_base) = (256usize, 1.0e6f32);
+        let theta_scale = freq_base.powf(-2.0 / ne0 as f32);
+        let sections = [11usize, 11, 10, 0];
+
+        // ggml_rope_cache_init: one theta, scaled once per pair.
+        let rope_thetas = |base: f32| -> Vec<f32> {
+            let mut theta = base;
+            (0..ne0 / 2)
+                .map(|_| {
+                    let t = theta;
+                    theta *= theta_scale;
+                    t
+                })
+                .collect()
+        };
+
+        // ggml_mrope_cache_init, non-interleaved branch.
+        let mrope_thetas = |bases: [f32; 4], indep_sects: bool| -> Vec<f32> {
+            let sect_dims: usize = sections.iter().sum();
+            let sec_w = sections[1] + sections[0];
+            let sec_e = sections[2] + sec_w;
+            let mut th = bases;
+            (0..ne0 / 2)
+                .map(|pair| {
+                    let sector = pair % sect_dims;
+                    if indep_sects {
+                        if sector == 0 {
+                            th[0] = bases[0];
+                        } else if sector == sections[0] {
+                            th[1] = bases[1];
+                        } else if sector == sec_w {
+                            th[2] = bases[2];
+                        } else if sector == sec_e {
+                            th[3] = bases[3];
+                        }
+                    }
+                    let t = if sector >= sections[0] && sector < sec_w {
+                        th[1]
+                    } else if sector >= sec_w && sector < sec_w + sections[2] {
+                        th[2]
+                    } else if sector >= sec_w + sections[2] {
+                        th[3]
+                    } else {
+                        th[0]
+                    };
+                    for x in th.iter_mut() {
+                        *x *= theta_scale;
+                    }
+                    t
+                })
+                .collect()
+        };
+
+        let mut differing_pairs = 0;
+        for pos in 0..6u32 {
+            let base = pos as f32;
+            // A TEXT batch: one position broadcast into all four components.
+            let plain = rope_thetas(base);
+            let m = mrope_thetas([base; 4], false);
+            for (i, (a, b)) in plain.iter().zip(&m).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "pos {pos} pair {i}: plain rope {a} vs mrope {b} — the equivalence this \
+                     lane relies on to ship NO sectioned kernel does not hold"
+                );
+            }
+            // The control: the vision path must NOT agree, or this proves nothing.
+            let vision = mrope_thetas([base; 4], true);
+            differing_pairs += plain.iter().zip(&vision).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        }
+        assert!(
+            differing_pairs > 0,
+            "indep_sects made no difference — the probe cannot see a sectioned rope, \
+             so the equivalence above is not evidence"
+        );
+    }
+
+    /// (b) of the MRoPE ruling: the precondition is refused BY NAME. A
+    /// vision-capable checkpoint reaches the same rope path and would be
+    /// silently rotated as text — the only way this finding can bite.
+    #[test]
+    fn vision_section_layout_is_refused_by_name() {
+        let mut meta = crate::lowmem::gguf::Qwen35Meta {
+            trunk_layers: 64,
+            nextn_layers: 1,
+            full_attention_interval: 4,
+            is_recurrent: (0..64).map(|i| (i + 1) % 4 != 0).collect(),
+            d_conv: 4,
+            d_state: 128,
+            n_group: 16,
+            dt_rank: 48,
+            d_inner: 6144,
+            rope_sections: [11, 11, 10, 0], // the real 27B layout
+            conv_state_elems: 30_720,
+            delta_state_elems: 786_432,
+        };
+        assert!(super::Qwen35Layout::check_rope_sections(&meta).is_ok(), "the real 27B layout must pass");
+
+        meta.rope_sections = [11, 11, 10, 4];
+        let err = super::Qwen35Layout::check_rope_sections(&meta).unwrap_err();
+        assert!(err.contains("vision"), "the refusal must name why: {err}");
+
+        meta.rope_sections = [0, 0, 0, 0];
+        assert!(super::Qwen35Layout::check_rope_sections(&meta).is_err(), "all-zero sections must refuse");
     }
 
     /// Run l2norm_rows over `rows` (one threadgroup per row) and read them back.
