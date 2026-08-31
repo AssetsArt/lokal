@@ -301,6 +301,28 @@ checkpoint reads beside staged pages: an over-budget page does not stage at
 all, so a stage-in count alone would call a run that streamed 1.5 GB in eight
 decode steps "resident". A checkpoint that fits shows zeros in both.
 
+**Streaming, and one path deliberately left off.** A page that does not fit the
+budget is not staged at all: it is read straight from the checkpoint's mmap
+through a no-copy Metal view, so streamed bytes cross the bus once. For bf16
+that needs its own pipeline (the pool holds f16, the file holds bf16); for
+quantized weights it needs none, because a pool page and a file span hold the
+same blocks and the staged pipeline reads either.
+
+Quantized direct-read nonetheless ships **off by default**, behind
+`LOKAL_LOWMEM_QDIRECT=1`. Spans admitted at 4- or 16-byte alignment decode into
+garbage, while 64 and 128 are exact; Q4_K alone reproduces it, and since every
+offset here is already 32-aligned (GGUF aligns tensor data to 32, the view base
+to a page), what fails is precisely the 32-mod-64 spans. That is a bound, not a
+mechanism. The obvious suspect — a widened `u16`/`u32` load over Q4_K's
+`d`/`dmin`/packed-scale area, which Metal leaves undefined when misaligned —
+has been **ruled out**: `lm_f16_at` assembles halves byte-wise
+(`p[0] | (p[1] << 8)`) and the 6-bit scales are read a byte at a time, so no
+load in the dequant path is wider than one byte. The remaining suspect is
+`setBuffer:offset:` semantics against a `newBufferWithBytesNoCopy` view.
+Whoever picks this up: reproduce with Qwen3-0.6B-Q4_K_M at a 200 MB pool, and
+do not flip the default until the mechanism is named — the staged fallback is
+exact and always available, so the only thing at stake is streaming speed.
+
 **Budget.** `--memory-budget` (4096 MB) splits closed-form: KV and activation
 scratch are computed exactly, a fixed overhead estimate covers the runtime,
 and the weight pool takes the rest; the split prints as one line at load, and
