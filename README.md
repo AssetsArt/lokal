@@ -208,10 +208,14 @@ lets Mistral's sliding window carry long documents). Without the flags,
 behavior is bit-for-bit unchanged. On `-b hybrid`, the ANE's graphs compute full causal
 attention, which below position W is EXACTLY the window+sink result — so the
 ANE serves those positions and windowed Metal takes everything past them, no
-graph re-export, no approximation. In serve mode a window means per-request
-sessions (the batcher pool keeps the full-causal layout), `--draft` is
-refused, and RoPE positions past the trained length degrade quality — same
-caveat as lowmem.
+graph re-export, no approximation. Speed-wise the mode is a
+long-context play, not a general win: at W=2048 on Qwen 0.5B the windowed
+prefill curve is flat (2,669 / 2,495 / 2,716 tok/s at 2k/4k/8k) where full
+attention starts higher and falls (3,164 / 3,149 / 2,402) — the lines cross
+around 8k, and past it the gap only widens while full-causal KV keeps
+growing. In serve mode a window means per-request sessions (the batcher pool
+keeps the full-causal layout), `--draft` is refused, and RoPE positions past
+the trained length degrade quality — same caveat as lowmem.
 
 The export step needs [uv](https://docs.astral.sh/uv/) and runs offline.
 Placement is verified, not assumed: inspecting the compiled graph with the
