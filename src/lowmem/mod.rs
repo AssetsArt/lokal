@@ -13,6 +13,7 @@
 
 mod forward;
 pub(crate) mod gguf;
+pub(crate) mod iq_grids;
 pub(crate) mod manifest;
 mod pool;
 
