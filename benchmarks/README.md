@@ -42,6 +42,30 @@ separate because `vmmap` suspends its target and would corrupt a timed number.
 If it refuses, the machine was not idle enough — the refusal is the result, not
 an obstacle to work around.
 
+### Checking a quantized type against llama.cpp
+
+`agree-vs-llamacpp.py` compares lokal's greedy output against llama.cpp on the
+**same GGUF file** — the only comparison that isolates our dequantization from
+everything else. Start `llama-server` on the file, then:
+
+```
+python3 benchmarks/agree-vs-llamacpp.py <model.gguf>
+```
+
+Two rules are baked in because both were learned the hard way. It talks to
+`llama-server`'s `/completion` with `cache_prompt: false`, never `llama-cli` —
+`llama-cli` applies the GGUF's chat template to Instruct models even under
+`-no-cnv`, and `-st` is a conversation flag that re-enables it, so its text
+reads as total disagreement at token 1 while the kernels are fine. And one
+prompt is deliberately long: every prompt here was once under twenty tokens,
+and a real scratch-buffer sizing bug passed the check 5/5 because nothing
+reached the oversized region. Short prompts test the math, long prompts test
+the sizes.
+
+Agreement, not identity, is the bar — summation order differs, so greedy
+decoding eventually elects a different token. An EARLY divergence is the signal
+that means a real bug.
+
 ## Setup
 
 - Hardware: Apple M1 Pro, 16 GB RAM, macOS 26.5
