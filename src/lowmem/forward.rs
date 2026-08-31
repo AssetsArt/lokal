@@ -115,7 +115,7 @@ impl<'a> LowMemSession<'a> {
         let d = &e.device;
         let cap = e.win.cap;
         let chunk = gpu::PREFILL_CHUNK.min(max_seq);
-        let (h, kvd) = (cfg.hidden_size, cfg.kv_dim());
+        let (h, kvd) = (cfg.hidden_size, e.dims.kv_dim);
         Self {
             k_cache: (0..cfg.num_hidden_layers)
                 .map(|_| gpu::f16_empty_buffer(d, cap * kvd))
@@ -132,14 +132,14 @@ impl<'a> LowMemSession<'a> {
             up: gpu::f32_buffer(d, chunk * cfg.intermediate_size),
             kvs: gpu::f32_buffer(d, 2 * chunk * kvd),
             xh: gpu::f16_empty_buffer(d, chunk * h),
-            scores: if cfg.head_dim() == gpu::FLASH_HEAD_DIM {
+            scores: if e.dims.head_dim == gpu::FLASH_HEAD_DIM {
                 gpu::f32_buffer(d, 1) // flash path never reads it — stub binding
             } else {
                 gpu::f32_buffer(d, chunk * cfg.num_attention_heads * cap)
             },
             partials: gpu::f32_buffer(
                 d,
-                cfg.num_attention_heads * (cap / gpu::ATTN_SPLIT) * (cfg.head_dim() + 2),
+                cfg.num_attention_heads * (cap / gpu::ATTN_SPLIT) * (e.dims.head_dim + 2),
             ),
             logits: gpu::f32_buffer(d, cfg.vocab_size),
             mark: PoolStats::default(),
@@ -222,6 +222,49 @@ impl<'a> LowMemSession<'a> {
         enc.set_buffer(1, Some(weight), 0);
         enc.set_buffer(2, Some(y), 0);
         set_bytes(enc, 3, &p);
+        enc.dispatch_thread_groups(MTLSize::new(n_rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    /// RMSNorm over rows of an arbitrary width — qk-norm normalizes each HEAD
+    /// (dim = head_dim), not each token, so one token contributes n_heads rows.
+    /// Safe in place: the kernel reduces the row into threadgroup memory and
+    /// barriers before any thread writes back, so no thread reads a value
+    /// another has already scaled.
+    fn enc_rmsnorm_dim(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: &Buffer,
+        x_off: u64,
+        weight: &Buffer,
+        n_rows: usize,
+        dim: usize,
+    ) {
+        let p = NormParams { dim: dim as u32, eps: self.e.cfg.rms_norm_eps };
+        enc.set_compute_pipeline_state(&self.e.pipes.rmsnorm);
+        enc.set_buffer(0, Some(x), x_off);
+        enc.set_buffer(1, Some(weight), 0);
+        enc.set_buffer(2, Some(x), x_off);
+        set_bytes(enc, 3, &p);
+        enc.dispatch_thread_groups(MTLSize::new(n_rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    /// The same, on an f16 buffer in place — decode writes K straight into the
+    /// cache, so its qk-norm has to happen there rather than on an f32 staging
+    /// copy the way prefill's does.
+    fn enc_rmsnorm_h(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: &Buffer,
+        x_off: u64,
+        weight: &Buffer,
+        n_rows: usize,
+        dim: usize,
+    ) {
+        let p = NormParams { dim: dim as u32, eps: self.e.cfg.rms_norm_eps };
+        enc.set_compute_pipeline_state(&self.e.pipes.rmsnorm_h_inplace);
+        enc.set_buffer(0, Some(x), x_off);
+        enc.set_buffer(1, Some(weight), 0);
+        set_bytes(enc, 2, &p);
         enc.dispatch_thread_groups(MTLSize::new(n_rows as u64, 1, 1), MTLSize::new(256, 1, 1));
     }
 
@@ -369,14 +412,21 @@ impl<'a> LowMemSession<'a> {
     ) {
         let e = self.e;
         let cfg = &e.cfg;
-        let (h, hd, kvd) = (cfg.hidden_size, cfg.head_dim(), cfg.kv_dim());
+        let (h, hd, kvd) = (cfg.hidden_size, self.e.dims.head_dim, self.e.dims.kv_dim);
         let v_base = (self.chunk * kvd * 4) as u64; // V's half of the kvs staging
 
         // Attention half.
         self.enc_rmsnorm(enc, &self.x, 0, &lw.input_ln, &self.xn, n);
-        self.enc_matmul_paged(enc, pool, &lw.q, &self.xn, &self.q, n, 0, h);
+        self.enc_matmul_paged(enc, pool, &lw.q, &self.xn, &self.q, n, 0, self.e.dims.q_dim);
         self.enc_matmul_paged(enc, pool, &lw.k, &self.xn, &self.kvs, n, 0, kvd);
         self.enc_matmul_paged(enc, pool, &lw.v, &self.xn, &self.kvs, n, v_base, kvd);
+        // qwen3 normalizes every head of q and k before RoPE. q is f32 in its
+        // own buffer; k is still in the f32 staging half, which is why this
+        // lands BEFORE the f32_to_f16 spans below rather than after.
+        if let (Some(qn), Some(kn)) = (&lw.q_norm, &lw.k_norm) {
+            self.enc_rmsnorm_dim(enc, &self.q, 0, qn, n * cfg.num_attention_heads, hd);
+            self.enc_rmsnorm_dim(enc, &self.kvs, 0, kn, n * cfg.num_key_value_heads, hd);
+        }
         // RoPE q as one launch, then per destination span: convert the fresh
         // K/V rows into the store and rotate K there by its true positions.
         {
@@ -471,13 +521,17 @@ impl<'a> LowMemSession<'a> {
     ) {
         let e = self.e;
         let cfg = &e.cfg;
-        let hd = cfg.head_dim();
-        let kv_byte_off = (e.win.slot_of(pos) * cfg.kv_dim() * 2) as u64;
+        let hd = e.dims.head_dim;
+        let kv_byte_off = (e.win.slot_of(pos) * e.dims.kv_dim * 2) as u64;
 
         self.enc_rmsnorm(enc, &self.x, 0, &lw.input_ln, &self.xn, 1);
         self.enc_matvec_bound(enc, Fam::Mv, &lw.q, &plan.q, &self.xn, &self.q, 0, 4);
         self.enc_matvec_bound(enc, Fam::MvH, &lw.k, &plan.k, &self.xn, &self.k_cache[l], kv_byte_off, 2);
         self.enc_matvec_bound(enc, Fam::MvH, &lw.v, &plan.v, &self.xn, &self.v_cache[l], kv_byte_off, 2);
+        if let (Some(qn), Some(kn)) = (&lw.q_norm, &lw.k_norm) {
+            self.enc_rmsnorm_dim(enc, &self.q, 0, qn, cfg.num_attention_heads, hd);
+            self.enc_rmsnorm_h(enc, &self.k_cache[l], kv_byte_off, kn, cfg.num_key_value_heads, hd);
+        }
         {
             let p = RopeQkParams {
                 head_dim: hd as u32,
@@ -574,7 +628,7 @@ impl<'a> LowMemSession<'a> {
     fn run(&mut self, ids: &[u32], pos0: usize, want_logits: bool) -> crate::Result<Vec<f32>> {
         let e = self.e;
         let cfg = &e.cfg;
-        let (h, hd) = (cfg.hidden_size, cfg.head_dim());
+        let (h, hd) = (cfg.hidden_size, self.e.dims.head_dim);
         let n = ids.len();
         let fused_decode = n == 1 && hd <= gpu::DEC_TG && hd.is_multiple_of(4);
         // One session encodes at a time — concurrent serve sessions serialize

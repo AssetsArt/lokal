@@ -46,8 +46,41 @@ struct MemoryPlan {
     pool_bytes: usize,
 }
 
-fn memory_plan(cfg: &ModelConfig, win: &WindowCfg, budget_mb: usize) -> crate::Result<MemoryPlan> {
-    let (h, hd, kvd) = (cfg.hidden_size, cfg.head_dim(), cfg.kv_dim());
+/// Attention widths, taken from the checkpoint rather than derived.
+///
+/// ModelConfig::head_dim() computes hidden_size / n_heads, which qwen3 breaks:
+/// it states head_dim explicitly and it does NOT satisfy that identity
+/// (Qwen3-0.6B is hidden 1024, 16 heads, head_dim 128, so q_proj is
+/// [2048, 1024], not [1024, 1024]). Every width inside lowmem comes from here.
+#[derive(Clone, Copy)]
+pub(crate) struct Dims {
+    pub hidden: usize,
+    pub head_dim: usize,
+    /// n_heads * head_dim — the q and o projections' outer width.
+    pub q_dim: usize,
+    /// n_kv_heads * head_dim.
+    pub kv_dim: usize,
+}
+
+impl Dims {
+    fn new(cfg: &ModelConfig, head_dim: Option<usize>) -> Self {
+        let head_dim = head_dim.unwrap_or_else(|| cfg.head_dim());
+        Dims {
+            hidden: cfg.hidden_size,
+            head_dim,
+            q_dim: cfg.num_attention_heads * head_dim,
+            kv_dim: cfg.num_key_value_heads * head_dim,
+        }
+    }
+}
+
+fn memory_plan(
+    cfg: &ModelConfig,
+    dims: Dims,
+    win: &WindowCfg,
+    budget_mb: usize,
+) -> crate::Result<MemoryPlan> {
+    let (h, hd, kvd) = (dims.hidden, dims.head_dim, dims.kv_dim);
     let chunk = gpu::PREFILL_CHUNK;
     // KV store: K and V, f16, cap slots per layer — closed-form in the window.
     let kv_bytes = cfg.num_hidden_layers * win.cap * kvd * 2 * 2;
@@ -118,6 +151,8 @@ impl WindowCfg {
 /// compiled from the same source string as the metal backend's.
 pub(crate) struct Pipes {
     pub rmsnorm: ComputePipelineState,
+    /// qwen3 qk-norm on the f16 KV cache, in place.
+    pub rmsnorm_h_inplace: ComputePipelineState,
     pub matvec: ComputePipelineState,
     pub matvec_h: ComputePipelineState,
     pub matvec_acc: ComputePipelineState,
@@ -174,6 +209,10 @@ pub(crate) enum Fam {
 pub(crate) struct LayerWeights {
     pub input_ln: Buffer,
     pub post_ln: Buffer,
+    /// qwen3's per-head q/k RMSNorm weights (head_dim each), applied to every
+    /// head of q and k before RoPE. None on architectures without qk-norm.
+    pub q_norm: Option<Buffer>,
+    pub k_norm: Option<Buffer>,
     pub q: PagedTensor,
     pub k: PagedTensor,
     pub v: PagedTensor,
@@ -311,6 +350,15 @@ impl LowMemSource {
         v
     }
 
+    /// Explicit head dim when the checkpoint states one (GGUF always does).
+    /// None means "derive it", which is right for every safetensors model here.
+    pub fn head_dim(&self) -> Option<usize> {
+        match self {
+            LowMemSource::Safetensors(_) => None,
+            LowMemSource::Gguf(g) => Some(g.arch.head_dim),
+        }
+    }
+
     /// qwen3-style per-head q/k norm, straight from the file's metadata.
     pub fn qk_norm(&self) -> bool {
         match self {
@@ -425,6 +473,7 @@ impl GgufSource {
 
 pub struct LowMemEngine {
     cfg: ModelConfig,
+    dims: Dims,
     source: LowMemSource,
     device: Device,
     queue: CommandQueue,
@@ -472,10 +521,11 @@ impl LowMemEngine {
             t0.elapsed().as_secs_f64(),
         );
 
+        let dims = Dims::new(&cfg, source.head_dim());
         let device = Device::system_default().ok_or("no Metal-capable GPU found")?;
         source.make_gpu_views(&device);
         let queue = device.new_command_queue();
-        let shader = gpu::shader_source(cfg.kv_dim());
+        let shader = gpu::shader_source(dims.kv_dim);
         let lib = device
             .new_library_with_source(&shader, &CompileOptions::new())
             .map_err(|e| format!("failed to compile kernels.metal: {e}"))?;
@@ -593,6 +643,7 @@ impl LowMemEngine {
         };
         let pipes = Pipes {
             rmsnorm: pipe("rmsnorm")?,
+            rmsnorm_h_inplace: pipe("rmsnorm_h_inplace")?,
             matvec: pipe("matvec")?,
             matvec_h: pipe("matvec_h")?,
             matvec_acc: pipe("matvec_acc")?,
@@ -642,17 +693,26 @@ impl LowMemEngine {
             Ok(t)
         };
 
-        let (h, kv) = (cfg.hidden_size, cfg.kv_dim());
+        let (h, kv) = (cfg.hidden_size, dims.kv_dim);
+        let qk_norm = source.qk_norm();
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{i}");
             layers.push(LayerWeights {
                 input_ln: small(format!("{p}.input_layernorm.weight"))?,
                 post_ln: small(format!("{p}.post_attention_layernorm.weight"))?,
-                q: mk(format!("{p}.self_attn.q_proj"), h, h)?,
+                q_norm: match qk_norm {
+                    true => Some(small(format!("{p}.self_attn.q_norm.weight"))?),
+                    false => None,
+                },
+                k_norm: match qk_norm {
+                    true => Some(small(format!("{p}.self_attn.k_norm.weight"))?),
+                    false => None,
+                },
+                q: mk(format!("{p}.self_attn.q_proj"), h, dims.q_dim)?,
                 k: mk(format!("{p}.self_attn.k_proj"), h, kv)?,
                 v: mk(format!("{p}.self_attn.v_proj"), h, kv)?,
-                o: mk(format!("{p}.self_attn.o_proj"), h, h)?,
+                o: mk(format!("{p}.self_attn.o_proj"), dims.q_dim, h)?,
                 gate: mk(format!("{p}.mlp.gate_proj"), h, cfg.intermediate_size)?,
                 up: mk(format!("{p}.mlp.up_proj"), h, cfg.intermediate_size)?,
                 down: mk(format!("{p}.mlp.down_proj"), cfg.intermediate_size, h)?,
@@ -677,7 +737,7 @@ impl LowMemEngine {
         // The budget split (D9). LOKAL_LOWMEM_POOL_MB stays as a debug override
         // that pins the pool directly, bypassing the arithmetic.
         let budget_mb = opts.memory_budget_mb.unwrap_or(BUDGET_MB_DEFAULT);
-        let plan = memory_plan(&cfg, &win, budget_mb)?;
+        let plan = memory_plan(&cfg, dims, &win, budget_mb)?;
         let pool_bytes = match std::env::var("LOKAL_LOWMEM_POOL_MB") {
             Ok(v) => v.parse::<usize>().map(|mb| mb << 20).unwrap_or(plan.pool_bytes),
             Err(_) => plan.pool_bytes,
@@ -731,6 +791,7 @@ impl LowMemEngine {
             clip_warned: std::sync::atomic::AtomicBool::new(false),
             cfg,
             source,
+            dims,
             quant,
             device,
             queue,
@@ -832,13 +893,13 @@ mod tests {
     fn budget_arithmetic_refuses_impossible_budgets() {
         let cfg = qwen05b_cfg();
         let win = WindowCfg::new(2048, 4).unwrap();
-        let err = match memory_plan(&cfg, &win, 300) {
+        let err = match memory_plan(&cfg, Dims::new(&cfg, None), &win, 300) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("a 300 MB budget must be refused"),
         };
         assert!(err.contains("--memory-budget 300"), "{err}");
         assert!(err.contains("weight-pool floor"), "{err}");
-        let plan = memory_plan(&cfg, &win, 4096).unwrap();
+        let plan = memory_plan(&cfg, Dims::new(&cfg, None), &win, 4096).unwrap();
         let total = plan.kv_bytes + plan.act_bytes + (OVERHEAD_MB << 20) + plan.pool_bytes;
         assert_eq!(total, 4096 << 20);
         assert!(plan.pool_bytes >= 4 * PAGE_BYTES);
