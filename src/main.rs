@@ -14,8 +14,10 @@
 mod ane;
 mod batch;
 mod config;
+mod deltanet_ref;
 mod engine;
 mod generate;
+mod gguf;
 mod gpu;
 mod hub;
 #[cfg(target_os = "macos")]
@@ -323,8 +325,7 @@ fn gguf_setup(
     path: &std::path::Path,
     win: Option<(usize, usize)>,
 ) -> Result<(config::ModelConfig, tokenizers::Tokenizer, Option<Box<dyn engine::Engine>>)> {
-    use lowmem::gguf;
-    let g = gguf::GgufFile::open(path)?;
+        let g = gguf::GgufFile::open(path)?;
     // LOKAL_GGUF_INFO=1: dump the tensor table and exit — the cross-check gate
     // diffs this against `llama-cli --verbose` (parser-only, so it works even
     // on files whose tokenizer lokal refuses).
@@ -358,7 +359,7 @@ fn gguf_setup(
     //     no linear-block path yet, so it would fail on a tensor name at best
     //     and mis-read the joint Q+gate projection at worst.
     if arch.arch == "qwen35" {
-        let m = lowmem::gguf::qwen35_meta(&g)?;
+        let m = gguf::qwen35_meta(&g)?;
         crate::gpu::metal::Qwen35Layout::check_rope_sections(&m)?;
         if args.backend != "lowmem" {
             return Err(format!(

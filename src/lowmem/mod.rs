@@ -12,8 +12,6 @@
 //! windowed attention, and the --memory-budget arithmetic.
 
 mod forward;
-pub(crate) mod gguf;
-pub(crate) mod qwen35_ref;
 pub(crate) mod iq_grids;
 pub(crate) mod manifest;
 #[allow(dead_code)] // consumers arrive with lane C
@@ -22,7 +20,9 @@ mod pool;
 use crate::config::ModelConfig;
 use crate::engine::{Engine, Session};
 use crate::gpu::metal as gpu;
-use manifest::{dequant_row_ref, GgmlType, WeightManifest};
+use crate::deltanet_ref;
+use crate::gguf::{self, dequant_row_ref, GgmlType};
+use manifest::WeightManifest;
 use metal::{Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, FunctionConstantValues, MTLDataType, MTLResourceOptions};
 use pool::{PagedTensor, WeightPool, PAGE_BYTES};
 use safetensors::Dtype;
@@ -453,7 +453,7 @@ fn qwen35_hf_name(gguf: &str) -> Option<String> {
 impl LowMemEngine {
     /// The deltanet geometry, in the form the kernels and the reference both
     /// speak. None on every non-qwen35 checkpoint.
-    pub(crate) fn delta_dims(&self) -> Option<qwen35_ref::DeltaDims> {
+    pub(crate) fn delta_dims(&self) -> Option<deltanet_ref::DeltaDims> {
         self.q35_dims
     }
 }
@@ -712,7 +712,7 @@ impl LowMemSource {
 }
 
 impl GgufSource {
-    fn tensor(&self, hf: &str) -> crate::Result<manifest::GgufTensor<'_>> {
+    fn tensor(&self, hf: &str) -> crate::Result<gguf::GgufTensor<'_>> {
         let gg = self.by_hf.get(hf).ok_or_else(|| format!("{hf}: not in this GGUF"))?;
         self.file.tensor(gg)
     }
@@ -748,7 +748,7 @@ pub struct LowMemEngine {
     /// both the kernels and lane B's reference speak, it is Copy, and it avoids
     /// this file depending on a `Clone` that gguf.rs (the loader lane's file)
     /// does not derive.
-    q35_dims: Option<qwen35_ref::DeltaDims>,
+    q35_dims: Option<deltanet_ref::DeltaDims>,
     /// LOKAL_LOWMEM_SYNC=1: wait out every command buffer before the next —
     /// the bisect mode for anything that smells like an eviction race.
     sync: bool,
@@ -1100,7 +1100,7 @@ impl LowMemEngine {
             sync: std::env::var("LOKAL_LOWMEM_SYNC").is_ok_and(|v| v == "1"),
             win,
             q35_layout,
-            q35_dims: q35_meta.as_ref().map(|m| qwen35_ref::DeltaDims {
+            q35_dims: q35_meta.as_ref().map(|m| deltanet_ref::DeltaDims {
                 d_state: m.d_state,
                 n_v_heads: m.dt_rank,
                 n_k_heads: m.n_group,
@@ -1301,7 +1301,7 @@ mod tests {
         let Some(path) = qwen35_gguf() else { panic!("Qwen3.5-2B GGUF not in the HF cache") };
         let src = LowMemSource::open(&path).expect("opens");
         let meta = src.qwen35().expect("qwen35 meta parses");
-        let d = crate::lowmem::qwen35_ref::DeltaDims {
+        let d = deltanet_ref::DeltaDims {
             d_state: meta.d_state,
             n_v_heads: meta.dt_rank,
             n_k_heads: meta.n_group,

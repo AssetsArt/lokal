@@ -150,7 +150,7 @@ struct DeltaScratch {
 }
 
 impl DeltaScratch {
-    fn new(d: &metal::Device, dims: crate::lowmem::qwen35_ref::DeltaDims, chunk: usize) -> Self {
+    fn new(d: &metal::Device, dims: crate::deltanet_ref::DeltaDims, chunk: usize) -> Self {
         let (c, inner, hv) = (dims.conv_channels(), dims.d_inner(), dims.n_v_heads);
         Self {
             qkv: gpu::f32_buffer(d, chunk * c),

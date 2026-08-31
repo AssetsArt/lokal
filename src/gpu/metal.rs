@@ -366,10 +366,10 @@ pub(crate) struct Qwen35States {
 
 pub(crate) struct Qwen35LayerState {
     /// Rolling conv history, (d_conv−1)·C f32 — layout [channel][d_conv−1],
-    /// oldest first (matches lowmem::qwen35_ref::conv_step).
+    /// oldest first (matches deltanet_ref::conv_step).
     pub conv: Buffer,
     /// Delta-rule state [S, S, H_v] f32 — i the contraction index
-    /// (s[i + j·S + h·S·S], matches lowmem::qwen35_ref::delta_decode_step).
+    /// (s[i + j·S + h·S·S], matches deltanet_ref::delta_decode_step).
     pub delta: Buffer,
 }
 
@@ -405,7 +405,7 @@ impl Qwen35Layout {
     /// Deliberately NOT done: a sectioned rope kernel. Its best possible outcome
     /// is bit-identity with the rope we already ship, against a hand-derived
     /// index mapping that could be wrong (Detoro's ruling, task note e0449773).
-    pub fn check_rope_sections(m: &crate::lowmem::gguf::Qwen35Meta) -> Result<(), String> {
+    pub fn check_rope_sections(m: &crate::gguf::Qwen35Meta) -> Result<(), String> {
         let s = &m.rope_sections;
         let sum: usize = s.iter().sum();
         if sum == 0 {
@@ -428,7 +428,7 @@ impl Qwen35Layout {
     /// The one meta→layout translation, so no caller re-derives sizes (where
     /// the 17-layer misconception would creep back in): the map is exactly the
     /// TRUNK's is_recurrent — the MTP block is not in the meta's map at all.
-    pub fn from_meta(m: &crate::lowmem::gguf::Qwen35Meta) -> Self {
+    pub fn from_meta(m: &crate::gguf::Qwen35Meta) -> Self {
         Self {
             is_recurrent: m.is_recurrent.clone(),
             conv_elems: m.conv_state_elems,
@@ -2079,7 +2079,7 @@ impl MetalSession<'_> {
                     let ty = q.source.src_type(q.embed_name)?;
                     let dst = unsafe { std::slice::from_raw_parts_mut(xp.add(i * h), h) };
                     match ty {
-                        SrcType::Quant(t) => crate::lowmem::manifest::dequant_row_ref(t, row, dst),
+                        SrcType::Quant(t) => crate::gguf::dequant_row_ref(t, row, dst),
                         SrcType::F16 => {
                             for (j, c) in row.chunks_exact(2).enumerate() {
                                 dst[j] = f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32();
@@ -2759,7 +2759,7 @@ mod tests {
     /// only the trunk's map.
     #[test]
     fn qwen35_layout_from_meta_is_trunk_shaped() {
-        let meta = crate::lowmem::gguf::Qwen35Meta {
+        let meta = crate::gguf::Qwen35Meta {
             trunk_layers: 64,
             nextn_layers: 1,
             full_attention_interval: 4,
@@ -2789,12 +2789,12 @@ mod tests {
 
 #[cfg(test)]
 mod qwen35_kernel_oracle {
-    //! GPU kernels vs lane B's CPU reference (src/lowmem/qwen35_ref.rs),
+    //! GPU kernels vs lane B's CPU reference (src/deltanet_ref.rs),
     //! bit-for-bit. Same doctrine as the quant oracle: the reference is the
     //! subject, the GPU is the thing under test, and a negative control proves
     //! the comparison can fail.
     use crate::gpu::metal as gpu;
-    use crate::lowmem::qwen35_ref as rf;
+    use crate::deltanet_ref as rf;
     use metal::{CompileOptions, Device, MTLResourceOptions, MTLSize};
 
     /// Small but structurally real: several channels, the true d_conv, and a
@@ -3529,7 +3529,7 @@ mod qwen35_kernel_oracle {
     /// silently rotated as text — the only way this finding can bite.
     #[test]
     fn vision_section_layout_is_refused_by_name() {
-        let mut meta = crate::lowmem::gguf::Qwen35Meta {
+        let mut meta = crate::gguf::Qwen35Meta {
             trunk_layers: 64,
             nextn_layers: 1,
             full_attention_interval: 4,
