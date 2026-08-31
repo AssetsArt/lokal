@@ -74,7 +74,7 @@ fallback, ever. Until L2 (metal-deltanet) merges, qwen35 GGUF runs on
 | backend | safetensors dense | safetensors Qwen3/Qwen3.5 | GGUF dense | GGUF qwen35 (deltanet) |
 |---|---|---|---|---|
 | `cpu` | runs | refused by name | runs — `load_f32` expansion (fits-in-RAM guarded) | refused: no gated-deltanet path |
-| `metal` | runs | refused by name | runs — direct quant execution, no expansion; **output currently wrong on every GGUF model** (RopeParams mirror regression, fix in flight) | refused: no gated-deltanet path |
+| `metal` | runs | refused by name | runs — direct quant execution, no expansion | refused: no gated-deltanet path |
 | `lowmem` | runs | refused by name | runs — budgeted streaming, CPU-side dequant by design | **runs** (d7baf25) |
 | `hybrid` (alias `ane`) | runs | refused by name | refused: ANE prefill graphs are exported from safetensors (L4 opens this) | refused: no gated-deltanet path |
 
@@ -158,6 +158,13 @@ proves rightness). Three-tier numerics doctrine for recurrent paths: bit-exact
 where achievable, measured-stateless and measured-conditioning tiers otherwise,
 with negative controls. Quantized models: token-level agreement expected at the
 quant level actually stored; numeric tolerance follows quantization.
+
+**A cell that runs has been shown to execute, not shown to be correct; only a
+cross-engine or cross-format comparison shows the second.** (Mellow, from the
+rope-mirror regression: the metal×GGUF cell was surveyed as "runs" at the same
+SHA that shipped it producing fluent, wrong output. Running a cell proves it
+executes. The same trap caught the gguf-loader q/k permute, which passed
+cpu==metal by being consistently wrong on both sides.)
 
 ## Benchmarks
 

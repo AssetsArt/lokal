@@ -166,7 +166,7 @@ with a one-line reason, never a silent fallback:
 | backend | safetensors (dense) | GGUF (dense) | GGUF (qwen35 deltanet) |
 |---|---|---|---|
 | `cpu` | runs | runs (f32 expansion) | refuses by name |
-| `metal` | runs | runs (direct quant execution) — **output currently wrong**: RopeParams mirror regression, fix in flight | refuses by name |
+| `metal` | runs | runs (direct quant execution) | refuses by name |
 | `lowmem` | runs | runs (budgeted streaming) | **runs** |
 | `hybrid` (alias `ane`) | runs | refuses (ANE prefill graphs are exported from safetensors) | refuses by name |
 

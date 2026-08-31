@@ -533,7 +533,7 @@ impl<'a> LowMemSession<'a> {
 
             // 2. depthwise conv + silu, rolling the conv state in place.
             #[repr(C)]
-            struct ConvP {
+            struct SsmConvParams {
                 channels: u32,
                 d_conv: u32,
             }
@@ -542,7 +542,7 @@ impl<'a> LowMemSession<'a> {
             enc.set_buffer(1, Some(&ds.qkv), coff);
             enc.set_buffer(2, Some(&la.conv1d), 0);
             enc.set_buffer(3, Some(&ds.conv_out), 0);
-            set_bytes(enc, 4, &ConvP { channels: c_all as u32, d_conv: d.d_conv as u32 });
+            set_bytes(enc, 4, &SsmConvParams { channels: c_all as u32, d_conv: d.d_conv as u32 });
             gpu::dispatch_grid(enc, c_all);
 
             // 3. l2-normalise q and k per K head, in place on their slices.
@@ -556,7 +556,7 @@ impl<'a> LowMemSession<'a> {
 
             // 4. the delta rule. q/k/v are three views of the conv output.
             #[repr(C)]
-            struct DeltaP {
+            struct DeltaStepParams {
                 d_state: u32,
                 n_v_heads: u32,
                 group: u32,
@@ -572,7 +572,7 @@ impl<'a> LowMemSession<'a> {
             set_bytes(
                 enc,
                 7,
-                &DeltaP { d_state: s_dim as u32, n_v_heads: hv as u32, group: (hv / hk) as u32 },
+                &DeltaStepParams { d_state: s_dim as u32, n_v_heads: hv as u32, group: (hv / hk) as u32 },
             );
             gpu::dispatch_grid(enc, s_dim * hv);
 
@@ -596,7 +596,7 @@ impl<'a> LowMemSession<'a> {
         let e = self.e;
         let (hd, heads) = (e.dims.head_dim, e.cfg.num_attention_heads);
         #[repr(C)]
-        struct P {
+        struct QGSplitParams {
             head_dim: u32,
             n_heads: u32,
             n_rows: u32,
@@ -605,7 +605,7 @@ impl<'a> LowMemSession<'a> {
         enc.set_buffer(0, Some(&self.q), 0);
         enc.set_buffer(1, Some(q), 0);
         enc.set_buffer(2, Some(gate), 0);
-        set_bytes(enc, 3, &P { head_dim: hd as u32, n_heads: heads as u32, n_rows: n as u32 });
+        set_bytes(enc, 3, &QGSplitParams { head_dim: hd as u32, n_heads: heads as u32, n_rows: n as u32 });
         gpu::dispatch_grid(enc, n * heads * hd);
         q
     }
