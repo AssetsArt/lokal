@@ -368,12 +368,23 @@ impl LowMemEngine {
         let pool = WeightPool::new(&device, pool_bytes);
         let staged_bytes = manifest.n_params * 2; // f16 in the pool, whatever the disk dtype
         if staged_bytes > pool_bytes {
-            // The ANE-compile lesson: long silent work must announce itself.
+            // The ANE-compile lesson: long silent work must announce itself. And
+            // the decode line pre-answers "why is the GPU idle": past the budget
+            // every token re-streams the non-resident remainder from disk, so the
+            // GPU's few ms of matvec work per token round to zero on a power
+            // gauge — the machine is busy reading, not computing.
+            let stream_bytes = staged_bytes - pool_bytes;
             eprintln!(
-                "lowmem: model needs {:.1} GB staged but the weight pool holds {:.1} GB — running disk-bound; a full prefill pass streams the whole model (~{:.0}s per sweep at SSD speed)",
+                "lowmem: model needs {:.1} GB staged but the weight pool holds {:.1} GB — running disk-bound: \
+                 prefill streams the whole model once per {} tokens (~{:.1}s per sweep at SSD speed), \
+                 decode streams the non-resident {:.1} GB EVERY token (~{:.1}s/token; the GPU will look idle — \
+                 it is waiting on the disk). A quantized checkpoint that fits the pool removes this entirely.",
                 staged_bytes as f64 / (1 << 30) as f64,
                 pool_bytes as f64 / (1 << 30) as f64,
+                gpu::PREFILL_CHUNK,
                 staged_bytes as f64 / 2.5e9,
+                stream_bytes as f64 / (1 << 30) as f64,
+                stream_bytes as f64 / 2.5e9,
             );
         }
         // The one-line budget arithmetic, printed at load (D9).
