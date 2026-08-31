@@ -11,7 +11,7 @@
 
 use crate::config::ModelConfig;
 use crate::math::{dot, matvec, rmsnorm, silu, softmax};
-use crate::weights::TensorMap;
+use crate::weights::TensorStore;
 use std::path::Path;
 
 /// A plain linear layer: y = W·x (+ bias), with W shaped [out, in].
@@ -35,6 +35,35 @@ impl Linear {
     }
 }
 
+/// docs/gguf-design.md §MoE: the FFN shape seam. Dense is the only
+/// constructor on main; the MoE arm is a SHELL — it constructs nowhere and
+/// carries no invented router layout (building one against a hypothetical
+/// checkpoint is exactly the creep the design forbids). It exists so L5
+/// changes shape — a constructor and an arm — rather than cutting a new seam.
+pub(crate) enum FeedForward {
+    Dense(DenseFfn),
+    #[allow(dead_code)]
+    MoE {},
+}
+
+/// The dense silu-gated FFN every shipped model uses (SwiGLU per T2's enum).
+pub(crate) struct DenseFfn {
+    pub(crate) gate_proj: Linear,
+    pub(crate) up_proj: Linear,
+    pub(crate) down_proj: Linear,
+}
+
+impl FeedForward {
+    /// The dense projections, for backends that upload weights (GPU engines).
+    /// Panics on the MoE shell — nothing can construct it yet.
+    pub(crate) fn dense(&self) -> &DenseFfn {
+        match self {
+            FeedForward::Dense(f) => f,
+            FeedForward::MoE {} => unreachable!("no MoE constructor exists (L5)"),
+        }
+    }
+}
+
 /// One transformer block's weights — field names match the safetensors tensor names.
 pub(crate) struct Block {
     pub(crate) input_layernorm: Vec<f32>, // norm before attention
@@ -46,9 +75,24 @@ pub(crate) struct Block {
     pub(crate) q_norm: Option<Vec<f32>>,
     pub(crate) k_norm: Option<Vec<f32>>,
     pub(crate) post_attention_layernorm: Vec<f32>, // norm before the MLP
-    pub(crate) gate_proj: Linear,
-    pub(crate) up_proj: Linear,
-    pub(crate) down_proj: Linear,
+    pub(crate) ffn: FeedForward,
+}
+
+impl Block {
+    fn n_params(&self) -> usize {
+        let lin = |l: &Linear| l.w.len() + l.bias.as_ref().map_or(0, Vec::len);
+        self.input_layernorm.len()
+            + self.post_attention_layernorm.len()
+            + self.q_norm.as_ref().map_or(0, Vec::len)
+            + self.k_norm.as_ref().map_or(0, Vec::len)
+            + {
+                let f = self.ffn.dense();
+                [&self.q_proj, &self.k_proj, &self.v_proj, &self.o_proj, &f.gate_proj, &f.up_proj, &f.down_proj]
+            }
+                .into_iter()
+                .map(lin)
+                .sum::<usize>()
+    }
 }
 
 pub struct Model {
@@ -86,22 +130,30 @@ impl KvCache {
 impl Model {
     /// Wire the loaded tensors (name → values) into the model structure.
     pub fn load(dir: &Path, cfg: ModelConfig) -> crate::Result<Self> {
-        Self::from_tensors(cfg, crate::weights::load(dir)?)
+        Self::from_store(cfg, &mut crate::weights::load(dir)?)
     }
 
-    /// The tail `load` always contained, split out so a checkpoint that is not
-    /// safetensors-on-disk (GGUF, dequantized to f32) can enter with the same
-    /// numerics: an already-materialized name → f32 map, HF names.
-    pub fn from_tensors(cfg: ModelConfig, mut t: crate::weights::TensorMap) -> crate::Result<Self> {
-        let n_params = t.values().map(|v| v.len()).sum();
-
+    /// The tail `load` always contained, behind the TensorStore seam so any
+    /// checkpoint source that can hand over f32 tensors under HF names enters
+    /// with the same numerics (safetensors map, GGUF dequant — spec §11: the
+    /// graph must not know where tensors live).
+    pub fn from_store(cfg: ModelConfig, t: &mut dyn TensorStore) -> crate::Result<Self> {
+        // The enums resolve ONCE, before the layer loop — the forward pass
+        // below IS the SwiGLU/RMSNorm-pre implementation, and these matches
+        // stop compiling the day a second variant exists.
+        match cfg.activation()? {
+            crate::config::Activation::SwiGLU => {}
+        }
+        match cfg.norm_type() {
+            crate::config::NormType::RmsNormPre => {}
+        }
         let h = cfg.hidden_size;
         // Head width comes from the checkpoint itself: qwen3's q_proj is
         // [n_heads*128, hidden] with hidden/n_heads = 64 — trusting the config
         // identity would slice every head wrong.
         let head_dim = t
-            .get("model.layers.0.self_attn.q_proj.weight")
-            .map(|w| w.len() / h / cfg.num_attention_heads)
+            .numel("model.layers.0.self_attn.q_proj.weight")
+            .map(|n| n / h / cfg.num_attention_heads)
             .unwrap_or_else(|| cfg.head_dim());
         let q_dim = cfg.num_attention_heads * head_dim;
         let kv = cfg.num_key_value_heads * head_dim;
@@ -109,25 +161,34 @@ impl Model {
         for i in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{i}");
             blocks.push(Block {
-                input_layernorm: take(&mut t, &format!("{p}.input_layernorm.weight"))?,
-                q_proj: linear(&mut t, &format!("{p}.self_attn.q_proj"), h, q_dim)?,
-                k_proj: linear(&mut t, &format!("{p}.self_attn.k_proj"), h, kv)?,
-                v_proj: linear(&mut t, &format!("{p}.self_attn.v_proj"), h, kv)?,
-                o_proj: linear(&mut t, &format!("{p}.self_attn.o_proj"), q_dim, h)?,
-                q_norm: t.remove(&format!("{p}.self_attn.q_norm.weight")),
-                k_norm: t.remove(&format!("{p}.self_attn.k_norm.weight")),
-                post_attention_layernorm: take(&mut t, &format!("{p}.post_attention_layernorm.weight"))?,
-                gate_proj: linear(&mut t, &format!("{p}.mlp.gate_proj"), h, cfg.intermediate_size)?,
-                up_proj: linear(&mut t, &format!("{p}.mlp.up_proj"), h, cfg.intermediate_size)?,
-                down_proj: linear(&mut t, &format!("{p}.mlp.down_proj"), cfg.intermediate_size, h)?,
+                input_layernorm: take(t, &format!("{p}.input_layernorm.weight"))?,
+                q_proj: linear(t, &format!("{p}.self_attn.q_proj"), h, q_dim)?,
+                k_proj: linear(t, &format!("{p}.self_attn.k_proj"), h, kv)?,
+                v_proj: linear(t, &format!("{p}.self_attn.v_proj"), h, kv)?,
+                o_proj: linear(t, &format!("{p}.self_attn.o_proj"), q_dim, h)?,
+                q_norm: take_opt(t, &format!("{p}.self_attn.q_norm.weight"))?,
+                k_norm: take_opt(t, &format!("{p}.self_attn.k_norm.weight"))?,
+                post_attention_layernorm: take(t, &format!("{p}.post_attention_layernorm.weight"))?,
+                ffn: FeedForward::Dense(DenseFfn {
+                    gate_proj: linear(t, &format!("{p}.mlp.gate_proj"), h, cfg.intermediate_size)?,
+                    up_proj: linear(t, &format!("{p}.mlp.up_proj"), h, cfg.intermediate_size)?,
+                    down_proj: linear(t, &format!("{p}.mlp.down_proj"), cfg.intermediate_size, h)?,
+                }),
             });
         }
-        let embed_tokens = take(&mut t, "model.embed_tokens.weight")?;
-        let norm = take(&mut t, "model.norm.weight")?;
+        let embed_tokens = take(t, "model.embed_tokens.weight")?;
+        let norm = take(t, "model.norm.weight")?;
         // Small models often tie weights: no separate lm_head, the embedding table is reused.
-        let lm_head_w = t.remove("lm_head.weight").unwrap_or_else(|| embed_tokens.clone());
+        let lm_head_w = match take_opt(t, "lm_head.weight")? {
+            Some(w) => w,
+            None => embed_tokens.clone(),
+        };
         let lm_head = Linear { w: lm_head_w, bias: None, in_dim: h, out_dim: cfg.vocab_size };
 
+        let n_params = embed_tokens.len()
+            + norm.len()
+            + lm_head.w.len()
+            + blocks.iter().map(Block::n_params).sum::<usize>();
         Ok(Self { cfg, embed_tokens, blocks, norm, lm_head, n_params, head_dim, kv_dim: kv })
     }
 
@@ -175,13 +236,20 @@ impl Model {
                 x[i] += att[i]; // residual connection
             }
 
-            // Second half: SwiGLU MLP (per-token computation on what attention gathered).
+            // Second half: the FFN — matched through the shape seam (the MoE
+            // arm is an unreachable shell until L5 builds it).
             let xn = rmsnorm(&x, &blk.post_attention_layernorm, cfg.rms_norm_eps);
-            let gate = blk.gate_proj.forward(&xn);
-            let up = blk.up_proj.forward(&xn);
-            // silu(gate) acts as a per-dimension gate over the up projection.
-            let inner: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| silu(*g) * u).collect();
-            let out = blk.down_proj.forward(&inner);
+            let out = match &blk.ffn {
+                FeedForward::Dense(f) => {
+                    // SwiGLU: silu(gate) acts as a per-dimension gate over up.
+                    let gate = f.gate_proj.forward(&xn);
+                    let up = f.up_proj.forward(&xn);
+                    let inner: Vec<f32> =
+                        gate.iter().zip(&up).map(|(g, u)| silu(*g) * u).collect();
+                    f.down_proj.forward(&inner)
+                }
+                FeedForward::MoE {} => unreachable!("no MoE constructor exists (L5)"),
+            };
             for i in 0..h {
                 x[i] += out[i]; // residual connection
             }
@@ -251,12 +319,18 @@ fn attention(
 
 // ---------- weight-loading helpers ----------
 
-fn take(t: &mut TensorMap, name: &str) -> crate::Result<Vec<f32>> {
-    t.remove(name)
-        .ok_or_else(|| format!("tensor {name} not found in the weight files").into())
+fn take(t: &mut dyn TensorStore, name: &str) -> crate::Result<Vec<f32>> {
+    t.take_f32(name)
 }
 
-fn linear(t: &mut TensorMap, name: &str, in_dim: usize, out_dim: usize) -> crate::Result<Linear> {
+fn take_opt(t: &mut dyn TensorStore, name: &str) -> crate::Result<Option<Vec<f32>>> {
+    match t.has(name) {
+        true => Ok(Some(t.take_f32(name)?)),
+        false => Ok(None),
+    }
+}
+
+fn linear(t: &mut dyn TensorStore, name: &str, in_dim: usize, out_dim: usize) -> crate::Result<Linear> {
     let w = take(t, &format!("{name}.weight"))?;
     if w.len() != in_dim * out_dim {
         return Err(format!(
@@ -265,6 +339,6 @@ fn linear(t: &mut TensorMap, name: &str, in_dim: usize, out_dim: usize) -> crate
         )
         .into());
     }
-    let bias = t.remove(&format!("{name}.bias"));
+    let bias = take_opt(t, &format!("{name}.bias"))?;
     Ok(Linear { w, bias, in_dim, out_dim })
 }

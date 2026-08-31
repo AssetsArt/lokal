@@ -23,6 +23,28 @@ pub struct ModelConfig {
     pub max_position_embeddings: usize, // maximum context length the model was trained for
     #[serde(default)]
     pub eos_token_id: EosIds,
+    /// HF's activation name ("silu" everywhere we run); resolved through
+    /// `activation()` — never matched on directly.
+    #[serde(default)]
+    pub hidden_act: Option<String>,
+}
+
+/// docs/gguf-design.md §FFN/activation: single-variant BY DESIGN — every FFN
+/// we ship is silu-gated (SwiGLU, the fused Metal kernel's form). A second
+/// variant lands here as data, and every construction-time match over this
+/// enum stops compiling until the new arm exists. Do not add variants ahead
+/// of a target model (the variant inventory is the license).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Activation {
+    SwiGLU,
+}
+
+/// docs/gguf-design.md §Normalization: RMSNorm, pre-norm placement — the only
+/// shipped form. Same single-variant rule as Activation; new code reads THIS,
+/// never assumes Llama-style RMSNorm silently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NormType {
+    RmsNormPre,
 }
 
 fn default_rope_theta() -> f32 {
@@ -78,6 +100,28 @@ impl ModelConfig {
 
     pub fn is_eos(&self, id: u32) -> bool {
         self.eos_token_id.contains(id)
+    }
+
+    /// The FFN activation, resolved from checkpoint metadata. Unknown names
+    /// refuse (a gelu model run through the silu path would be plausibly
+    /// wrong, not visibly broken); absent means the llama-family default the
+    /// loaders always assumed.
+    pub fn activation(&self) -> crate::Result<Activation> {
+        match self.hidden_act.as_deref() {
+            None | Some("silu") => Ok(Activation::SwiGLU),
+            Some(other) => Err(format!(
+                "activation {other} is not supported: every shipped FFN path is \
+                 silu-gated (SwiGLU) — running it anyway would be silently wrong"
+            )
+            .into()),
+        }
+    }
+
+    /// The norm family + placement. No checkpoint we read carries a norm key
+    /// (llama-family is RMSNorm pre-norm by construction), so this is constant
+    /// until a second variant exists; consumers match on it exhaustively.
+    pub fn norm_type(&self) -> NormType {
+        NormType::RmsNormPre
     }
 }
 
@@ -149,5 +193,27 @@ mod tests {
         // Qwen2 < Qwen3 lexically but shares the prefix up to the digit —
         // prove the refusal never swallows it.
         assert!(load_arch("Qwen2ForCausalLM").is_ok());
+    }
+
+    /// §FFN/activation: the enum resolves from checkpoint metadata — silu and
+    /// absent mean SwiGLU (what every loader always assumed), anything else
+    /// refuses by name instead of running plausibly wrong through silu paths.
+    #[test]
+    fn activation_resolves_from_metadata_and_refuses_unknown() {
+        let mk = |act: &str| -> ModelConfig {
+            serde_json::from_str(&format!(
+                r#"{{"architectures":["LlamaForCausalLM"],"hidden_size":64,
+                    "intermediate_size":128,"num_hidden_layers":2,
+                    "num_attention_heads":4,"num_key_value_heads":2,
+                    "vocab_size":100,"rms_norm_eps":1e-6{act}}}"#
+            ))
+            .unwrap()
+        };
+        assert_eq!(mk("").activation().unwrap(), Activation::SwiGLU);
+        assert_eq!(mk(r#","hidden_act":"silu""#).activation().unwrap(), Activation::SwiGLU);
+        let err = mk(r#","hidden_act":"gelu""#).activation().unwrap_err().to_string();
+        assert!(err.contains("activation gelu is not supported"), "{err}");
+        assert!(err.contains("SwiGLU"), "{err}");
+        assert_eq!(mk("").norm_type(), NormType::RmsNormPre);
     }
 }

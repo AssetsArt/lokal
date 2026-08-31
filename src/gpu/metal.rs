@@ -481,6 +481,34 @@ pub(crate) struct DeltaNetLayerState {
     pub delta: Buffer,
 }
 
+/// docs/gguf-design.md §Attention & per-layer state: a trunk layer owns
+/// exactly ONE kind of per-layer state — a KV cache slot (attention layers)
+/// or a recurrent slot (conv window + delta state, the deltanet layers).
+/// `state_schedule` is the ONE place the kind is decided; construction reads
+/// it instead of re-deriving from the layout, and `cache[l]` keeps meaning
+/// layer l everywhere (stub buffers, never compaction — the recorded rule).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LayerStateKind {
+    Kv,
+    Recurrent,
+}
+
+/// The per-layer state schedule: dense checkpoints are all-Kv; a deltanet
+/// hybrid follows its recurrency map. Length is exactly the trunk.
+pub(crate) fn state_schedule(
+    n_layers: usize,
+    layout: Option<&DeltaNetLayout>,
+) -> Vec<LayerStateKind> {
+    (0..n_layers)
+        .map(|l| match layout {
+            Some(q) if q.is_recurrent.get(l).copied().unwrap_or(false) => {
+                LayerStateKind::Recurrent
+            }
+            _ => LayerStateKind::Kv,
+        })
+        .collect()
+}
+
 /// What a qwen35-aware engine hands its sessions so they can allocate states:
 /// the per-trunk-layer recurrency map plus the two per-layer element counts.
 /// The C/D seam — changes go through the lead, never pairwise.
@@ -667,6 +695,14 @@ impl MetalEngine {
     /// window pipelines must be specialized while the shader library is alive,
     /// which is why the choice happens at engine build, not per session.
     pub fn new_with_window(model: Model, win: Option<(usize, usize)>) -> crate::Result<Self> {
+        // Construction-time seam checks (docs/gguf-design.md §FFN/§Norm): the
+        // fused swiglu and rmsnorm pipelines are the only forms compiled in.
+        match model.cfg.activation()? {
+            crate::config::Activation::SwiGLU => {}
+        }
+        match model.cfg.norm_type() {
+            crate::config::NormType::RmsNormPre => {}
+        }
         let device = Device::system_default().ok_or("no Metal-capable GPU found")?;
         let queue = device.new_command_queue();
 
@@ -876,9 +912,9 @@ impl MetalEngine {
                 v_proj: lin(&device, &b.v_proj),
                 o_proj: lin(&device, &b.o_proj),
                 post_attention_layernorm: f16_buffer(&device, &b.post_attention_layernorm),
-                gate_proj: lin(&device, &b.gate_proj),
-                up_proj: lin(&device, &b.up_proj),
-                down_proj: lin(&device, &b.down_proj),
+                gate_proj: lin(&device, &b.ffn.dense().gate_proj),
+                up_proj: lin(&device, &b.ffn.dense().up_proj),
+                down_proj: lin(&device, &b.ffn.dense().down_proj),
             })
             .collect();
 
@@ -1484,6 +1520,12 @@ impl MetalEngine {
         cfg: ModelConfig,
         win: Option<(usize, usize)>,
     ) -> crate::Result<Self> {
+        match cfg.activation()? {
+            crate::config::Activation::SwiGLU => {}
+        }
+        match cfg.norm_type() {
+            crate::config::NormType::RmsNormPre => {}
+        }
         use std::collections::HashMap;
         let device = Device::system_default().ok_or("no Metal-capable GPU found")?;
         let queue = device.new_command_queue();
@@ -3262,6 +3304,33 @@ mod tests {
         st.reset();
         assert_eq!(read(&l0.conv, 6), vec![0.0; 6]);
         assert_eq!(read(&l0.delta, 10), vec![0.0; 10]);
+    }
+
+    /// The two-kind state schedule (T3): dense is all-Kv; the hybrid follows
+    /// its map index-for-index; and the DeltaNetStates slots agree with the
+    /// schedule layer by layer — the invariant every session construction
+    /// leans on.
+    #[test]
+    fn state_schedule_is_two_kind_and_agrees_with_states() {
+        use LayerStateKind::*;
+        assert!(state_schedule(4, None).iter().all(|k| *k == Kv), "dense = all Kv");
+
+        let layout = DeltaNetLayout {
+            is_recurrent: (0..8).map(|i| (i + 1) % 4 != 0).collect(),
+            conv_elems: 6,
+            delta_elems: 10,
+        };
+        let sched = state_schedule(8, Some(&layout));
+        assert_eq!(sched.len(), 8);
+        assert_eq!(sched.iter().filter(|k| **k == Kv).count(), 2);
+        for (l, k) in sched.iter().enumerate() {
+            assert_eq!(*k == Recurrent, layout.is_recurrent[l], "layer {l}");
+        }
+        let device = Device::system_default().expect("metal device");
+        let st = DeltaNetStates::new(&device, &layout);
+        for (l, k) in sched.iter().enumerate() {
+            assert_eq!(st.layers[l].is_some(), *k == Recurrent, "slot kind, layer {l}");
+        }
     }
 
     /// The one canonical meta→layout translation carries the real sizes and

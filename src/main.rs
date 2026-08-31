@@ -455,7 +455,7 @@ fn gguf_setup(
                 );
             }
             let t0 = Instant::now();
-            let model = model::Model::from_tensors(cfg.clone(), gguf::load_f32(&g)?)?;
+            let model = model::Model::from_store(cfg.clone(), &mut gguf::load_f32(&g)?)?;
             eprintln!(
                 "dequantized {:.1}M params to f32 in {:.1}s",
                 model.n_params as f64 / 1e6,

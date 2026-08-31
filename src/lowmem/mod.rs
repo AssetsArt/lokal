@@ -473,6 +473,21 @@ pub(crate) fn tests_qwen35_gguf() -> Option<std::path::PathBuf> {
         .find(|p| p.extension().is_some_and(|x| x == "gguf"))
 }
 
+/// The loading seam (spec §11): a view-backed store re-reads on every take —
+/// nothing is consumed. The paged/row/GPU-span surface below is deliberately
+/// wider than the trait; an f32 seam does not cover paging.
+impl crate::weights::TensorStore for LowMemSource {
+    fn has(&self, name: &str) -> bool {
+        LowMemSource::has(self, name)
+    }
+    fn numel(&self, name: &str) -> Option<usize> {
+        self.shape(name).ok().map(|s| s.iter().product())
+    }
+    fn take_f32(&mut self, name: &str) -> crate::Result<Vec<f32>> {
+        self.read_f32(name)
+    }
+}
+
 impl LowMemSource {
     pub fn open(path: &Path) -> crate::Result<Self> {
         if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
@@ -767,6 +782,15 @@ impl LowMemEngine {
     /// Built from the model DIRECTORY, not a loaded Model — nothing here ever
     /// materializes the full model in RAM.
     pub fn new(dir: &Path, cfg: ModelConfig, opts: &LowMemOpts) -> crate::Result<Self> {
+        // Construction-time seam checks (docs/gguf-design.md §FFN/§Norm): the
+        // staged swiglu pipelines and rmsnorm kernels below are the only forms
+        // this backend builds — a second enum variant must be wired here first.
+        match cfg.activation()? {
+            crate::config::Activation::SwiGLU => {}
+        }
+        match cfg.norm_type() {
+            crate::config::NormType::RmsNormPre => {}
+        }
         let t0 = Instant::now();
         let mut source = LowMemSource::open(dir)?;
         eprintln!(
@@ -1318,6 +1342,7 @@ mod tests {
 
     fn qwen05b_cfg() -> ModelConfig {
         ModelConfig {
+            hidden_act: None,
             architectures: vec!["Qwen2ForCausalLM".into()],
             hidden_size: 896,
             intermediate_size: 4864,
