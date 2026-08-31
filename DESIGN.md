@@ -213,6 +213,10 @@ publish a number that hides this asymmetry.
 
 Four pieces (all in `src/lowmem/`):
 
+- **LowMemSource** (mod.rs): the checkpoint, in whichever format it arrived.
+  Safetensors and GGUF differ in how a row is found and what it holds, and in
+  nothing else the pool cares about, so the difference is confined to this one
+  type rather than smeared through the pager.
 - **WeightManifest** (manifest.rs): every safetensors shard mmapped once,
   headers parsed to a name → {dtype, shape, byte range} table. Nothing is read
   up front; the mmap is the source of truth and the OS is free to drop clean
@@ -242,6 +246,60 @@ Four pieces (all in `src/lowmem/`):
   The kernels are the same flash/GQA-decode kernels the metal backend runs,
   specialized through function constants; unspecialized they compile to
   exactly the metal code.
+
+**GGUF checkpoints.** `-b lowmem` reads the ecosystem's pre-quantized files
+directly, and this is the backend where that matters most: quantized weights
+are held in the pool **raw**, exactly as the file stores them, so a Q4 model
+occupies about a quarter of what its bf16 twin would and a 14B Q4_K_M becomes
+fully resident on a 16 GB machine. Dequantizing at stage time would hand that
+entire factor back, so a page is a whole number of quantized blocks and the
+kernels dequantize at read time instead. Consequences worth knowing:
+
+- **Two shader libraries.** The quantized matvec family compiles from a second
+  library with fast math OFF. Metal's default contracts `a*b+c` into an fma
+  whose intermediate carries extra precision, and the dequant path has to agree
+  with a strict-IEEE CPU reference to the last ulp — the values a quantizer
+  produces are exactly where the two disagree. Everything else keeps the fast
+  library, so the metal backend's numerics are untouched.
+- **Pipelines are per type PRESENT, and selected per TENSOR.** The encoding is
+  a function constant, so each type multiplies the whole family; building the
+  six supported types when a file mentions three would spend startup seconds
+  for nothing. Selection cannot be per layer either — Q4_K_M genuinely mixes
+  encodings inside one layer (a 0.5B file carries Q4_K, Q6_K, Q8_0 and 133
+  Q5_0 tensors), so each tensor is read by the pipeline for its own type.
+- **llama-arch q/k are un-permuted at materialization.** llama.cpp's converter
+  stores those rows rotated to suit GGML's adjacent-pair RoPE, while lokal
+  rotates halves. The inverse is applied as the page is built, where it is a
+  pure row reorder that works on quantized blocks untouched. Deliberately not
+  compensated inside the dequant kernels: a shuffle buried there would make
+  every future llama-arch GGUF silently wrong, and it is only detectable
+  against a safetensors twin — a GGUF-vs-GGUF check shares the loader and
+  passes either way.
+- **qwen3** states `head_dim` explicitly and does not satisfy
+  `hidden_size / n_heads` (0.6B is hidden 1024 across 16 heads of 128), so
+  every attention width comes from the checkpoint rather than that derivation.
+  It also normalizes each head of q and k before RoPE; prefill does that on the
+  f32 buffers before K converts into the cache, decode does it in place on the
+  f16 cache row.
+- **A quantized embedding table stays quantized**, gathered and dequantized one
+  row per token — the same reasoning that keeps the f16 table off the GPU.
+
+Correctness rests on a bit-for-bit oracle rather than on output looking
+reasonable: GPU dequantization is compared against the CPU reference on
+adversarial blocks (subnormal scales, all-zero, max-magnitude) for every type,
+and against a second reference transcribed independently from `ggml-quants.c`,
+because two references catch a shared misreading of ggml that one cannot.
+End to end, an F16 GGUF must generate **byte-identical** text to the same
+weights in safetensors — same values, same math, no quantization noise to hide
+behind — and a real quantized file is checked against llama.cpp on the same
+file, where agreement rather than identity is the bar.
+
+**Residency is asserted, not assumed.** `LOKAL_LOWMEM_STATS=1` prints one line
+per session splitting stage-ins at the prefill/decode boundary, because prefill
+always stages the model once and only decode proves residency. It counts direct
+checkpoint reads beside staged pages: an over-budget page does not stage at
+all, so a stage-in count alone would call a run that streamed 1.5 GB in eight
+decode steps "resident". A checkpoint that fits shows zeros in both.
 
 **Budget.** `--memory-budget` (4096 MB) splits closed-form: KV and activation
 scratch are computed exactly, a fixed overhead estimate covers the runtime,
