@@ -2209,6 +2209,15 @@ impl MetalSession<'_> {
             n_heads: u32,
             n_rows: u32,
         }
+        // WAR ORDERING, and the reason this lane's oracle went red at long prompts:
+        // the PREVIOUS attention layer READ this same `gate` buffer in
+        // enc_apply_qgate. On a concurrent encoder nothing stops this layer's
+        // write from landing before that read retires, and the deltanet layers
+        // in between are not a barrier — they touch different resources. So the
+        // buffers are ordered BEFORE the write, not only after it.
+        if conc {
+            enc.memory_barrier_with_resources(&[qc, gate]);
+        }
         enc.set_compute_pipeline_state(&e.pipes.split_q_gate);
         enc.set_buffer(0, Some(&self.q), 0);
         enc.set_buffer(1, Some(qc), 0);
