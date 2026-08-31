@@ -58,9 +58,10 @@ Shipped, do not re-implement:
 - Identity-gate practice = spec §19 (see §Validation). Bench collectors =
   spec §20 groundwork (benchmarks/collect-gguf-rows.sh, collect-metal-quant.sh).
 
-Gaps (the roadmap, in order): structure move out of src/lowmem (L1, with the
-backend×format matrix); deltanet on metal (L2); arch abstractions (L3); GGUF
-through hybrid (L4); MoE (L5) and MLA (L6) once target models are named.
+Gaps (the roadmap, in order): arch abstractions (L3); GGUF through hybrid
+(L4); MoE (L5) and MLA (L6) once target models are named. L1 (structure move
+out of src/lowmem, with the backend×format matrix) and L2 (deltanet on metal)
+have landed.
 
 ## Backend × format matrix
 
@@ -68,13 +69,13 @@ Every cell below was established by RUNNING it (L1-B1 survey, main @887a0ec +
 the L1 lane). Rule: every cell either runs, or refuses with a one-line
 mechanism-named reason asserted by a unit test (`gguf_backend_refusal` for the
 GGUF rows, the config.rs arch refusal for safetensors). No silent backend
-fallback, ever. Until L2 (metal-deltanet) merges, qwen35 GGUF runs on
-`-b lowmem` only.
+fallback, ever. Since L2 (metal-deltanet), qwen35 GGUF runs on `-b metal`
+as well as `-b lowmem`.
 
 | backend | safetensors dense | safetensors Qwen3/Qwen3.5 | GGUF dense | GGUF qwen35 (deltanet) |
 |---|---|---|---|---|
 | `cpu` | runs | refused by name | runs — `load_f32` expansion (fits-in-RAM guarded) | refused: no gated-deltanet path |
-| `metal` | runs | refused by name | runs — direct quant execution, no expansion | refused: no gated-deltanet path |
+| `metal` | runs | refused by name | runs — direct quant execution, no expansion | **runs** (L2) |
 | `lowmem` | runs | refused by name | runs — budgeted streaming, CPU-side dequant by design | **runs** (d7baf25) |
 | `hybrid` (alias `ane`) | runs | refused by name | refused: ANE prefill graphs are exported from safetensors (L4 opens this) | refused: no gated-deltanet path |
 
@@ -135,7 +136,7 @@ Reuse the shipped kernel set — tensor-op matmul, FlashAttention prefill, flash
 decode, GQA-aware attention, F16 KV cache, fused QKV, fused SwiGLU — for every
 compatible model; no new execution paths without necessity. The deltanet block
 kernels (ssm_conv_decode, delta_decode_step, delta_gates) exist for the lowmem
-oracle; their metal-side execution is lane L2 (metal-deltanet), gated
+oracle; their metal-side execution landed in lane L2 (metal-deltanet), gated
 byte-identical against `-b lowmem` on Qwen3.5-2B.
 
 ## ANE / Hybrid
@@ -166,6 +167,19 @@ SHA that shipped it producing fluent, wrong output. Running a cell proves it
 executes. The same trap caught the gguf-loader q/k permute, which passed
 cpu==metal by being consistently wrong on both sides.)
 
+**When two engines disagree, also diff each engine against ITSELF: prefill
+against decode.** (Mellow, from metal-deltanet. metal≠lowmem on qwen35 came
+down to one line — prefill applied qk-norm to the raw joint Q+gate buffer that
+the split had already consumed, so attention ran on an un-normalized Q, while
+metal's own decode path already did it correctly. Reading metal-prefill against
+metal-decode against lowmem-prefill found in minutes what a long run of
+cross-engine feature-toggling had only narrowed. Corollary, learned the
+expensive way on the same lane: a probe's EXCLUSION is a measurement and can be
+wrong. "Toggling qk-norm changes neither hash" was recorded as settled and sent
+the hunt to the wrong half of the layer for most of a session. Before trusting
+an exclusion, confirm the feature it excludes is even live on that
+checkpoint — qwen35 does carry attn_q_norm/attn_k_norm.)
+
 ## Benchmarks
 
 Per GGUF model: model, quant, params, context, prefill tok/s, decode tok/s,
@@ -195,7 +209,7 @@ constructor-side and backend-specific.
 | 6 GQA/MHA mapping | done |
 | 7 RoPE parameters | done (partial rope incl.) |
 | 8 Q8..Q4 (+IQ) | done — 17 types |
-| 9 Metal quantized matmul | done (dense); deltanet block = L2 |
+| 9 Metal quantized matmul | done — dense and the deltanet block (L2) |
 | 10 more dense variants (Gemma/Phi/…) | after L3, per human-named targets |
 | 11 MoE | L5, blocked on target model |
 | 12 MLA / advanced | L6, blocked on target model |

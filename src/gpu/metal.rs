@@ -2501,7 +2501,17 @@ impl MetalSession<'_> {
                 if let (Some(qn), Some(kn)) = (&fa.q_norm, &fa.k_norm) {
                     // qwen3: per-head norm before RoPE — q in place (f32), k while
                     // still in the f32 staging half (why this precedes the spans).
-                    e.enc_rmsnorm_dim(enc, &self.q, qn, n * cfg.num_attention_heads, hd);
+                    //
+                    // NORMALIZE `qbuf`, NEVER `self.q`. On a joint Q+gate
+                    // checkpoint (qwen35) enc_split_qg has already drained
+                    // self.q into the compact q/gate pair and nothing reads it
+                    // again, so norming self.q here writes to a dead buffer and
+                    // hands attention an UN-NORMALIZED Q — fluent, wrong output
+                    // on prefill only, which is what this lane spent a session
+                    // chasing. On every other arch qbuf IS self.q, so `qbuf` is
+                    // correct in both cases and `self.q` is correct in only one.
+                    // The decode half below has always used qbuf; keep them same.
+                    e.enc_rmsnorm_dim(enc, qbuf, qn, n * cfg.num_attention_heads, hd);
                     e.enc_rmsnorm_dim(enc, &self.kvs, kn, n * cfg.num_key_value_heads, hd);
                     bar!(qbuf, &self.kvs);
                 }
@@ -3093,12 +3103,22 @@ mod tests {
         assert!(metal.len() > 10, "parsed only {} Metal structs — parser broken", metal.len());
 
         let mut checked = 0;
+        let mut unmatched = Vec::new();
         for (file, src) in [
             ("src/gpu/metal.rs", include_str!("metal.rs")),
             ("src/lowmem/forward.rs", include_str!("../lowmem/forward.rs")),
         ] {
             for (name, rust_fields) in parse_rust(src) {
-                let Some(metal_fields) = metal.get(&name) else { continue };
+                let Some(metal_fields) = metal.get(&name) else {
+                    // A Rust struct named *Params that matches NO Metal struct is
+                    // the guard's blind spot: the loop above skips it silently, so
+                    // renaming either side disables the check instead of failing
+                    // it. Collect them and fail loudly rather than `continue`.
+                    if name.ends_with("Params") {
+                        unmatched.push(format!("{file}: {name}"));
+                    }
+                    continue;
+                };
                 checked += 1;
                 assert_eq!(
                     &rust_fields, metal_fields,
@@ -3109,13 +3129,24 @@ mod tests {
                 );
             }
         }
+        assert!(
+            unmatched.is_empty(),
+            "these Rust `*Params` structs mirror no struct in kernels.metal, so NOTHING \
+             checks them: {unmatched:?}. Either the Metal struct was renamed (rename the \
+             mirror to match) or this is not a kernel mirror (then it must not be called \
+             *Params). A silently unchecked mirror is how e61c260 shipped."
+        );
         // The guard needs its own negative control: if the parsers silently
         // matched nothing, every assertion above is vacuous and the test would
-        // pass on a codebase where every mirror had drifted.
+        // pass on a codebase where every mirror had drifted. The floor tracks
+        // the real population (30 at the metal-deltanet lane) rather than a
+        // token handful, so LOSING most of the mirrors fails here too — an
+        // `>= 8` floor happily passes a run that checked eight of thirty.
         assert!(
-            checked >= 8,
-            "compared only {checked} mirrors — expected at least the eight duplicated \
-             *Params structs; the parser or the naming convention has changed"
+            checked >= 24,
+            "compared only {checked} mirrors — the duplicated *Params structs number about \
+             thirty; the parser or the naming convention has changed and most mirrors are \
+             now going unchecked"
         );
     }
 

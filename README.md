@@ -166,13 +166,16 @@ with a one-line reason, never a silent fallback:
 | backend | safetensors (dense) | GGUF (dense) | GGUF (qwen35 deltanet) |
 |---|---|---|---|
 | `cpu` | runs | runs (f32 expansion) | refuses by name |
-| `metal` | runs | runs (direct quant execution) | refuses by name |
+| `metal` | runs | runs (direct quant execution) | **runs** |
 | `lowmem` | runs | runs (budgeted streaming) | **runs** |
 | `hybrid` (alias `ane`) | runs | refuses (ANE prefill graphs are exported from safetensors) | refuses by name |
 
 Safetensors Qwen3/Qwen3.5 checkpoints are refused by name on every backend
 (explicit head_dim + qk-norm do not fit the Llama walk) — run the GGUF.
-qwen35 stays `-b lowmem` only until the metal-deltanet lane lands.
+qwen35 runs on `-b metal` as well as `-b lowmem`, and the two are held to
+token-identical greedy output: Qwen3.5-2B Q4_K_M, `-t 0`, four runs per side,
+on a short prompt and on one past the prefill chunk. `-b metal` also agrees
+character-for-character with llama.cpp on the same file across six prompts.
 
 ## Backends
 
