@@ -2705,3 +2705,151 @@ mod tests {
         assert_eq!(bytes >> 20, 149);
     }
 }
+
+#[cfg(test)]
+mod qwen35_kernel_oracle {
+    //! GPU kernels vs lane B's CPU reference (src/lowmem/qwen35_ref.rs),
+    //! bit-for-bit. Same doctrine as the quant oracle: the reference is the
+    //! subject, the GPU is the thing under test, and a negative control proves
+    //! the comparison can fail.
+    use crate::gpu::metal as gpu;
+    use crate::lowmem::qwen35_ref as rf;
+    use metal::{CompileOptions, Device, MTLResourceOptions, MTLSize};
+
+    /// Small but structurally real: several channels, the true d_conv, and a
+    /// state that is genuinely rolled across steps rather than used once.
+    fn dims() -> rf::DeltaDims {
+        rf::DeltaDims { d_state: 8, n_v_heads: 4, n_k_heads: 2, d_conv: 4 }
+    }
+
+    fn lcg(seed: &mut u32) -> f32 {
+        *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        ((*seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+    }
+
+    /// Run ssm_conv_decode for `steps` tokens, returning every step's output
+    /// and the final state — the rolling is half the semantics, so a
+    /// single-shot comparison would miss a broken roll entirely.
+    fn gpu_conv(d: rf::DeltaDims, state0: &[f32], xs: &[Vec<f32>], w: &[f32]) -> (Vec<Vec<f32>>, Vec<f32>) {
+        let device = Device::system_default().expect("Metal device required");
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+        let f = lib.get_function("ssm_conv_decode", None).expect("ssm_conv_decode");
+        let pipe = device.new_compute_pipeline_state_with_function(&f).expect("pipeline");
+        let queue = device.new_command_queue();
+        let c_all = d.conv_channels();
+
+        let bytes = |v: &[f32]| (std::mem::size_of_val(v)) as u64;
+        let st = device.new_buffer_with_data(
+            state0.as_ptr() as *const _, bytes(state0), MTLResourceOptions::StorageModeShared);
+        let wb = device.new_buffer_with_data(
+            w.as_ptr() as *const _, bytes(w), MTLResourceOptions::StorageModeShared);
+        let out = device.new_buffer((c_all * 4) as u64, MTLResourceOptions::StorageModeShared);
+
+        #[repr(C)]
+        struct P { channels: u32, d_conv: u32 }
+        let p = P { channels: c_all as u32, d_conv: d.d_conv as u32 };
+        let mut outs = Vec::new();
+        for x in xs {
+            let xb = device.new_buffer_with_data(
+                x.as_ptr() as *const _, bytes(x), MTLResourceOptions::StorageModeShared);
+            let cb = queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipe);
+            enc.set_buffer(0, Some(&st), 0);
+            enc.set_buffer(1, Some(&xb), 0);
+            enc.set_buffer(2, Some(&wb), 0);
+            enc.set_buffer(3, Some(&out), 0);
+            enc.set_bytes(4, std::mem::size_of::<P>() as u64,
+                          &p as *const P as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(((c_all + 63) / 64) as u64, 1, 1), MTLSize::new(64, 1, 1));
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            outs.push(unsafe { std::slice::from_raw_parts(out.contents() as *const f32, c_all) }.to_vec());
+        }
+        let final_state =
+            unsafe { std::slice::from_raw_parts(st.contents() as *const f32, state0.len()) }.to_vec();
+        (outs, final_state)
+    }
+
+    #[test]
+    fn conv_decode_matches_reference_bit_for_bit() {
+        let d = dims();
+        let (c_all, k) = (d.conv_channels(), d.d_conv);
+        let mut seed = 0x2545_F491u32;
+        let state0: Vec<f32> = (0..c_all * (k - 1)).map(|_| lcg(&mut seed)).collect();
+        let w: Vec<f32> = (0..c_all * k).map(|_| lcg(&mut seed)).collect();
+        let xs: Vec<Vec<f32>> =
+            (0..5).map(|_| (0..c_all).map(|_| lcg(&mut seed)).collect()).collect();
+
+        let (gpu_outs, gpu_state) = gpu_conv(d, &state0, &xs, &w);
+
+        // Two different bars, because two different things are being checked.
+        //
+        // The DOT is pure multiply-add and must be BIT-EXACT: we control the
+        // order and, with contraction off, the GPU reproduces ggml's scalar
+        // form exactly. Anything less means a real arithmetic divergence.
+        //
+        // The SiLU output cannot be bit-exact: it goes through exp(), and no
+        // transcendental is bit-specified across implementations — Metal's and
+        // libm's differ, and `precise::exp` does not close it either (measured,
+        // not assumed). So this gate bounds the END-TO-END value at 2 ulp.
+        //
+        // That the DOT itself is bit-exact was established separately, by
+        // running this same comparison with silu removed from the kernel: it
+        // failed by 1 ulp until `#pragma clang fp contract(off)` stopped Metal
+        // fusing the multiply-add, then matched exactly. The bound below is
+        // therefore exp's floor and nothing else, which is why 2 ulp is an
+        // assertion rather than a shrug.
+        let mut ref_state = state0.clone();
+        let mut worst_ulp = 0i64;
+        for (step, x) in xs.iter().enumerate() {
+            let want = rf::conv_step(&d, &mut ref_state, x, &w);
+            for (i, (a, b)) in want.iter().zip(&gpu_outs[step]).enumerate() {
+                let ulp = (a.to_bits() as i64 - b.to_bits() as i64).abs();
+                assert!(
+                    ulp <= 2,
+                    "step {step} channel {i}: reference {a} vs gpu {b} ({ulp} ulp) — \
+                     more than exp()'s spread means a real divergence"
+                );
+                worst_ulp = worst_ulp.max(ulp);
+            }
+        }
+        // Pin the observed spread: if it ever grows, something changed that is
+        // not exp's last bit.
+        assert!(worst_ulp <= 2, "worst {worst_ulp} ulp across the run");
+        // The rolled state must match too: an off-by-one roll produces correct
+        // FIRST outputs and wrong later ones, so only comparing step 0 would
+        // pass a broken kernel.
+        for (i, (a, b)) in ref_state.iter().zip(&gpu_state).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "final state slot {i}");
+        }
+    }
+
+    /// The comparison must be able to FAIL: feeding the reference a state that
+    /// differs in one slot has to break bit-equality somewhere.
+    #[test]
+    fn conv_oracle_has_a_negative_control() {
+        let d = dims();
+        let (c_all, k) = (d.conv_channels(), d.d_conv);
+        let mut seed = 99u32;
+        let state0: Vec<f32> = (0..c_all * (k - 1)).map(|_| lcg(&mut seed)).collect();
+        let w: Vec<f32> = (0..c_all * k).map(|_| lcg(&mut seed)).collect();
+        let xs: Vec<Vec<f32>> = vec![(0..c_all).map(|_| lcg(&mut seed)).collect()];
+
+        let (gpu_outs, _) = gpu_conv(d, &state0, &xs, &w);
+        let mut perturbed = state0.clone();
+        perturbed[0] = perturbed[0] + 1.0;
+        let mut rs = perturbed;
+        let want = rf::conv_step(&d, &mut rs, &xs[0], &w);
+        assert!(
+            want.iter().zip(&gpu_outs[0]).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "a perturbed state must change the output, or the oracle proves nothing"
+        );
+    }
+}

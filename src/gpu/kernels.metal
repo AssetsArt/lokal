@@ -3437,11 +3437,18 @@ kernel void ssm_conv_decode(
     device float *st = state + (ulong)gid * (k - 1);
     device const float *c = w + (ulong)gid * k;
     float acc = 0.0f;
-    for (uint j = 0; j + 1 < k; j++) {
-        acc += st[j] * c[j];
-    }
     float xv = x[gid];
-    acc += xv * c[k - 1];
+    {
+        // ggml's CPU dot does a separate multiply and add per tap. Metal
+        // contracts that into an fma unless told not to — and fast-math being
+        // OFF does not stop it, contraction is a separate switch. Without this
+        // the kernel is one ulp from the reference on most channels.
+#pragma clang fp contract(off)
+        for (uint j = 0; j + 1 < k; j++) {
+            acc += st[j] * c[j];
+        }
+        acc += xv * c[k - 1];
+    }
     // silu as the reference spells it: x * sigmoid(x), a reciprocal and a
     // multiply. `x / (1 + exp(-x))` is the same value in real arithmetic and
     // not always the same float.
