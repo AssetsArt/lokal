@@ -29,8 +29,11 @@ To collect the held rows on an actually-idle machine — a fresh boot, or after
 any agent crew exits — run:
 
 ```
-zsh /path/to/k4-bigmodels.sh
+zsh benchmarks/collect-gguf-rows.sh
 ```
+
+(models default to `~/.cache/gguf/`; override with
+`M14=/path/to/14b.gguf M32=/path/to/32b.gguf`)
 
 It gates itself: CPU-quiet before and after, `vm_stat` swapins and
 decompressions sampled around each run (>20k swapins or >200k decompressions
