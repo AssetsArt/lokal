@@ -97,7 +97,7 @@ pub(crate) struct WindowCfg {
 }
 
 impl WindowCfg {
-    fn new(w: usize, sink: usize) -> crate::Result<Self> {
+    pub(crate) fn new(w: usize, sink: usize) -> crate::Result<Self> {
         if w == 0 || sink > w {
             return Err(format!("invalid window config: window {w}, sink {sink}").into());
         }
