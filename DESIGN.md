@@ -301,6 +301,15 @@ checkpoint reads beside staged pages: an over-budget page does not stage at
 all, so a stage-in count alone would call a run that streamed 1.5 GB in eight
 decode steps "resident". A checkpoint that fits shows zeros in both.
 
+Those counters prove the POOL did not restage, which is **not** the same claim
+as the pages being in RAM. A pool that fits `--memory-budget` but not the
+machine reports perfect residency while the OS swaps it: a 14B Q4 at budget
+12000 on a box with 3.2 GB free showed zero stage-ins beside 1.7 million
+swapins in six decode tokens. Residency is therefore asserted at both levels —
+the gate samples `vm_stat` around the run and fails with "pool is resident but
+the MACHINE is not". The tell is a U-curve: if a SMALLER budget runs faster,
+the right arm is swap thrash, not streaming.
+
 **Streaming, and one path deliberately left off.** A page that does not fit the
 budget is not staged at all: it is read straight from the checkpoint's mmap
 through a no-copy Metal view, so streamed bytes cross the bus once. For bf16
@@ -386,6 +395,31 @@ Metal's — the ANE changes time-to-first-token only, and at chat latencies
 grows (attention's cost is linear in cached positions), but flash-decoding
 flattened the slide dramatically: before it, the same run decoded at
 ~76 tok/s; the remaining per-position cost is mostly the f32 KV cache reads.
+
+## GGUF: what runs today (M1 Pro, 16 GB, greedy)
+
+Capability first, because on a 16 GB machine that is the claim that matters:
+
+| checkpoint | file | result |
+|---|---|---|
+| Qwen3-32B Q4_K_M | 19.76 GB | opens and answers correctly — a 32B on a 16 GB box |
+| Qwen2.5-14B Q4_K_M | 8.99 GB | pool-resident, answers correctly |
+| Qwen3-0.6B Q4_K_M | 0.46 GB | **5/5 prompts byte-identical to llama.cpp** over 48 greedy tokens |
+| SmolLM2-135M F16 | — | byte-identical to the same weights in safetensors |
+
+Decode throughput, models small enough to be genuinely resident on this box:
+
+| checkpoint | decode |
+|---|---|
+| Qwen2.5-0.5B Q4_K_M | ~120 tok/s |
+| Qwen2.5-0.5B Q8_0 | ~114 tok/s |
+
+The 14B and 32B decode rows are **pending a memory-quiet window** and are
+deliberately absent rather than estimated. Both were measured, and both are
+contaminated: with only ~3 GB free the box swapped through the run, so the
+figure describes what else was resident on the machine rather than what the
+engine does. A reader on an idle 16 GB M1 Pro would not reproduce it, which is
+the only test a published row has to pass.
 
 ## Where the time goes
 
