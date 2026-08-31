@@ -473,6 +473,21 @@ pub(crate) fn tests_qwen35_gguf() -> Option<std::path::PathBuf> {
         .find(|p| p.extension().is_some_and(|x| x == "gguf"))
 }
 
+/// The loading seam (spec §11): a view-backed store re-reads on every take —
+/// nothing is consumed. The paged/row/GPU-span surface below is deliberately
+/// wider than the trait; an f32 seam does not cover paging.
+impl crate::weights::TensorStore for LowMemSource {
+    fn has(&self, name: &str) -> bool {
+        LowMemSource::has(self, name)
+    }
+    fn numel(&self, name: &str) -> Option<usize> {
+        self.shape(name).ok().map(|s| s.iter().product())
+    }
+    fn take_f32(&mut self, name: &str) -> crate::Result<Vec<f32>> {
+        self.read_f32(name)
+    }
+}
+
 impl LowMemSource {
     pub fn open(path: &Path) -> crate::Result<Self> {
         if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {

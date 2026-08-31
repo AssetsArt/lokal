@@ -66,3 +66,70 @@ pub(crate) fn to_f32(dtype: Dtype, data: &[u8]) -> crate::Result<Vec<f32>> {
     };
     Ok(out)
 }
+
+/// The tensor-storage seam (docs/gguf-design.md §Tensor Abstraction): the
+/// model graph must not know where tensors live. Two variants exist on main —
+/// the eager f32 map (safetensors via `load`, GGUF via `gguf::load_f32`) and
+/// the mmap-backed `LowMemSource` — and both satisfy this trait. It is a
+/// LOADING seam: `dyn` here is off every hot path (construction only), and the
+/// paged/view surface the streaming backends also need (row ranges, GPU spans)
+/// is intentionally beyond it — an f32 seam must not pretend to cover paging.
+pub(crate) trait TensorStore {
+    fn has(&self, name: &str) -> bool;
+    /// Element count without materializing (shape inference, e.g. head_dim).
+    fn numel(&self, name: &str) -> Option<usize>;
+    /// Materialize one tensor as owned f32. A store MAY hand its buffer over
+    /// (the map does — second take errors); a view-backed store re-reads.
+    fn take_f32(&mut self, name: &str) -> crate::Result<Vec<f32>>;
+}
+
+impl TensorStore for TensorMap {
+    fn has(&self, name: &str) -> bool {
+        self.contains_key(name)
+    }
+    fn numel(&self, name: &str) -> Option<usize> {
+        self.get(name).map(Vec::len)
+    }
+    fn take_f32(&mut self, name: &str) -> crate::Result<Vec<f32>> {
+        self.remove(name)
+            .ok_or_else(|| format!("tensor {name} not found in the weight files").into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seam's move semantics on the eager map: a take hands the buffer
+    /// over, so a second take of the same name is an error, and optional
+    /// tensors probe with has() first (how from_store reads q_norm/bias).
+    #[test]
+    fn tensor_map_store_hands_buffers_over() {
+        let mut t = TensorMap::new();
+        t.insert("a.weight".into(), vec![1.0, 2.0]);
+        assert!(TensorStore::has(&t, "a.weight"));
+        assert_eq!(TensorStore::numel(&t, "a.weight"), Some(2));
+        assert_eq!(t.take_f32("a.weight").unwrap(), vec![1.0, 2.0]);
+        assert!(!TensorStore::has(&t, "a.weight"));
+        assert!(t.take_f32("a.weight").is_err(), "second take must error");
+        assert!(t.take_f32("missing").unwrap_err().to_string().contains("missing"));
+    }
+
+    /// The seam over the view-backed store: LowMemSource::take_f32 re-reads
+    /// (nothing consumed) — both formats behind one trait is the whole point
+    /// of spec §11. Real-file: the synthetic header is too bare for open().
+    #[test]
+    #[ignore = "needs the local Qwen GGUF checkpoint"]
+    fn lowmem_source_satisfies_the_seam() {
+        let p = crate::gguf::testutil::qwen_gguf();
+        let mut src = crate::lowmem::LowMemSource::open(&p).unwrap();
+        let store: &mut dyn TensorStore = &mut src;
+        let name = "model.norm.weight";
+        assert!(store.has(name));
+        let a = store.take_f32(name).unwrap();
+        let b = store.take_f32(name).unwrap();
+        assert_eq!(a, b, "view-backed take consumes nothing");
+        assert_eq!(store.numel(name), Some(a.len()));
+        assert!(!a.is_empty());
+    }
+}
