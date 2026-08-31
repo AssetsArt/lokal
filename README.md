@@ -126,8 +126,12 @@ out of a GGUF repo (ambiguity and misses list what IS there), and a bare
 `-GGUF` repo defaults to Q4_K_M.
 
 Config and tokenizer come out of the file itself (nothing else to download);
-tensor types F32, F16, Q8_0, Q4_0, Q4_K, Q5_K, and Q6_K are supported, and
-anything else is refused by name. On `-b metal` the weights STAY in their
+tensor types F32, F16, Q8_0, Q4_0, Q5_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K and the
+i-quant family (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
+IQ4_NL) are supported, which covers the mixed "UD" low-bit files whose tensors
+span a dozen types at once. Anything else is refused by name — in ONE pass,
+listing every unsupported type in the file with counts, so a mixed checkpoint
+does not teach you its requirements one re-download at a time. On `-b metal` the weights STAY in their
 quantized encoding on the GPU and dequantize on read — the memory cost is the
 file size, which is what lets a ~16 GB 27B Q4_K_M run resident with full
 attention on a 32 GB machine (`benchmarks/collect-metal-quant.sh` is the
@@ -135,7 +139,18 @@ one-command acceptance for exactly that). On `-b cpu` the weights are
 dequantized to f32 up front, so the honest memory cost there is the EXPANDED
 size — a 4 GB Q4 file is ~28 GB of f32, refused with both numbers named.
 `-b lowmem` keeps quantized weights paged under a fixed budget with windowed
-attention. The hybrid backend cannot run GGUF (its ANE graphs are exported
+attention.
+
+**On the 1- and 2-bit types: they work, and they cost quality.** IQ1-class
+output is heavily degraded — that is the nature of ~1.5 bits per weight, not a
+defect in this implementation, and no amount of correct dequantization buys it
+back. They are here because they make otherwise-impossible models fit, and
+because fewer bytes per weight means fewer bytes moved per token. If you are
+choosing a quantization rather than living with one you already have,
+**Q4_K_M is the floor worth defaulting to**; drop below it when the model does
+not otherwise fit, not to go faster. Every type is verified bit-for-bit against
+ggml's reference dequantization, so what you get is exactly what llama.cpp
+would compute from the same file — including its quality loss. The hybrid backend cannot run GGUF (its ANE graphs are exported
 from safetensors). GGUF architectures: `llama`, `qwen2` (and `qwen3` on
 `-b lowmem`), byte-level BPE tokenizers.
 
