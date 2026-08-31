@@ -2005,6 +2005,125 @@ kernel void bf16_to_f16_copy(
     dst[gid] = h;
 }
 
+// ---------- GGUF quant dequantization (-b lowmem) ----------
+// Block layouts follow ggml (llama.cpp, MIT — studied and reimplemented; the
+// structs live in ggml-common.h, the reference walks in ggml-quants.c). Every
+// value dequantizes to f32 in registers with the SAME expression shapes as the
+// CPU reference dequant_row_ref, and the quant pipelines are built from the
+// engine's PRECISE (fast-math-off) library so multiplies and subtracts stay
+// un-fused IEEE f32 — the oracle gate demands bit-for-bit, not "close".
+//
+// LM_W_QTYPE selects the weight encoding at pipeline build (the switch folds):
+//   0 = staged f16 (default; every existing pipeline)
+//   1 = raw bf16 through the mmap view (supersedes the old LM_W_BF16 flag)
+//   2 = Q8_0   34 B / 32 elems : f16 d, int8 qs[32]         → q*d
+//   3 = Q4_0   18 B / 32 elems : f16 d, nibbles lo|hi       → (q-8)*d
+//   4 = Q4_K  144 B / 256      : f16 d,dmin, 6-bit packed scales/mins ×8, nibbles
+//   5 = Q6_K  210 B / 256      : ql nibbles + qh 2-bit highs, int8 scales ×16, f16 d
+constant uint LM_W_QTYPE_FC [[function_constant(25)]];
+constant uint LM_W_QTYPE = is_function_constant_defined(LM_W_QTYPE_FC) ? LM_W_QTYPE_FC : 0;
+
+// f16 scale at an arbitrary (unaligned) byte offset — 18/34/210-byte blocks
+// put half the scales on odd addresses.
+inline float lm_f16_at(device const uchar *p) {
+    return (float)as_type<half>((ushort)(p[0] | (p[1] << 8)));
+}
+
+inline float lm_dequant_q8_0(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 5) * 34;
+    float d = lm_f16_at(b);
+    return (float)(char)b[2 + (col & 31)] * d;
+}
+
+inline float lm_dequant_q4_0(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 5) * 18;
+    float d = lm_f16_at(b);
+    uint j = col & 31;
+    uchar byte = b[2 + (j & 15)];
+    int q = (int)((j < 16) ? (byte & 0x0F) : (byte >> 4)) - 8;
+    return (float)q * d;
+}
+
+// The 6-bit packed scale/min unpack — THE classic silent-rot spot. Mirrors
+// ggml's get_scale_min_k4 exactly, including the j-th (not j+4-th) byte
+// donating the top bits of the MIN in the second half.
+inline void lm_scale_min_k4(uint j, device const uchar *q, thread uint &sc, thread uint &mn) {
+    if (j < 4) {
+        sc = q[j] & 63;
+        mn = q[j + 4] & 63;
+    } else {
+        sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        mn = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+inline float lm_dequant_q4_K(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 8) * 144;
+    float d = lm_f16_at(b);
+    float dmin = lm_f16_at(b + 2);
+    device const uchar *scales = b + 4;
+    device const uchar *qs = b + 16;
+    uint ib = col & 255;
+    uint sc, mn;
+    lm_scale_min_k4(ib >> 5, scales, sc, mn);
+    float d1 = d * (float)sc;
+    float m1 = dmin * (float)mn;
+    // qs: per 64-element group, 32 bytes — low nibbles first 32, high next 32.
+    uchar byte = qs[(ib >> 6) * 32 + (ib & 31)];
+    uint q = (ib & 32) ? (byte >> 4) : (byte & 0xF);
+    return d1 * (float)q - m1;
+}
+
+inline float lm_dequant_q6_K(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 8) * 210;
+    uint ib = col & 255;
+    uint h = ib >> 7; // which 128-element half
+    uint r = ib & 127;
+    uint grp = r >> 5; // the reference's q1..q4 lanes
+    uint l = r & 31;
+    device const uchar *ql = b + h * 64;
+    device const uchar *qh = b + 128 + h * 32;
+    device const char *sc = (device const char *)(b + 192) + h * 8;
+    float d = lm_f16_at(b + 208);
+    uchar lowbyte = ql[l + (grp & 1) * 32];
+    uint low = (grp < 2) ? (lowbyte & 0xF) : (lowbyte >> 4);
+    uint hi2 = (qh[l] >> (2 * grp)) & 3;
+    int q = (int)(low | (hi2 << 4)) - 32;
+    return d * (float)sc[(l >> 4) + 2 * grp] * (float)q;
+}
+
+inline float lm_dequant(device const uchar *row, uint col) {
+    switch (LM_W_QTYPE) {
+        case 2: return lm_dequant_q8_0(row, col);
+        case 3: return lm_dequant_q4_0(row, col);
+        case 4: return lm_dequant_q4_K(row, col);
+        case 5: return lm_dequant_q6_K(row, col);
+        default: return 0.0f;
+    }
+}
+
+// The oracle gate's kernel: dequantize whole rows through the SAME inline
+// functions the matvec/matmul paths use, so the bit-for-bit comparison against
+// dequant_row_ref covers the production math.
+struct LmDeqParams {
+    uint cols;
+    uint row_bytes;
+    uint n_rows;
+};
+
+kernel void lm_dequant_oracle(
+    device const uchar *src [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    constant LmDeqParams &p [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]) // x = column, y = row
+{
+    if (gid.x >= p.cols || gid.y >= p.n_rows) {
+        return;
+    }
+    out[(ulong)gid.y * p.cols + gid.x] =
+        lm_dequant(src + (ulong)gid.y * p.row_bytes, gid.x);
+}
+
 // x += y  (residual connection)
 kernel void add_inplace(
     device float *x [[buffer(0)]],

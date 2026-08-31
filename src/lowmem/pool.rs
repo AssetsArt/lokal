@@ -427,3 +427,275 @@ impl WeightPool {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod quant_oracle {
+    //! The oracle gate (gguf-kernels D2, written FIRST per the lane order):
+    //! GPU dequantization must match the CPU reference BIT-FOR-BIT on
+    //! adversarial blocks. Until gguf-loader's seam freezes, `ref_dequant_row`
+    //! below is a placeholder implementing exact ggml semantics (transcribed
+    //! from ggml-quants.c); at seam-freeze it is swapped for
+    //! `manifest::dequant_row_ref` in one line — and because this shim was
+    //! derived independently of Tiësto's, the swap also cross-checks HIS
+    //! implementation against ggml.
+    //!
+    //! Negative control (run once, 2026-08-31): planting the classic
+    //! get_scale_min_k4 bug (q[j+4] instead of q[j] donating the min's top
+    //! bits) fails the gate at Q4_K block 1 elem 128 — the gate can fail.
+
+    use crate::gpu::metal as gpu;
+    use half::f16;
+    use metal::{CompileOptions, Device, FunctionConstantValues, MTLDataType, MTLResourceOptions, MTLSize};
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum QType {
+        Q8_0 = 2,
+        Q4_0 = 3,
+        Q4K = 4,
+        Q6K = 5,
+    }
+
+    impl QType {
+        fn blk_elems(self) -> usize {
+            match self {
+                QType::Q8_0 | QType::Q4_0 => 32,
+                QType::Q4K | QType::Q6K => 256,
+            }
+        }
+        fn blk_bytes(self) -> usize {
+            match self {
+                QType::Q8_0 => 34,
+                QType::Q4_0 => 18,
+                QType::Q4K => 144,
+                QType::Q6K => 210,
+            }
+        }
+    }
+
+    fn f16_at(b: &[u8]) -> f32 {
+        f16::from_le_bytes([b[0], b[1]]).to_f32()
+    }
+
+    // ggml's get_scale_min_k4, exactly — including q[j] (not q[j+4]) donating
+    // the min's top bits in the second half.
+    fn scale_min_k4(j: usize, q: &[u8]) -> (u32, u32) {
+        if j < 4 {
+            ((q[j] & 63) as u32, (q[j + 4] & 63) as u32)
+        } else {
+            (
+                ((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4)) as u32,
+                ((q[j + 4] >> 4) | ((q[j] >> 6) << 4)) as u32,
+            )
+        }
+    }
+
+    /// Placeholder for the seam's dequant_row_ref (exact ggml semantics,
+    /// strict IEEE f32 — no fma, same expression shapes as ggml-quants.c).
+    fn ref_dequant_row(ty: QType, src: &[u8], out: &mut [f32]) {
+        let (be, bb) = (ty.blk_elems(), ty.blk_bytes());
+        assert_eq!(out.len() % be, 0);
+        assert_eq!(src.len(), out.len() / be * bb);
+        for (blk, y) in src.chunks_exact(bb).zip(out.chunks_exact_mut(be)) {
+            match ty {
+                QType::Q8_0 => {
+                    let d = f16_at(blk);
+                    for j in 0..32 {
+                        y[j] = (blk[2 + j] as i8) as f32 * d;
+                    }
+                }
+                QType::Q4_0 => {
+                    let d = f16_at(blk);
+                    for j in 0..16 {
+                        let x0 = (blk[2 + j] & 0x0F) as i32 - 8;
+                        let x1 = (blk[2 + j] >> 4) as i32 - 8;
+                        y[j] = x0 as f32 * d;
+                        y[j + 16] = x1 as f32 * d;
+                    }
+                }
+                QType::Q4K => {
+                    let d = f16_at(blk);
+                    let min = f16_at(&blk[2..]);
+                    let scales = &blk[4..16];
+                    let qs = &blk[16..144];
+                    let mut yy = 0usize;
+                    let mut is = 0usize;
+                    let mut qoff = 0usize;
+                    for _ in (0..256).step_by(64) {
+                        let (sc, m) = scale_min_k4(is, scales);
+                        let d1 = d * sc as f32;
+                        let m1 = min * m as f32;
+                        let (sc, m) = scale_min_k4(is + 1, scales);
+                        let d2 = d * sc as f32;
+                        let m2 = min * m as f32;
+                        for l in 0..32 {
+                            y[yy] = d1 * (qs[qoff + l] & 0xF) as f32 - m1;
+                            yy += 1;
+                        }
+                        for l in 0..32 {
+                            y[yy] = d2 * (qs[qoff + l] >> 4) as f32 - m2;
+                            yy += 1;
+                        }
+                        qoff += 32;
+                        is += 2;
+                    }
+                }
+                QType::Q6K => {
+                    let d = f16_at(&blk[208..]);
+                    for n in (0..256).step_by(128) {
+                        let ql = &blk[n / 2..];
+                        let qh = &blk[128 + n / 4..];
+                        let sc = &blk[192 + n / 16..];
+                        for l in 0..32 {
+                            let is = l / 16;
+                            let q1 = ((ql[l] & 0xF) as i32 | (((qh[l] >> 0) & 3) as i32) << 4) - 32;
+                            let q2 = ((ql[l + 32] & 0xF) as i32 | (((qh[l] >> 2) & 3) as i32) << 4) - 32;
+                            let q3 = ((ql[l] >> 4) as i32 | (((qh[l] >> 4) & 3) as i32) << 4) - 32;
+                            let q4 = ((ql[l + 32] >> 4) as i32 | (((qh[l] >> 6) & 3) as i32) << 4) - 32;
+                            y[n + l] = d * (sc[is] as i8) as f32 * q1 as f32;
+                            y[n + l + 32] = d * (sc[is + 2] as i8) as f32 * q2 as f32;
+                            y[n + l + 64] = d * (sc[is + 4] as i8) as f32 * q3 as f32;
+                            y[n + l + 96] = d * (sc[is + 6] as i8) as f32 * q4 as f32;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Adversarial rows: all-zero, subnormal scales with extreme quants, max
+    /// f16 scale with max-magnitude quants, and dense LCG-patterned bytes that
+    /// exercise every scale high-bit combination. Inf/NaN f16 scales are out
+    /// of domain (no real checkpoint carries them; NaN payloads differ across
+    /// engines) and deliberately excluded.
+    fn adversarial_rows(ty: QType, n_blocks: usize, n_rows: usize) -> Vec<u8> {
+        let bb = ty.blk_bytes();
+        let mut out = Vec::with_capacity(n_rows * n_blocks * bb);
+        let mut lcg: u32 = 0x2545_F491;
+        let mut next = || {
+            lcg = lcg.wrapping_mul(1664525).wrapping_add(1013904223);
+            (lcg >> 16) as u8
+        };
+        let scale_bytes: [[u8; 2]; 4] = [
+            f16::from_f32(0.0).to_le_bytes(),
+            [0x01, 0x00],                       // smallest positive subnormal
+            [0xFF, 0x83],                       // negative subnormal
+            f16::MAX.to_le_bytes(),             // 65504
+        ];
+        for row in 0..n_rows {
+            for blk in 0..n_blocks {
+                let variant = (row * n_blocks + blk) % 4;
+                let mut b = vec![0u8; bb];
+                match variant {
+                    0 => {} // all-zero block
+                    _ => {
+                        for x in b.iter_mut() {
+                            *x = next();
+                        }
+                        let sb = scale_bytes[variant];
+                        match ty {
+                            QType::Q8_0 | QType::Q4_0 => b[0..2].copy_from_slice(&sb),
+                            QType::Q4K => {
+                                b[0..2].copy_from_slice(&sb);
+                                b[2..4].copy_from_slice(&scale_bytes[3 - variant + 1]);
+                            }
+                            QType::Q6K => b[208..210].copy_from_slice(&sb),
+                        }
+                        if variant == 3 {
+                            // max-magnitude quants under the max scale
+                            match ty {
+                                QType::Q8_0 => b[2..34].fill(0x80),
+                                QType::Q4_0 => b[2..18].fill(0x0F),
+                                QType::Q4K => {
+                                    b[4..16].fill(0xFF); // all scale/min bits set
+                                    b[16..144].fill(0xFF);
+                                }
+                                QType::Q6K => {
+                                    b[0..192].fill(0xFF);
+                                    b[192..208].fill(0x80); // scales = -128
+                                }
+                            }
+                        }
+                    }
+                }
+                out.extend_from_slice(&b);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn gpu_dequant_matches_reference_bit_for_bit() {
+        let device = Device::system_default().expect("Metal device required for the oracle");
+        // PRECISE library: fast-math would license fma fusion and reordering,
+        // and the gate is bit equality with strict-IEEE Rust — the shipped
+        // quant pipelines are built from this same fast-math-off source.
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+
+        for ty in [QType::Q8_0, QType::Q4_0, QType::Q4K, QType::Q6K] {
+            let (n_blocks, n_rows) = (8usize, 3usize);
+            let cols = n_blocks * ty.blk_elems();
+            let row_bytes = n_blocks * ty.blk_bytes();
+            let src = adversarial_rows(ty, n_blocks, n_rows);
+
+            let mut want = vec![0f32; n_rows * cols];
+            for r in 0..n_rows {
+                ref_dequant_row(
+                    ty,
+                    &src[r * row_bytes..(r + 1) * row_bytes],
+                    &mut want[r * cols..(r + 1) * cols],
+                );
+            }
+
+            let consts = FunctionConstantValues::new();
+            let tyv = ty as u32;
+            consts.set_constant_value_at_index(&tyv as *const u32 as *const _, MTLDataType::UInt, 25);
+            let f = lib.get_function("lm_dequant_oracle", Some(consts)).expect("oracle fn");
+            let pipe = device.new_compute_pipeline_state_with_function(&f).expect("oracle pipe");
+
+            let src_buf = device.new_buffer_with_data(
+                src.as_ptr() as *const _,
+                src.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let out_buf = device.new_buffer(
+                (want.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let queue = device.new_command_queue();
+            let cb = queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipe);
+            enc.set_buffer(0, Some(&src_buf), 0);
+            enc.set_buffer(1, Some(&out_buf), 0);
+            let p: [u32; 3] = [cols as u32, row_bytes as u32, n_rows as u32];
+            enc.set_bytes(2, 12, p.as_ptr() as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(cols.div_ceil(32) as u64, n_rows as u64, 1),
+                MTLSize::new(32, 1, 1),
+            );
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            let got = unsafe {
+                std::slice::from_raw_parts(out_buf.contents() as *const f32, want.len())
+            };
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    g.to_bits() == w.to_bits(),
+                    "{ty:?}: col {} row {} (block {}, elem {}): gpu {g:e} ({:#010x}) != ref {w:e} ({:#010x})",
+                    i % cols,
+                    i / cols,
+                    (i % cols) / ty.blk_elems(),
+                    (i % cols) % ty.blk_elems(),
+                    g.to_bits(),
+                    w.to_bits(),
+                );
+            }
+        }
+    }
+}
