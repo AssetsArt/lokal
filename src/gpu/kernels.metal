@@ -3397,3 +3397,106 @@ kernel void add_inplace(
         x[gid] += y[gid];
     }
 }
+
+// ---- qwen35 (gated deltanet) ----
+//
+// Kernels for the hybrid recurrent blocks. Semantics are transcribed from
+// llama.cpp's CPU path, not from the fused upstream Metal kernel, so that the
+// bit-for-bit oracle (lane B) compares against the same arithmetic the
+// reference performs.
+
+struct SsmConvParams {
+    uint channels; // d_inner + 2 * n_group * d_state
+    uint d_conv;   // filter taps (4 for qwen35)
+};
+
+/// Depthwise conv1d, DECODE form: one token, one rolling window per channel.
+///
+/// Mirrors lane B's `conv_step` exactly, because that is the oracle:
+///   * state is [channels][d_conv - 1], OLDEST FIRST — this is also the width
+///     llama.cpp's own state formula uses ((d_conv-1)*channels at
+///     llama-hparams.cpp:183), so a d_conv-wide window would not just differ
+///     from the reference, it would mis-size the persistent recurrent state;
+///   * the dot runs over the stored taps and then the NEW input against the
+///     last filter tap, f32, in that order (ggml's loop deliberately avoids
+///     its own double-precision dot here);
+///   * SiLU is applied INSIDE, matching the reference's gate boundary;
+///   * the window rolls AFTER the dot, never before.
+kernel void ssm_conv_decode(
+    device float *state [[buffer(0)]],          // [channels][d_conv-1], rolled in place
+    device const float *x [[buffer(1)]],        // [channels] this token's input
+    device const float *w [[buffer(2)]],        // [channels][d_conv] filter
+    device float *out [[buffer(3)]],            // [channels] post-SiLU
+    constant SsmConvParams &p [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= p.channels) {
+        return;
+    }
+    uint k = p.d_conv;
+    device float *st = state + (ulong)gid * (k - 1);
+    device const float *c = w + (ulong)gid * k;
+    float acc = 0.0f;
+    for (uint j = 0; j + 1 < k; j++) {
+        acc += st[j] * c[j];
+    }
+    float xv = x[gid];
+    acc += xv * c[k - 1];
+    // silu as the reference spells it: x * sigmoid(x), a reciprocal and a
+    // multiply. `x / (1 + exp(-x))` is the same value in real arithmetic and
+    // not always the same float.
+    out[gid] = acc * (1.0f / (1.0f + exp(-acc)));
+    for (uint j = 0; j + 1 < k - 1; j++) {
+        st[j] = st[j + 1];
+    }
+    st[k - 2] = xv;
+}
+
+/// Attention output gating, applied PRE-wo: out = attn_out * sigmoid(gate).
+/// qwen35's full-attention blocks project Q and the gate jointly and interleave
+/// them per head, so the gate arrives beside the attention output rather than
+/// as a separate tensor.
+kernel void attn_out_gate(
+    device float *attn_out [[buffer(0)]],
+    device const float *gate [[buffer(1)]],
+    constant uint &n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < n) {
+        attn_out[gid] *= 1.0f / (1.0f + exp(-gate[gid]));
+    }
+}
+
+/// L2 normalise each row: x / sqrt(sum(x^2)), no epsilon and no weight — this
+/// is the deltanet l2norm, NOT RMSNorm (which divides by sqrt(mean) and scales).
+kernel void l2norm_rows(
+    device float *x [[buffer(0)]],
+    constant uint &dim [[buffer(1)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    device float *r = x + (ulong)row * dim;
+    threadgroup float partial[NORM_TG / 32];
+    float acc = 0.0f;
+    for (uint i = tid; i < dim; i += NORM_TG) {
+        float v = r[i];
+        acc += v * v;
+    }
+    float sg = simd_sum(acc);
+    if (tid % 32 == 0) {
+        partial[tid / 32] = sg;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint j = 0; j < NORM_TG / 32; j++) {
+            total += partial[j];
+        }
+        partial[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = 1.0f / sqrt(partial[0]);
+    for (uint i = tid; i < dim; i += NORM_TG) {
+        r[i] *= inv;
+    }
+}
