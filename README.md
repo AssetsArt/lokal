@@ -158,9 +158,11 @@ ggml's reference dequantization, so what you get is exactly what llama.cpp
 would compute from the same file — including its quality loss.
 
 The hybrid backend cannot run GGUF (its ANE graphs are exported
-from safetensors). GGUF architectures: `llama`, `qwen2`, and `qwen3`
+from safetensors). GGUF architectures: `llama`, `qwen2`, `qwen3`
 (per-head q/k norm runs on cpu, metal, and lowmem — hybrid's ANE graphs
-cannot compute it), byte-level BPE tokenizers.
+cannot compute it), and `qwen35` — Qwen3.5's gated-deltanet hybrid, which
+**runs on `-b lowmem` only** (the Metal engine has no linear-block path yet;
+`-b metal` refuses it by name). Byte-level BPE tokenizers.
 
 ## Backends
 
