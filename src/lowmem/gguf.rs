@@ -451,15 +451,44 @@ pub fn quant_bytes(g: &GgufFile) -> usize {
     g.infos.iter().map(|i| i.range.len()).sum()
 }
 
+/// llama-arch GGUFs store q_proj/k_proj with llama.cpp's RoPE permute
+/// (LlamaModel.permute in the converter): per head,
+///   gguf[h*hd + d*2 + a] = hf[h*hd + a*(hd/2) + d],  a in {0,1}.
+/// Verified numerically row-by-row on SmolLM2 (lane note). qwen2 checkpoints
+/// are NOT permuted (proved bit-exact without it). Undo it at load so every
+/// consumer sees the HF layout the whole tree assumes. Public for lane 2:
+/// GgufTensor.data is the file's bytes, i.e. still permuted for llama-arch.
+pub fn unpermute_llama_qk(data: &mut Vec<f32>, rows: usize, cols: usize, head_dim: usize) {
+    debug_assert_eq!(rows % head_dim, 0);
+    let mut out = vec![0f32; data.len()];
+    for h in 0..rows / head_dim {
+        for j in 0..head_dim {
+            let (a, d) = (j / (head_dim / 2), j % (head_dim / 2));
+            let src = h * head_dim + d * 2 + a;
+            out[(h * head_dim + j) * cols..][..cols]
+                .copy_from_slice(&data[src * cols..][..cols]);
+        }
+    }
+    *data = out;
+}
+
 /// Dequantize the whole checkpoint to f32 under HF names — what `-b cpu` and
 /// `-b metal` eat. The caller has already run the fits-in-RAM check.
 pub fn load_f32(g: &GgufFile) -> crate::Result<crate::weights::TensorMap> {
+    let (_, arch) = model_config(g)?;
+    let undo_permute = arch.arch == "llama";
     let mut map = crate::weights::TensorMap::new();
     for t in g.tensors() {
         let Some(name) = hf_name(&t.name) else { continue };
         let n: usize = t.dims.iter().product();
         let mut out = vec![0f32; n];
         dequant_row_ref(t.ty, t.data, &mut out);
+        if undo_permute
+            && t.dims.len() == 2
+            && (t.name.ends_with("attn_q.weight") || t.name.ends_with("attn_k.weight"))
+        {
+            unpermute_llama_qk(&mut out, t.dims[0], t.dims[1], arch.head_dim);
+        }
         map.insert(name, out);
     }
     Ok(map)
@@ -687,6 +716,26 @@ mod tests {
     }
 
     #[test]
+    fn unpermute_inverts_the_converter_permute() {
+        // Forward permute exactly as conversion/llama.py does it, on a 2-head,
+        // hd=4, cols=1 toy: reshape(h, 2, hd/2, in).swapaxes(1,2).reshape.
+        let hd = 4usize;
+        let rows = 8usize;
+        let hf: Vec<f32> = (0..rows as u32).map(|x| x as f32).collect();
+        let mut gguf = vec![0f32; rows];
+        for h in 0..rows / hd {
+            for a in 0..2 {
+                for d in 0..hd / 2 {
+                    gguf[h * hd + d * 2 + a] = hf[h * hd + a * (hd / 2) + d];
+                }
+            }
+        }
+        let mut got = gguf.clone();
+        unpermute_llama_qk(&mut got, rows, 1, hd);
+        assert_eq!(got, hf);
+    }
+
+    #[test]
     fn maps_gguf_names_to_hf() {
         assert_eq!(hf_name("token_embd.weight").as_deref(), Some("model.embed_tokens.weight"));
         assert_eq!(
@@ -775,12 +824,37 @@ mod tests {
         std::fs::remove_file(p).ok();
     }
 
+    fn hf_tokenizer_json(repo_dir: &str) -> std::path::PathBuf {
+        let snaps = std::path::PathBuf::from(std::env::var("HOME").unwrap())
+            .join(".cache/huggingface/hub")
+            .join(repo_dir)
+            .join("snapshots");
+        std::fs::read_dir(snaps)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path().join("tokenizer.json"))
+            .find(|p| p.is_file())
+            .expect("snapshot with tokenizer.json")
+    }
+
     #[test]
-    #[ignore = "needs the local Qwen GGUF + HF checkpoints"]
+    #[ignore = "needs the local GGUF + HF checkpoints"]
     fn gguf_tokenizer_matches_hf_on_mixed_corpus() {
-        let g = GgufFile::open(&qwen_gguf()).unwrap();
+        let smol_gguf = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(
+            ".cache/huggingface/hub/models--unsloth--SmolLM2-135M-Instruct-GGUF/snapshots/9e6855bc4be717fca1ef21360a1db4b29d5c559a/SmolLM2-135M-Instruct-F16.gguf",
+        );
+        for (gguf, hf_json) in [
+            (qwen_gguf(), hf_tokenizer_json("models--Qwen--Qwen2.5-0.5B-Instruct")),
+            (smol_gguf, hf_tokenizer_json("models--HuggingFaceTB--SmolLM2-135M-Instruct")),
+        ] {
+            check_tokenizer_pair(&gguf, &hf_json);
+        }
+    }
+
+    fn check_tokenizer_pair(gguf: &std::path::Path, hf_json: &std::path::Path) {
+        let g = GgufFile::open(gguf).unwrap();
         let ours = build_tokenizer(&g).unwrap();
-        let hf = tokenizers::Tokenizer::from_file(qwen_hf_tokenizer()).unwrap();
+        let hf = tokenizers::Tokenizer::from_file(hf_json).unwrap();
         let corpus = [
             "สวัสดีครับ วันนี้อากาศดีมาก ๆ เลยนะครับ",
             "ภาษาไทยไม่มีการเว้นวรรคระหว่างคำ ทำให้ tokenizer ต้องทำงานหนัก",
@@ -816,5 +890,61 @@ mod tests {
         assert_eq!(cfg.num_key_value_heads, 2);
         assert_eq!(cfg.vocab_size, 151936);
         assert!(cfg.is_eos(151645));
+    }
+}
+
+#[cfg(test)]
+mod equivalence_tests {
+    use super::*;
+
+    /// Name-mapping + dequant proof with ZERO tolerance: an F16 GGUF converted
+    /// from the same snapshot the safetensors arm loads must dequantize to the
+    /// exact same f32 values — bf16 is exactly f16-representable, so the
+    /// converter's f16 rounding is lossless here. Asset built with
+    /// convert_hf_to_gguf.py from snapshot 7ae55760. Deliberately NOT Qwen's
+    /// own fp16 upload: that file carries OLDER instruct weights than today's
+    /// snapshot (embed frozen, everything else differs — task note 39617bde).
+    #[test]
+    #[ignore = "needs the local same-snapshot GGUF + safetensors checkpoints"]
+    fn fp16_gguf_matches_safetensors_bit_exact() {
+        let home = std::env::var("HOME").unwrap();
+        let g = GgufFile::open(
+            &std::path::Path::new(&home)
+                .join(".cache/gguf/qwen2.5-0.5b-instruct-f16-from-7ae55760.gguf"),
+        )
+        .unwrap();
+        let snaps = std::path::PathBuf::from(&home)
+            .join(".cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots");
+        let st_dir = std::fs::read_dir(snaps)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.join("model.safetensors").is_file())
+            .unwrap();
+        let ours = load_f32(&g).unwrap();
+        let theirs = crate::weights::load(&st_dir).unwrap();
+        let mut checked = 0usize;
+        for (name, st) in &theirs {
+            let Some(gg) = ours.get(name) else {
+                panic!("safetensors tensor {name} has no GGUF counterpart");
+            };
+            assert_eq!(gg.len(), st.len(), "{name} length");
+            for (i, (a, b)) in gg.iter().zip(st).enumerate() {
+                // Compare AFTER f16 rounding — the form every engine stores.
+                // bf16 is exactly f16-representable in the normal range, but
+                // f16 SUBNORMALS (|x| < 2^-14) round; both paths round them
+                // identically, so post-round bits must still be equal.
+                let (fa, fb) = (half::f16::from_f32(*a), half::f16::from_f32(*b));
+                assert!(
+                    fa.to_bits() == fb.to_bits(),
+                    "{name}[{i}]: {a} vs {b} — f16 bits {:04x} != {:04x}",
+                    fa.to_bits(),
+                    fb.to_bits()
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked > 200, "only {checked} tensors compared");
+        eprintln!("equivalence: {checked} tensors bit-exact at f16");
     }
 }
