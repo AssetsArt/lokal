@@ -3068,6 +3068,399 @@ mod qwen35_kernel_oracle {
         if scale == 0.0 { 0.0 } else { (a - b).abs() / scale }
     }
 
+    /// Run attn_out_gate over a flat vector.
+    fn gpu_attn_gate(attn: &[f32], gate: &[f32]) -> Vec<f32> {
+        let device = Device::system_default().expect("Metal device required");
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+        let f = lib.get_function("attn_out_gate", None).expect("attn_out_gate");
+        let pipe = device.new_compute_pipeline_state_with_function(&f).expect("pipeline");
+        let queue = device.new_command_queue();
+        let shared = MTLResourceOptions::StorageModeShared;
+        let ab = device.new_buffer_with_data(
+            attn.as_ptr() as *const _, std::mem::size_of_val(attn) as u64, shared);
+        let gb = device.new_buffer_with_data(
+            gate.as_ptr() as *const _, std::mem::size_of_val(gate) as u64, shared);
+        let n = attn.len() as u32;
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipe);
+        enc.set_buffer(0, Some(&ab), 0);
+        enc.set_buffer(1, Some(&gb), 0);
+        enc.set_bytes(2, 4, &n as *const u32 as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new(((attn.len() + 63) / 64) as u64, 1, 1), MTLSize::new(64, 1, 1));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        unsafe { std::slice::from_raw_parts(ab.contents() as *const f32, attn.len()) }.to_vec()
+    }
+
+    /// The EXACT half for the out-gate. σ has three arguments where it is
+    /// exactly representable in any implementation — σ(0) = 0.5 (exp(0) = 1
+    /// exactly), σ(+big) = 1 and σ(−big) = 0 (exp underflows, 1+0 = 1) — so
+    /// feeding those pins the pairing, the indexing and the multiply with no
+    /// tolerance at all. The +big case is the valuable one: it asserts the
+    /// kernel leaves values ALONE when the gate is open, which a scaling bug
+    /// would break while still passing a σ(0) test.
+    #[test]
+    fn attn_out_gate_is_exact_at_saturation_and_zero() {
+        let mut seed = 0x7A11_0000u32;
+        let attn: Vec<f32> = (0..256).map(|_| lcg(&mut seed)).collect();
+        let gate: Vec<f32> = (0..256)
+            .map(|i| match i % 3 { 0 => 0.0, 1 => 100.0, _ => -100.0 })
+            .collect();
+        let got = gpu_attn_gate(&attn, &gate);
+        let mut want = attn.clone();
+        rf::attn_out_gate(&mut want, &gate);
+        for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "slot {i}: reference {a} vs gpu {b}");
+        }
+    }
+
+    /// The BOUNDED half — and the number in it was NOT picked, because when I
+    /// picked one I got it wrong.
+    ///
+    /// I asserted 2 ulp here first, on the strength of the conv kernel's
+    /// measured silu spread. It FAILED at 3 ulp, and the reason is structural,
+    /// not a fluke: σ(g) = 1/(1+exp(−g)) rounds three more times AFTER exp —
+    /// the add, the reciprocal, and the product — so a one-ulp exp error can
+    /// surface as three. conv's silu happened to land inside 2 and I
+    /// generalised from it.
+    ///
+    /// Bumping 2 to 3 would have been exactly the quiet gate-widening this lane
+    /// exists to prevent, so the bound is measured instead: perturb exp by one
+    /// rounding inside the reference's own σ, see how far the result moves, and
+    /// require the GPU inside 4x that. Then the bar tracks the arithmetic
+    /// rather than the last number that happened to pass.
+    #[test]
+    fn attn_out_gate_bounded_by_sigmoids_measured_floor() {
+        let mut seed = 0x7A11_0001u32;
+        let attn: Vec<f32> = (0..1024).map(|_| lcg(&mut seed) * 4.0).collect();
+        let gate: Vec<f32> = (0..1024).map(|_| lcg(&mut seed) * 8.0).collect();
+        let got = gpu_attn_gate(&attn, &gate);
+        let mut want = attn.clone();
+        rf::attn_out_gate(&mut want, &gate);
+
+        // σ with exp moved by one f32 rounding — the only thing the GPU is
+        // allowed to be doing differently.
+        let nudged: Vec<f32> = attn
+            .iter()
+            .zip(&gate)
+            .map(|(a, g)| {
+                // f32::EPSILON (2⁻²³), not 2⁻²⁴: 1.0 + 2⁻²⁴ rounds straight
+                // back to 1.0, so the smaller nudge is a no-op and the probe
+                // measures nothing. The guard below caught exactly that.
+                let e = (-g).exp() * (1.0 + f32::EPSILON);
+                a * (1.0 / (1.0 + e))
+            })
+            .collect();
+        let yardstick = want
+            .iter()
+            .zip(&nudged)
+            .fold(0f32, |m, (a, b)| m.max(rel_err(*a, *b)));
+        let measured = want.iter().zip(&got).fold(0f32, |m, (a, b)| m.max(rel_err(*a, *b)));
+        assert!(yardstick > 0.0, "the one-rounding nudge changed nothing — probe is broken");
+        assert!(
+            measured <= 4.0 * yardstick,
+            "gpu drift {measured:e} exceeds 4x sigmoid's measured one-rounding \
+             floor {yardstick:e} — more than exp's last bit can explain"
+        );
+    }
+
+    /// The out-gate's negative control: the gate is applied ELEMENTWISE and
+    /// paired by index, so rotating the gate by one must break the match. A
+    /// kernel that read the gate at the wrong offset — the exact hazard, since
+    /// the gate rides interleaved in the joint Q projection — would otherwise
+    /// look perfect.
+    #[test]
+    fn attn_out_gate_oracle_sees_a_misaligned_gate() {
+        let mut seed = 0x7A11_0002u32;
+        let attn: Vec<f32> = (0..256).map(|_| lcg(&mut seed)).collect();
+        let gate: Vec<f32> = (0..256).map(|_| lcg(&mut seed) * 4.0).collect();
+        let got = gpu_attn_gate(&attn, &gate);
+        let mut rotated: Vec<f32> = gate[1..].to_vec();
+        rotated.push(gate[0]);
+        let mut want = attn.clone();
+        rf::attn_out_gate(&mut want, &rotated);
+        assert!(
+            want.iter().zip(&got).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "a rotated gate must change the output, or the pairing is untested"
+        );
+    }
+
+    /// Run gated_output_norm (one threadgroup per V head).
+    fn gpu_gated_norm(d: rf::DeltaDims, o: &[f32], w: &[f32], z: &[f32], eps: f32) -> Vec<f32> {
+        let device = Device::system_default().expect("Metal device required");
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+        let f = lib.get_function("gated_output_norm", None).expect("gated_output_norm");
+        let pipe = device.new_compute_pipeline_state_with_function(&f).expect("pipeline");
+        let queue = device.new_command_queue();
+        let shared = MTLResourceOptions::StorageModeShared;
+        let mk = |v: &[f32]| device.new_buffer_with_data(
+            v.as_ptr() as *const _, std::mem::size_of_val(v) as u64, shared);
+        let (ob, wb, zb) = (mk(o), mk(w), mk(z));
+        let dim = d.d_state as u32;
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipe);
+        enc.set_buffer(0, Some(&ob), 0);
+        enc.set_buffer(1, Some(&wb), 0);
+        enc.set_buffer(2, Some(&zb), 0);
+        enc.set_bytes(3, 4, &dim as *const u32 as *const _);
+        enc.set_bytes(4, 4, &eps as *const f32 as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new(d.n_v_heads as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        unsafe { std::slice::from_raw_parts(ob.contents() as *const f32, o.len()) }.to_vec()
+    }
+
+    fn norm_dims() -> rf::DeltaDims {
+        rf::DeltaDims { d_state: 128, n_v_heads: 4, n_k_heads: 2, d_conv: 4 }
+    }
+
+    /// The EXACT half for the gated norm, built by removing BOTH inexact
+    /// ingredients at once rather than tolerating them:
+    ///   * integer o and w keep Σo² exactly representable, so the f32 tree sum
+    ///     and the reference's f64 sum agree bit-for-bit (and dividing by a
+    ///     power-of-two head width is exact);
+    ///   * z = +100 makes silu(z) = z EXACTLY (exp(−100) underflows, 1+0 = 1,
+    ///     σ = 1), so the gate contributes a real multiply rather than a
+    ///     transcendental — and unlike z = 0 it does not collapse the output to
+    ///     zeros, which would have made the test vacuous.
+    /// What remains pinned exactly is the whole operation order: mean, one
+    /// reciprocal root, and the (o·scale)·w association the reference uses.
+    #[test]
+    fn gated_output_norm_matches_reference_where_the_sums_agree() {
+        let d = norm_dims();
+        let (s, eps) = (d.d_state, 1e-5f32);
+        let mut seed = 0xBEEF_0001u32;
+        let o: Vec<f32> = (0..s * d.n_v_heads).map(|_| (lcg(&mut seed) * 8.0).round()).collect();
+        let w: Vec<f32> = (0..s).map(|_| (lcg(&mut seed) * 4.0).round()).collect();
+        let z: Vec<f32> = vec![100.0; s * d.n_v_heads];
+        let got = gpu_gated_norm(d, &o, &w, &z, eps);
+        let mut want = o.clone();
+        rf::gated_output_norm(&d, &mut want, &w, &z, eps);
+        for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "slot {i}: reference {a} vs gpu {b}");
+        }
+    }
+
+    /// The BOUNDED half. Two inexact ingredients now, so the yardstick is the
+    /// larger of the two measured floors: the f64→f32 accumulation gap (probed
+    /// on the reference itself) and one σ rounding. Same rule as everywhere in
+    /// this lane — the tolerance may only ever cover what was proven separately
+    /// above, and it is measured rather than picked.
+    #[test]
+    fn gated_output_norm_bounded_by_its_two_measured_floors() {
+        let d = norm_dims();
+        let (s, eps) = (d.d_state, 1e-5f32);
+        let mut seed = 0xBEEF_0002u32;
+        let o: Vec<f32> = (0..s * d.n_v_heads).map(|_| lcg(&mut seed)).collect();
+        let w: Vec<f32> = (0..s).map(|_| lcg(&mut seed)).collect();
+        let z: Vec<f32> = (0..s * d.n_v_heads).map(|_| lcg(&mut seed) * 4.0).collect();
+        let got = gpu_gated_norm(d, &o, &w, &z, eps);
+
+        let mut want = o.clone();
+        rf::gated_output_norm(&d, &mut want, &w, &z, eps);
+
+        // The accumulation probe: the same maths with the mean narrowed to f32.
+        let mut narrowed = o.clone();
+        for h in 0..d.n_v_heads {
+            let oh = &mut narrowed[h * s..(h + 1) * s];
+            let mean: f32 = oh.iter().map(|&v| v * v).sum::<f32>() / s as f32;
+            let scale = 1.0 / (mean + eps).sqrt();
+            for i in 0..s {
+                oh[i] = oh[i] * scale * w[i] * rf::silu(z[h * s + i]);
+            }
+        }
+        let accum_gap = want
+            .iter()
+            .zip(&narrowed)
+            .fold(0f32, |m, (a, b)| m.max(rel_err(*a, *b)));
+        // One f32 rounding is 2⁻²⁴ relative; σ costs about one.
+        let sigma_floor = (2f32).powi(-24);
+        let yardstick = accum_gap.max(sigma_floor);
+        let measured = want.iter().zip(&got).fold(0f32, |m, (a, b)| m.max(rel_err(*a, *b)));
+        assert!(accum_gap > 0.0, "narrowing the mean changed nothing — probe is broken");
+        assert!(
+            measured <= 4.0 * yardstick,
+            "gpu drift {measured:e} exceeds 4x the measured floor {yardstick:e} \
+             (accumulation {accum_gap:e}, sigma {sigma_floor:e})"
+        );
+    }
+
+    /// The gated norm's negative control. `w` is [S] and SHARED by every head,
+    /// so it must be indexed WITHIN the head — a kernel that walked it by
+    /// global position would produce head 0 correctly and every later head
+    /// wrong. Rotating w must break the match; that it does is what makes the
+    /// exact test above evidence about indexing and not just about arithmetic.
+    #[test]
+    fn gated_output_norm_oracle_sees_a_misaligned_weight() {
+        let d = norm_dims();
+        let (s, eps) = (d.d_state, 1e-5f32);
+        let mut seed = 0xBEEF_0003u32;
+        let o: Vec<f32> = (0..s * d.n_v_heads).map(|_| lcg(&mut seed)).collect();
+        let w: Vec<f32> = (0..s).map(|_| lcg(&mut seed)).collect();
+        let z: Vec<f32> = (0..s * d.n_v_heads).map(|_| lcg(&mut seed) * 4.0).collect();
+        let got = gpu_gated_norm(d, &o, &w, &z, eps);
+        let mut rotated: Vec<f32> = w[1..].to_vec();
+        rotated.push(w[0]);
+        let mut want = o.clone();
+        rf::gated_output_norm(&d, &mut want, &rotated, &z, eps);
+        assert!(
+            want.iter().zip(&got).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "a rotated ssm_norm weight must change the output, or w's indexing is untested"
+        );
+    }
+
+    /// Run l2norm_rows over `rows` (one threadgroup per row) and read them back.
+    fn gpu_l2norm(rows: &[Vec<f32>], eps: f32) -> Vec<Vec<f32>> {
+        let device = Device::system_default().expect("Metal device required");
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+        let f = lib.get_function("l2norm_rows", None).expect("l2norm_rows");
+        let pipe = device.new_compute_pipeline_state_with_function(&f).expect("pipeline");
+        let queue = device.new_command_queue();
+
+        let dim = rows[0].len();
+        let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+        let buf = device.new_buffer_with_data(
+            flat.as_ptr() as *const _,
+            std::mem::size_of_val(&flat[..]) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipe);
+        enc.set_buffer(0, Some(&buf), 0);
+        let d32 = dim as u32;
+        enc.set_bytes(1, 4, &d32 as *const u32 as *const _);
+        enc.set_bytes(2, 4, &eps as *const f32 as *const _);
+        // One threadgroup per row, NORM_TG threads wide — the kernel strides.
+        enc.dispatch_thread_groups(MTLSize::new(rows.len() as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let out = unsafe { std::slice::from_raw_parts(buf.contents() as *const f32, flat.len()) };
+        out.chunks(dim).map(|c| c.to_vec()).collect()
+    }
+
+    /// The EXACT half. The only thing that can differ between this kernel and
+    /// the reference is the accumulation of Σx² (f32 tree here, f64 sequential
+    /// there), so this test removes that variable instead of tolerating it:
+    /// with small-integer inputs every partial sum is exactly representable, so
+    /// both accumulations agree BIT-FOR-BIT in any order. Everything else — the
+    /// eps clamp, the single reciprocal, the scaling, the row striding — is
+    /// then pinned exactly, with no tolerance to hide in.
+    ///
+    /// (√ is safe to compare: rounding a f64 square root to f32 gives the
+    /// correctly-rounded f32 result, because 53 ≥ 2·24+2, so the reference's
+    /// f64-then-narrow and the GPU's native f32 √ cannot disagree here.)
+    #[test]
+    fn l2norm_matches_reference_where_the_sums_agree() {
+        let dim = 128; // the real d_state
+        let eps = 1e-6f32;
+        let mut seed = 0xC0FF_EE11u32;
+        let rows: Vec<Vec<f32>> = (0..6)
+            .map(|_| (0..dim).map(|_| (lcg(&mut seed) * 16.0).round()).collect())
+            .collect();
+        let got = gpu_l2norm(&rows, eps);
+        for (r, row) in rows.iter().enumerate() {
+            let mut want = row.clone();
+            rf::l2_norm(&mut want, eps);
+            for (i, (a, b)) in want.iter().zip(&got[r]).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "row {r} slot {i}: reference {a} vs gpu {b} — on exactly-summable \
+                     input this kernel has no excuse for a difference"
+                );
+            }
+        }
+    }
+
+    /// The eps clamp, pinned on the one input that can expose it. A zero row is
+    /// reachable in practice (split_qkv l2-normalises per K head, and a head
+    /// whose conv output is all zeros produces one), and without the clamp the
+    /// kernel computes 1/0 = inf and then 0·inf = NaN while the reference
+    /// returns zeros. No random test data ever generates this row, which is
+    /// exactly why it gets its own test rather than a seed.
+    #[test]
+    fn l2norm_zero_row_is_zero_not_nan() {
+        let dim = 128;
+        let eps = 1e-6f32;
+        let rows = vec![vec![0f32; dim], vec![1f32; dim]];
+        let got = gpu_l2norm(&rows, eps);
+        assert!(
+            got[0].iter().all(|v| v.is_finite()),
+            "zero row produced non-finite values — the eps clamp is missing or wrong"
+        );
+        let mut want = rows[0].clone();
+        rf::l2_norm(&mut want, eps);
+        for (i, (a, b)) in want.iter().zip(&got[0]).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "zero row slot {i}");
+        }
+        // The neighbouring row must still be normalised normally — a clamp that
+        // fires on every row would also pass the check above.
+        let n = (dim as f32).sqrt();
+        assert!(
+            (got[1][0] - 1.0 / n).abs() < 1e-6,
+            "the clamp must not fire on an ordinary row: got {}",
+            got[1][0]
+        );
+    }
+
+    /// The BOUNDED half, calibrated the same way as the delta step: the f32-vs-
+    /// f64 accumulation gap is measured on the reference itself (same maths,
+    /// sum narrowed to f32) and the GPU is required to sit inside a small
+    /// multiple of it. The GPU sums in a different ORDER as well (a simd tree,
+    /// not a sequential walk), which is why the allowance is 4x and not 1x.
+    #[test]
+    fn l2norm_bounded_by_the_measured_accumulation_gap() {
+        let dim = 128;
+        let eps = 1e-6f32;
+        let mut seed = 0x1234_ABCDu32;
+        let rows: Vec<Vec<f32>> = (0..6)
+            .map(|_| (0..dim).map(|_| lcg(&mut seed)).collect())
+            .collect();
+        let got = gpu_l2norm(&rows, eps);
+
+        let f32_sum_variant = |row: &[f32]| -> Vec<f32> {
+            let sum: f32 = row.iter().map(|&v| v * v).sum();
+            let scale = 1.0 / sum.sqrt().max(eps);
+            row.iter().map(|v| v * scale).collect()
+        };
+        let (mut worst_gpu, mut yardstick) = (0f32, 0f32);
+        for (r, row) in rows.iter().enumerate() {
+            let mut want = row.clone();
+            rf::l2_norm(&mut want, eps);
+            let narrowed = f32_sum_variant(row);
+            for i in 0..dim {
+                worst_gpu = worst_gpu.max(rel_err(want[i], got[r][i]));
+                yardstick = yardstick.max(rel_err(want[i], narrowed[i]));
+            }
+        }
+        assert!(yardstick > 0.0, "narrowing the sum to f32 changed nothing — probe is broken");
+        assert!(
+            worst_gpu <= 4.0 * yardstick,
+            "gpu drift {worst_gpu:e} exceeds 4x the measured f64→f32 accumulation gap \
+             {yardstick:e} — more than the missing f64 can explain"
+        );
+    }
+
     /// The comparison must be able to see a TRANSPOSED state. The layout is
     /// s[i + j*S + h*S*S] with i the contraction index; a kernel that swapped
     /// i and j would produce finite, plausible numbers. Feeding the reference a

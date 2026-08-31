@@ -3474,11 +3474,24 @@ kernel void attn_out_gate(
     }
 }
 
-/// L2 normalise each row: x / sqrt(sum(x^2)), no epsilon and no weight — this
-/// is the deltanet l2norm, NOT RMSNorm (which divides by sqrt(mean) and scales).
+/// L2 normalise each row: x / max(sqrt(sum(x^2)), eps), no weight — this is the
+/// deltanet l2norm, NOT RMSNorm (which divides by sqrt(mean) and scales).
+///
+/// THE EPS IS NOT DECORATION. ops.cpp clamps the DENOMINATOR after the root,
+/// and dropping it is not a rounding difference: a zero row — which split_qkv
+/// can hand us for a head whose conv output is all zeros — gives 1/0 = inf and
+/// then 0·inf = NaN, where the reference gives exactly 0. Random test data will
+/// never produce that row, so the oracle pins it by hand.
+///
+/// The sum accumulates in f32 here and in f64 (ggml_float) in the reference.
+/// That gap is unclosable — Metal has no f64 at all — and llama.cpp makes the
+/// identical trade in its own kernel_l2_norm_impl (threadgroup float). So the
+/// oracle proves the exact half on data where the two accumulations provably
+/// agree, and bounds only the accumulation difference.
 kernel void l2norm_rows(
     device float *x [[buffer(0)]],
     constant uint &dim [[buffer(1)]],
+    constant float &eps [[buffer(2)]],
     uint row [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
@@ -3502,7 +3515,9 @@ kernel void l2norm_rows(
         partial[0] = total;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inv = 1.0f / sqrt(partial[0]);
+    // max(sqrt(sum), eps) — the reference's exact shape: clamp the denominator
+    // after the root, then take the reciprocal once and multiply.
+    float inv = 1.0f / max(sqrt(partial[0]), eps);
     for (uint i = tid; i < dim; i += NORM_TG) {
         r[i] *= inv;
     }
@@ -3581,4 +3596,56 @@ kernel void delta_decode_step(
         o += s * (qh[i] * scale);
     }
     out[h * s_dim + j] = o;
+}
+
+/// The linear block's output stage: per-head RMSNorm(o; ssm_norm) · silu(z),
+/// in place on `o` — one threadgroup per V head (build_norm_gated).
+///
+/// The reference's operation order is load-bearing and reproduced exactly:
+/// the mean of squares, then 1/√(mean+eps) ONCE, then `(o · scale) · w`, in
+/// that association — not `o · (scale · w)`, which is the same value in real
+/// arithmetic and a different float.
+///
+/// Like l2norm this sums in f32 where the reference sums in f64, which is the
+/// one difference the oracle bounds rather than forbids; llama.cpp's
+/// kernel_rms_norm_fuse_impl makes the same trade.
+kernel void gated_output_norm(
+    device float *o [[buffer(0)]],       // [S*H_v], normalised and gated in place
+    device const float *w [[buffer(1)]], // [S] ssm_norm weights, shared by heads
+    device const float *z [[buffer(2)]], // [S*H_v] the gate, pre-silu
+    constant uint &dim [[buffer(3)]],    // S
+    constant float &eps [[buffer(4)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    device float *r = o + (ulong)head * dim;
+    device const float *zh = z + (ulong)head * dim;
+    threadgroup float partial[NORM_TG / 32];
+    float acc = 0.0f;
+    {
+        // Same contraction rule as everywhere else in this lane.
+#pragma clang fp contract(off)
+        for (uint i = tid; i < dim; i += NORM_TG) {
+            float v = r[i];
+            acc += v * v;
+        }
+    }
+    float sg = simd_sum(acc);
+    if (tid % 32 == 0) {
+        partial[tid / 32] = sg;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint j = 0; j < NORM_TG / 32; j++) {
+            total += partial[j];
+        }
+        partial[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float scale = 1.0f / sqrt(partial[0] / (float)dim + eps);
+    for (uint i = tid; i < dim; i += NORM_TG) {
+        float zv = zh[i];
+        r[i] = r[i] * scale * w[i] * (zv * (1.0f / (1.0f + exp(-zv))));
+    }
 }
