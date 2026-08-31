@@ -98,6 +98,17 @@ struct RopeParams {
     pos0: u32,
     theta: f32,
     n_rows: u32,
+    /// Leading dims that rotate; the rest of each head passes through. Equals
+    /// head_dim on every architecture except qwen35 (rope.dimension_count 64
+    /// inside head_dim 256).
+    ///
+    /// THIS FIELD'S ABSENCE HERE WAS THE e61c260 REGRESSION. kernels.metal
+    /// gained it and forward.rs mirrored it; this copy did not, and Metal
+    /// matches these by LAYOUT, so the kernel read it from uninitialised memory
+    /// past the struct and RoPE rotated the wrong span — fluent, wrong output
+    /// on every GGUF model under -b metal. `mirror_structs_match_the_metal_source`
+    /// now fails if any mirror drifts from kernels.metal again.
+    rot_dim: u32,
 }
 #[repr(C)]
 struct RopeQkParams {
@@ -1025,6 +1036,7 @@ impl MetalEngine {
             pos0: pos0 as u32,
             theta: self.cfg.rope_theta,
             n_rows: n_rows as u32,
+            rot_dim: hd as u32,
         };
         enc.set_compute_pipeline_state(if f16 { &self.pipes.rope_h } else { &self.pipes.rope });
         enc.set_buffer(0, Some(x), x_off);
@@ -1838,6 +1850,7 @@ impl MetalSession<'_> {
                     pos0: pos0 as u32,
                     theta: cfg.rope_theta,
                     n_rows: n as u32,
+                    rot_dim: hd as u32,
                 };
                 enc.set_compute_pipeline_state(&e.pipes.rope);
                 enc.set_buffer(0, Some(&self.q), 0);
@@ -1857,6 +1870,7 @@ impl MetalSession<'_> {
                         pos0: (pos0 + row) as u32,
                         theta: cfg.rope_theta,
                         n_rows: len as u32,
+                        rot_dim: hd as u32,
                     };
                     enc.set_compute_pipeline_state(&e.pipes.rope_h);
                     enc.set_buffer(0, Some(&self.k_cache[l]), dst_off);
@@ -2122,6 +2136,7 @@ impl MetalSession<'_> {
                     pos0: pos0 as u32,
                     theta: cfg.rope_theta,
                     n_rows: n as u32,
+                    rot_dim: hd as u32,
                 };
                 enc.set_compute_pipeline_state(&e.pipes.rope);
                 enc.set_buffer(0, Some(&self.q), 0);
@@ -2144,6 +2159,7 @@ impl MetalSession<'_> {
                     pos0: (pos0 + row) as u32,
                     theta: cfg.rope_theta,
                     n_rows: len as u32,
+                    rot_dim: hd as u32,
                 };
                 enc.set_compute_pipeline_state(&e.pipes.rope_h);
                 enc.set_buffer(0, Some(&self.k_cache[l]), dst_off);
@@ -2601,6 +2617,128 @@ impl Session for MetalSession<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// THE MIRROR GUARD — the class this lane exists to close.
+    ///
+    /// kernels.metal's `*Params` structs are mirrored by hand in Rust, in more
+    /// than one file, and Metal binds them BY LAYOUT: a mirror missing a field
+    /// makes the kernel read that field from uninitialised memory past the end
+    /// of the struct. Nothing crashes. RoPE just rotates the wrong span and the
+    /// model produces fluent, wrong text — which is what e61c260 shipped, on
+    /// every GGUF model under `-b metal`, for three merges.
+    ///
+    /// The compiler cannot catch it. Rust forces field-completeness on the
+    /// struct you EDIT; a duplicate declaration in another file stays
+    /// internally consistent and silently disagrees with the Metal side. So the
+    /// check has to be textual, and it has to run.
+    ///
+    /// Both sides are PARSED rather than listed here on purpose: a hand-written
+    /// table of expected fields is one more mirror, and it would drift exactly
+    /// like the one that caused this.
+    #[test]
+    fn mirror_structs_match_the_metal_source() {
+        // metal type -> the Rust type a mirror must use for the same 4/8 bytes
+        fn canon(t: &str) -> Option<&'static str> {
+            Some(match t {
+                "uint" => "u32",
+                "int" => "i32",
+                "float" => "f32",
+                "ulong" => "u64",
+                "long" => "i64",
+                "ushort" => "u16",
+                _ => return None,
+            })
+        }
+
+        /// `struct Name { ... }` bodies from Metal source: (field, rust-type).
+        fn parse_metal(src: &str) -> std::collections::HashMap<String, Vec<(String, String)>> {
+            let mut out = std::collections::HashMap::new();
+            let mut cur: Option<(String, Vec<(String, String)>)> = None;
+            for line in src.lines() {
+                let t = line.trim();
+                if let Some(rest) = t.strip_prefix("struct ") {
+                    if let Some(name) = rest.strip_suffix(" {") {
+                        cur = Some((name.to_string(), Vec::new()));
+                        continue;
+                    }
+                }
+                if let Some((name, fields)) = cur.as_mut() {
+                    if t == "};" || t == "}" {
+                        out.insert(name.clone(), std::mem::take(fields));
+                        cur = None;
+                        continue;
+                    }
+                    // `uint head_dim;` possibly followed by a // comment
+                    let decl = t.split("//").next().unwrap_or("").trim().trim_end_matches(';');
+                    let mut w = decl.split_whitespace();
+                    if let (Some(ty), Some(field), None) = (w.next(), w.next(), w.next()) {
+                        if let Some(rt) = canon(ty) {
+                            fields.push((field.to_string(), rt.to_string()));
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        /// The same for Rust `struct Name { field: ty, }` (any indentation).
+        fn parse_rust(src: &str) -> Vec<(String, Vec<(String, String)>)> {
+            let mut out = Vec::new();
+            let mut cur: Option<(String, Vec<(String, String)>)> = None;
+            for line in src.lines() {
+                let t = line.trim();
+                if let Some(rest) = t.strip_prefix("struct ") {
+                    if let Some(name) = rest.strip_suffix(" {") {
+                        cur = Some((name.to_string(), Vec::new()));
+                        continue;
+                    }
+                }
+                if let Some((name, fields)) = cur.as_mut() {
+                    if t == "}" {
+                        out.push((name.clone(), std::mem::take(fields)));
+                        cur = None;
+                        continue;
+                    }
+                    if t.starts_with("///") || t.starts_with("//") || t.is_empty() {
+                        continue;
+                    }
+                    if let Some((f, ty)) = t.trim_end_matches(',').split_once(':') {
+                        fields.push((f.trim().to_string(), ty.trim().to_string()));
+                    }
+                }
+            }
+            out
+        }
+
+        let metal = parse_metal(include_str!("kernels.metal"));
+        assert!(metal.len() > 10, "parsed only {} Metal structs — parser broken", metal.len());
+
+        let mut checked = 0;
+        for (file, src) in [
+            ("src/gpu/metal.rs", include_str!("metal.rs")),
+            ("src/lowmem/forward.rs", include_str!("../lowmem/forward.rs")),
+        ] {
+            for (name, rust_fields) in parse_rust(src) {
+                let Some(metal_fields) = metal.get(&name) else { continue };
+                checked += 1;
+                assert_eq!(
+                    &rust_fields, metal_fields,
+                    "{file}: `struct {name}` has drifted from its kernels.metal definition. \
+                     Metal binds these BY LAYOUT, so a mismatch makes the kernel read a field \
+                     from uninitialised memory and produce fluent, wrong output — it does not \
+                     crash. Update every Rust mirror when you change the Metal struct."
+                );
+            }
+        }
+        // The guard needs its own negative control: if the parsers silently
+        // matched nothing, every assertion above is vacuous and the test would
+        // pass on a codebase where every mirror had drifted.
+        assert!(
+            checked >= 8,
+            "compared only {checked} mirrors — expected at least the eight duplicated \
+             *Params structs; the parser or the naming convention has changed"
+        );
+    }
+
     /// q_dim is NOT hidden_size, and on real configs it is bigger. This pins
     /// the invariant that every Q/attention-width allocation must use, because
     /// getting it wrong overruns the buffer silently — the failure shows up as
