@@ -174,9 +174,15 @@ impl<'a> LowMemSession<'a> {
         let cap = e.win.cap;
         let chunk = gpu::PREFILL_CHUNK.min(max_seq);
         let (h, kvd) = (cfg.hidden_size, e.dims.kv_dim);
-        let recurrent = |l: usize| {
-            e.deltanet_layout.as_ref().is_some_and(|q| q.is_recurrent.get(l).copied().unwrap_or(false))
-        };
+        // The two-kind state schedule (docs/gguf-design.md §state seam) — the
+        // one source for which slot a layer gets; the stub-vs-full choice below
+        // and the DeltaNetStates slots both follow it.
+        let sched = crate::gpu::metal::state_schedule(
+            cfg.num_hidden_layers,
+            e.deltanet_layout.as_ref(),
+        );
+        let recurrent =
+            |l: usize| sched[l] == crate::gpu::metal::LayerStateKind::Recurrent;
         Self {
             // KV EXISTS ONLY ON THE FULL-ATTENTION LAYERS. On qwen35 that is 6 of
             // 24 (one in full_attention_interval); the gated-deltanet blocks
@@ -215,10 +221,17 @@ impl<'a> LowMemSession<'a> {
             } else {
                 gpu::f32_buffer(d, chunk * cfg.num_attention_heads * cap)
             },
-            deltanet: e
-                .deltanet_layout
-                .as_ref()
-                .map(|l| crate::gpu::metal::DeltaNetStates::new(d, l)),
+            deltanet: e.deltanet_layout.as_ref().map(|l| {
+                let st = crate::gpu::metal::DeltaNetStates::new(d, l);
+                for (i, k) in sched.iter().enumerate() {
+                    debug_assert_eq!(
+                        st.layers[i].is_some(),
+                        *k == crate::gpu::metal::LayerStateKind::Recurrent,
+                        "state slot kind drifted from the schedule at layer {i}"
+                    );
+                }
+                st
+            }),
             ds: e.delta_dims().map(|dd| DeltaScratch::new(d, dd, chunk)),
             qg: (e.dims.q_proj_dim != e.dims.q_dim).then(|| {
                 (gpu::f32_buffer(d, chunk * e.dims.q_dim), gpu::f32_buffer(d, chunk * e.dims.q_dim))
