@@ -66,16 +66,28 @@ pub(crate) struct Dims {
     pub q_dim: usize,
     /// n_kv_heads * head_dim.
     pub kv_dim: usize,
+    /// The Q PROJECTION's output width, which is not always `q_dim`.
+    ///
+    /// qwen35's attention blocks project Q and the output gate JOINTLY —
+    /// [q(head_dim)|gate(head_dim)] interleaved per head — so the tensor is
+    /// 2·q_dim wide while attention itself still consumes q_dim. Two different
+    /// numbers that were one number on every previous architecture, which is
+    /// exactly the shape of bug that has already cost this repo two buffer
+    /// overruns (see gpu::metal::attn_row_width): size the projection's
+    /// destination by THIS, and attention's own widths by `q_dim`.
+    pub q_proj_dim: usize,
 }
 
 impl Dims {
-    fn new(cfg: &ModelConfig, head_dim: Option<usize>) -> Self {
+    fn new(cfg: &ModelConfig, head_dim: Option<usize>, joint_q_gate: bool) -> Self {
         let head_dim = head_dim.unwrap_or_else(|| cfg.head_dim());
+        let q_dim = cfg.num_attention_heads * head_dim;
         Dims {
             hidden: cfg.hidden_size,
             head_dim,
-            q_dim: cfg.num_attention_heads * head_dim,
+            q_dim,
             kv_dim: cfg.num_key_value_heads * head_dim,
+            q_proj_dim: if joint_q_gate { 2 * q_dim } else { q_dim },
         }
     }
 }
@@ -110,7 +122,8 @@ fn memory_plan(
         chunk * cfg.num_attention_heads * win.cap * 4
     };
     let act_bytes = 3 * chunk * h * 4                    // x, xn, xb
-        + 2 * chunk * dims.q_dim * 4                     // q, att (q_dim != h on qwen3)
+        + chunk * dims.q_proj_dim * 4                    // q (q_proj_dim: joint Q+gate on qwen35)
+        + chunk * dims.q_dim * 4                         // att (q_dim != h on qwen3)
         + 2 * chunk * cfg.intermediate_size * 4          // gate, up
         + 2 * chunk * kvd * 4                            // kvs staging
         + chunk * dims.q_dim * 2                         // xh (o_proj input)
@@ -715,7 +728,7 @@ impl LowMemEngine {
             t0.elapsed().as_secs_f64(),
         );
 
-        let dims = Dims::new(&cfg, source.head_dim());
+        let dims = Dims::new(&cfg, source.head_dim(), source.qwen35().is_some());
         let device = Device::system_default().ok_or("no Metal-capable GPU found")?;
         source.make_gpu_views(&device);
         let queue = device.new_command_queue();
@@ -928,7 +941,7 @@ impl LowMemEngine {
                         true => Some(small(format!("{p}.self_attn.k_norm.weight"))?),
                         false => None,
                     },
-                    q: mk(format!("{p}.self_attn.q_proj"), h, dims.q_dim)?,
+                    q: mk(format!("{p}.self_attn.q_proj"), h, dims.q_proj_dim)?,
                     k: mk(format!("{p}.self_attn.k_proj"), h, kv)?,
                     v: mk(format!("{p}.self_attn.v_proj"), h, kv)?,
                     o: mk(format!("{p}.self_attn.o_proj"), dims.q_dim, h)?,
@@ -1113,6 +1126,31 @@ impl Engine for LowMemEngine {
 #[cfg(test)]
 mod tests {
 
+    /// The Q projection's width and attention's width are the SAME number on
+    /// every dense model and DIFFERENT on qwen35, whose attention blocks project
+    /// Q and the output gate jointly ([q(hd)|gate(hd)] per head). Anything that
+    /// receives the projection must be sized by q_proj_dim; anything that
+    /// consumes attention itself by q_dim. Conflating them is the same class as
+    /// the two buffer overruns this repo has already paid for, so it gets a
+    /// test rather than a comment.
+    #[test]
+    fn joint_q_gate_widens_the_projection_but_not_attention() {
+        // Qwen3.5-2B: hidden 2048, 8 heads, head_dim 256 (key_length), 2 kv heads.
+        let cfg = ModelConfig {
+            hidden_size: 2048,
+            num_attention_heads: 8,
+            num_key_value_heads: 2,
+            ..qwen05b_cfg()
+        };
+        let joint = Dims::new(&cfg, Some(256), true);
+        assert_eq!(joint.q_dim, 2048, "attention still consumes n_heads*head_dim");
+        assert_eq!(joint.q_proj_dim, 4096, "the tensor is 2x that: [q|gate] per head");
+        assert_eq!(joint.kv_dim, 512);
+        // A dense model must be unaffected: the two widths stay one number.
+        let dense = Dims::new(&cfg, Some(256), false);
+        assert_eq!(dense.q_proj_dim, dense.q_dim);
+    }
+
     // ---- qwen35 real-file tests: run by the gates with `--ignored` ----
 
     fn qwen35_gguf() -> Option<std::path::PathBuf> {
@@ -1242,13 +1280,13 @@ mod tests {
     fn budget_arithmetic_refuses_impossible_budgets() {
         let cfg = qwen05b_cfg();
         let win = WindowCfg::new(2048, 4).unwrap();
-        let err = match memory_plan(&cfg, Dims::new(&cfg, None), &win, 300, None) {
+        let err = match memory_plan(&cfg, Dims::new(&cfg, None, false), &win, 300, None) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("a 300 MB budget must be refused"),
         };
         assert!(err.contains("--memory-budget 300"), "{err}");
         assert!(err.contains("weight-pool floor"), "{err}");
-        let plan = memory_plan(&cfg, Dims::new(&cfg, None), &win, 4096, None).unwrap();
+        let plan = memory_plan(&cfg, Dims::new(&cfg, None, false), &win, 4096, None).unwrap();
         let total = plan.kv_bytes
             + plan.act_bytes
             + plan.state_bytes
@@ -1287,7 +1325,7 @@ mod tests {
     fn budget_arithmetic_qwen35_kv_on_attention_layers_only() {
         let mut cfg = qwen05b_cfg();
         cfg.num_hidden_layers = 64;
-        let dims = Dims::new(&cfg, None);
+        let dims = Dims::new(&cfg, None, false);
         let meta = q35_meta_27b(64);
         assert_eq!(meta.is_recurrent.iter().filter(|&&r| !r).count(), 16);
 

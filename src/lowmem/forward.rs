@@ -151,7 +151,9 @@ impl<'a> LowMemSession<'a> {
             // chunk * hidden everywhere EXCEPT qwen3 (explicit head_dim makes
             // q_dim = 2*hidden on the 0.6B) — sizing them by `h` was a real
             // overflow, found by Tiësto fixing the same bug in metal (b3bd4db6).
-            q: gpu::f32_buffer(d, chunk * e.dims.q_dim),
+            // q holds the PROJECTION's output, which on qwen35 is 2x the
+            // attention width (joint Q+gate) — size by q_proj_dim, not q_dim.
+            q: gpu::f32_buffer(d, chunk * e.dims.q_proj_dim),
             att: gpu::f32_buffer(d, chunk * e.dims.q_dim),
             xb: gpu::f32_buffer(d, chunk * h),
             gate: gpu::f32_buffer(d, chunk * cfg.intermediate_size),
@@ -455,7 +457,7 @@ impl<'a> LowMemSession<'a> {
 
         // Attention half.
         self.enc_rmsnorm(enc, &self.x, 0, &lw.input_ln, &self.xn, n);
-        self.enc_matmul_paged(enc, pool, &fa.q, &self.xn, &self.q, n, 0, self.e.dims.q_dim);
+        self.enc_matmul_paged(enc, pool, &fa.q, &self.xn, &self.q, n, 0, self.e.dims.q_proj_dim);
         self.enc_matmul_paged(enc, pool, &fa.k, &self.xn, &self.kvs, n, 0, kvd);
         self.enc_matmul_paged(enc, pool, &fa.v, &self.xn, &self.kvs, n, v_base, kvd);
         // qwen3 normalizes every head of q and k before RoPE. q is f32 in its

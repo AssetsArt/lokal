@@ -249,13 +249,16 @@ pub struct MetalEngine {
 
 /// lowmem's Dims constructor is module-private; same three lines, same reason
 /// as the WindowCfg mirror (fields are pub, the formula is fixed).
-fn dims_of(cfg: &ModelConfig, head_dim: Option<usize>) -> crate::lowmem::Dims {
+fn dims_of(cfg: &ModelConfig, head_dim: Option<usize>, joint_q_gate: bool) -> crate::lowmem::Dims {
     let hd = head_dim.unwrap_or_else(|| cfg.head_dim());
+    let q_dim = cfg.num_attention_heads * hd;
     crate::lowmem::Dims {
         hidden: cfg.hidden_size,
         head_dim: hd,
-        q_dim: cfg.num_attention_heads * hd,
+        q_dim,
         kv_dim: cfg.num_key_value_heads * hd,
+        // qwen35 projects Q and the output gate jointly; everyone else does not.
+        q_proj_dim: if joint_q_gate { 2 * q_dim } else { q_dim },
     }
 }
 
@@ -590,7 +593,7 @@ impl MetalEngine {
         let lib = device
             .new_library_with_source(&shader_source(model.kv_dim), &CompileOptions::new())
             .map_err(|e| format!("failed to compile kernels.metal: {e}"))?;
-        let dims = dims_of(&model.cfg, Some(model.head_dim));
+        let dims = dims_of(&model.cfg, Some(model.head_dim), false);
         let pipes = Self::build_pipelines(&device, &lib, &model.cfg)?;
         let win_state = Self::build_win_state(&device, &lib, &model.cfg, dims.kv_dim, win)?;
         Self::finish_dense(device, queue, model, pipes, win_state, dims)
@@ -1392,7 +1395,7 @@ impl MetalEngine {
         let queue = device.new_command_queue();
         let mut source = LowMemSource::open(path)?;
         source.make_gpu_views(&device);
-        let dims = dims_of(&cfg, source.head_dim());
+        let dims = dims_of(&cfg, source.head_dim(), source.qwen35().is_some());
 
         let shader = shader_source(dims.kv_dim);
         let lib = device
@@ -1626,7 +1629,7 @@ impl MetalEngine {
             // q and attention rows are q_dim wide — qwen3's q_dim (heads x 128)
             // is 2x hidden, so sizing these by hidden overflows into whatever
             // the allocator placed next (the first symptom is nondeterminism).
-            q: f32_buffer(d, chunk * attn_row_width(cfg.hidden_size, self.dims.q_dim)),
+            q: f32_buffer(d, chunk * attn_row_width(cfg.hidden_size, self.dims.q_proj_dim)),
             att: f32_buffer(d, chunk * attn_row_width(cfg.hidden_size, self.dims.q_dim)),
             xb: f32_buffer(d, chunk * cfg.hidden_size),
             gate: f32_buffer(d, chunk * cfg.intermediate_size),
@@ -1645,7 +1648,7 @@ impl MetalEngine {
             ),
             xh: f16_empty_buffer(
                 d,
-                chunk * cfg.hidden_size.max(cfg.intermediate_size).max(self.dims.q_dim),
+                chunk * cfg.hidden_size.max(cfg.intermediate_size).max(self.dims.q_proj_dim),
             ),
             // Window mode stages fresh K/V rows in f32 here, then scatters them
             // into the ring as f16 spans (lowmem's exact write path). One float
@@ -2407,7 +2410,7 @@ impl MetalEngine {
             // overran them on every config where q_dim > hidden_size (Qwen3-0.6B
             // and 4B among them); session_scratch had the same bug and this
             // path was missed when that one was fixed.
-            q: f32_buffer(d, n_slots * attn_row_width(h, self.dims.q_dim)),
+            q: f32_buffer(d, n_slots * attn_row_width(h, self.dims.q_proj_dim)),
             att: f32_buffer(d, n_slots * attn_row_width(h, self.dims.q_dim)),
             gate: f32_buffer(d, n_slots * cfg.intermediate_size),
             logits: f32_buffer(d, n_slots * cfg.vocab_size),
