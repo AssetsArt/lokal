@@ -74,7 +74,7 @@ fallback, ever. Until L2 (metal-deltanet) merges, qwen35 GGUF runs on
 | backend | safetensors dense | safetensors Qwen3/Qwen3.5 | GGUF dense | GGUF qwen35 (deltanet) |
 |---|---|---|---|---|
 | `cpu` | runs | refused by name | runs — `load_f32` expansion (fits-in-RAM guarded) | refused: no gated-deltanet path |
-| `metal` | runs | refused by name | runs — direct quant execution, no expansion | refused: no gated-deltanet path |
+| `metal` | runs | refused by name | runs — direct quant execution, no expansion; **output currently wrong on every GGUF model** (RopeParams mirror regression, fix in flight) | refused: no gated-deltanet path |
 | `lowmem` | runs | refused by name | runs — budgeted streaming, CPU-side dequant by design | **runs** (d7baf25) |
 | `hybrid` (alias `ane`) | runs | refused by name | refused: ANE prefill graphs are exported from safetensors (L4 opens this) | refused: no gated-deltanet path |
 
