@@ -990,6 +990,45 @@ kernel void rmsnorm(
     }
 }
 
+// qwen3 qk-norm (-b lowmem, D4): RMSNorm one f16 row of `dim` elements IN
+// PLACE — decode's freshly written K row is normalized per kv head (dim =
+// head_dim, one dispatched "row" per head) before RoPE. Same math and
+// reduction as rmsnorm above: f32 accumulation, f16 storage. Prefill needs no
+// f16 variant — it norms the f32 staging rows with the plain rmsnorm before
+// they convert into the cache.
+kernel void rmsnorm_h_inplace(
+    device half *x [[buffer(0)]],
+    device const half *weight [[buffer(1)]],
+    constant NormParams &p [[buffer(2)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    device half *xr = x + (ulong)row * p.dim;
+    threadgroup float partial[NORM_TG / 32];
+    float acc = 0.0f;
+    for (uint i = tid; i < p.dim; i += NORM_TG) {
+        float v = (float)xr[i];
+        acc += v * v;
+    }
+    float sg = simd_sum(acc);
+    if (tid % 32 == 0) {
+        partial[tid / 32] = sg;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint j = 0; j < NORM_TG / 32; j++) {
+            total += partial[j];
+        }
+        partial[0] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float scale = rsqrt(partial[0] / (float)p.dim + p.eps);
+    for (uint i = tid; i < p.dim; i += NORM_TG) {
+        xr[i] = (half)((float)xr[i] * scale * (float)weight[i]);
+    }
+}
+
 // rmsnorm variant for the prefill path: same math, but the normalized row is
 // written twice — f32 for the residual pipeline, half for the tensor-ops
 // matmul operands (saves a separate conversion dispatch per use).
