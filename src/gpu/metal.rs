@@ -546,6 +546,21 @@ pub(crate) fn attn_row_width(hidden: usize, q_dim: usize) -> usize {
     hidden.max(q_dim)
 }
 
+/// An f32 buffer holding `data`, for weights the qwen35 kernels read as f32.
+///
+/// The deltanet small tensors (ssm_conv1d, ssm_a, ssm_dt.bias, ssm_norm) are
+/// stored F32 in the checkpoint and consumed as `device const float *` by the
+/// kernels, which are gated BIT-FOR-BIT against an f32 CPU reference. Routing
+/// them through the f16 path that norms use would narrow them and forfeit that
+/// gate for no residency win — together they are a few hundred KB.
+pub(crate) fn f32_buffer_from(device: &Device, data: &[f32]) -> Buffer {
+    device.new_buffer_with_data(
+        data.as_ptr() as *const _,
+        std::mem::size_of_val(data) as u64,
+        MTLResourceOptions::StorageModeShared,
+    )
+}
+
 pub(crate) fn f32_buffer(device: &Device, len: usize) -> Buffer {
     device.new_buffer((len * 4) as u64, MTLResourceOptions::StorageModeShared)
 }

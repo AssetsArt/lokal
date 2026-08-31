@@ -233,17 +233,85 @@ pub(crate) enum Fam {
 pub(crate) struct LayerWeights {
     pub input_ln: Buffer,
     pub post_ln: Buffer,
+    /// What sits between the two norms. Dense models are `Full` on every layer;
+    /// qwen35 alternates, `Linear` on the gated-deltanet blocks and `Full` on
+    /// one in `full_attention_interval`. The FFN half below is shared — both
+    /// block kinds carry the same three projections, which is why they live
+    /// out here rather than being duplicated into both arms.
+    pub attn: AttnWeights,
+    pub gate: PagedTensor,
+    pub up: PagedTensor,
+    pub down: PagedTensor,
+}
+
+impl LayerWeights {
+    /// Every paged (pool-resident) tensor of this layer, whichever shape it is.
+    /// Sites that walk a layer's big weights — the residency plan, the page
+    /// enumerator, the max-rows scan — must not have to know which arm they
+    /// hold, and must not silently miss the deltanet projections.
+    pub fn paged(&self) -> Vec<&PagedTensor> {
+        let mut v: Vec<&PagedTensor> = match &self.attn {
+            AttnWeights::Full(f) => vec![&f.q, &f.k, &f.v, &f.o],
+            AttnWeights::Linear(l) => vec![&l.qkv, &l.z_gate, &l.out, &l.alpha, &l.beta],
+        };
+        v.extend([&self.gate, &self.up, &self.down]);
+        v
+    }
+}
+
+/// The two shapes a qwen35 trunk layer can take. An enum rather than a bag of
+/// Options because the arms share no tensor at all: a linear block has no
+/// q/k/v/o and an attention block has no conv or state, so Options would encode
+/// "absent" twelve times and let the wrong pair be read together.
+pub(crate) enum AttnWeights {
+    Full(Box<FullAttn>),
+    Linear(Box<LinearAttn>),
+}
+
+pub(crate) struct FullAttn {
     /// qwen3's per-head q/k RMSNorm weights (head_dim each), applied to every
     /// head of q and k before RoPE. None on architectures without qk-norm.
     pub q_norm: Option<Buffer>,
     pub k_norm: Option<Buffer>,
+    /// On qwen35 this projects Q and the output gate JOINTLY — out_dim is
+    /// 2·n_heads·head_dim, with [q(hd)|gate(hd)] interleaved per head.
     pub q: PagedTensor,
     pub k: PagedTensor,
     pub v: PagedTensor,
     pub o: PagedTensor,
-    pub gate: PagedTensor,
-    pub up: PagedTensor,
-    pub down: PagedTensor,
+}
+
+/// qwen35's gated-deltanet block. Tensor roles transcribed from llama.cpp
+/// (src/models/qwen35.cpp build_linear_attn) rather than inferred:
+///   qkv_mixed = attn_qkv·x      -> depthwise conv -> silu -> split q,k,v
+///   z         = attn_gate·x     -> silu gate on the normalised output
+///   beta      = SIGMOID(ssm_beta·x)        <- easy to miss; see the field note
+///   g         = ssm_a · softplus(ssm_alpha·x + ssm_dt)
+pub(crate) struct LinearAttn {
+    /// hidden -> conv_channels (2·n_group·d_state + d_inner).
+    pub qkv: PagedTensor,
+    /// hidden -> d_inner; the `z` that gates the normalised output.
+    pub z_gate: PagedTensor,
+    /// d_inner -> hidden.
+    pub out: PagedTensor,
+    /// hidden -> n_v_heads, the delta-rule gate's pre-activation.
+    pub alpha: PagedTensor,
+    /// hidden -> n_v_heads. THE SIGMOID IS THE CALLER'S JOB: qwen35.cpp:366
+    /// applies ggml_sigmoid to this projection's output, and lane B's
+    /// `delta_decode_step` takes beta already activated (it has a `delta_gate`
+    /// helper for g and deliberately none for beta). Feeding the raw
+    /// projection through would be silently plausible and wrong.
+    pub beta: PagedTensor,
+    /// [channels][d_conv], f32 — the depthwise conv filter. f32 and not f16
+    /// because the kernels are gated bit-for-bit against an f32 reference and
+    /// the file stores it as F32; narrowing here would forfeit that.
+    pub conv1d: Buffer,
+    /// [n_v_heads] f32, the per-head decay scale (ggml calls it A_NOSCAN).
+    pub a: Buffer,
+    /// [n_v_heads] f32.
+    pub dt_bias: Buffer,
+    /// [d_state] f32, the per-head RMSNorm weight of the output stage.
+    pub ssm_norm: Buffer,
 }
 
 /// What a weight's elements are, across both checkpoint formats. Safetensors
@@ -821,24 +889,55 @@ impl LowMemEngine {
 
         let (h, kv) = (cfg.hidden_size, dims.kv_dim);
         let qk_norm = source.qk_norm();
+        // qwen35 names its second norm `post_attention_norm`, which the generic
+        // GGUF mapper leaves under its `gguf.` fallback rather than folding into
+        // llama's `ffn_norm` -> `post_attention_layernorm`. Both kinds of trunk
+        // layer carry it, so it is resolved once here, not per arm.
+        let q35 = source.qwen35();
+        let post_ln_name = |p: &str| match q35.is_some() {
+            true => format!("{p}.gguf.post_attention_norm.weight"),
+            false => format!("{p}.post_attention_layernorm.weight"),
+        };
+        let mut f32_small = |name: String| -> crate::Result<Buffer> {
+            Ok(gpu::f32_buffer_from(&device, &source.read_f32(&name)?))
+        };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{i}");
+            let recurrent = q35.as_ref().is_some_and(|m| m.is_recurrent[i]);
+            let attn = if recurrent {
+                let m = q35.as_ref().expect("recurrent implies qwen35 meta");
+                AttnWeights::Linear(Box::new(LinearAttn {
+                    qkv: mk(format!("{p}.gguf.attn_qkv"), h, 2 * m.n_group * m.d_state + m.d_inner)?,
+                    z_gate: mk(format!("{p}.gguf.attn_gate"), h, m.d_inner)?,
+                    out: mk(format!("{p}.gguf.ssm_out"), m.d_inner, h)?,
+                    alpha: mk(format!("{p}.gguf.ssm_alpha"), h, m.dt_rank)?,
+                    beta: mk(format!("{p}.gguf.ssm_beta"), h, m.dt_rank)?,
+                    conv1d: f32_small(format!("{p}.gguf.ssm_conv1d.weight"))?,
+                    a: f32_small(format!("{p}.gguf.ssm_a"))?,
+                    dt_bias: f32_small(format!("{p}.gguf.ssm_dt.bias"))?,
+                    ssm_norm: f32_small(format!("{p}.gguf.ssm_norm.weight"))?,
+                }))
+            } else {
+                AttnWeights::Full(Box::new(FullAttn {
+                    q_norm: match qk_norm {
+                        true => Some(small(format!("{p}.self_attn.q_norm.weight"))?),
+                        false => None,
+                    },
+                    k_norm: match qk_norm {
+                        true => Some(small(format!("{p}.self_attn.k_norm.weight"))?),
+                        false => None,
+                    },
+                    q: mk(format!("{p}.self_attn.q_proj"), h, dims.q_dim)?,
+                    k: mk(format!("{p}.self_attn.k_proj"), h, kv)?,
+                    v: mk(format!("{p}.self_attn.v_proj"), h, kv)?,
+                    o: mk(format!("{p}.self_attn.o_proj"), dims.q_dim, h)?,
+                }))
+            };
             layers.push(LayerWeights {
                 input_ln: small(format!("{p}.input_layernorm.weight"))?,
-                post_ln: small(format!("{p}.post_attention_layernorm.weight"))?,
-                q_norm: match qk_norm {
-                    true => Some(small(format!("{p}.self_attn.q_norm.weight"))?),
-                    false => None,
-                },
-                k_norm: match qk_norm {
-                    true => Some(small(format!("{p}.self_attn.k_norm.weight"))?),
-                    false => None,
-                },
-                q: mk(format!("{p}.self_attn.q_proj"), h, dims.q_dim)?,
-                k: mk(format!("{p}.self_attn.k_proj"), h, kv)?,
-                v: mk(format!("{p}.self_attn.v_proj"), h, kv)?,
-                o: mk(format!("{p}.self_attn.o_proj"), dims.q_dim, h)?,
+                post_ln: small(post_ln_name(&p))?,
+                attn,
                 gate: mk(format!("{p}.mlp.gate_proj"), h, cfg.intermediate_size)?,
                 up: mk(format!("{p}.mlp.up_proj"), h, cfg.intermediate_size)?,
                 down: mk(format!("{p}.mlp.down_proj"), cfg.intermediate_size, h)?,
@@ -853,7 +952,7 @@ impl LowMemEngine {
 
         let max_rows = layers
             .iter()
-            .flat_map(|l| [&l.q, &l.k, &l.v, &l.o, &l.gate, &l.up, &l.down])
+            .flat_map(|l| l.paged())
             .chain([&lm_head])
             .map(|t| t.rows_per_page)
             .max()

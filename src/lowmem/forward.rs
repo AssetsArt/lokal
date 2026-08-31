@@ -11,7 +11,23 @@
 //!     keeping a vocab × hidden table resident.
 
 use super::pool::{Admit, Bind, PagedTensor, PendingConvert, PoolStats, WeightPool};
-use super::{dequant_row_ref, Fam, LayerWeights, LowMemEngine, SrcType};
+use super::{dequant_row_ref, AttnWeights, Fam, FullAttn, LayerWeights, LowMemEngine, SrcType};
+
+/// The attention half of a layer, for the paths that only handle full
+/// attention. qwen35's gated-deltanet blocks take a different route entirely
+/// (different tensors, different state), so they are dispatched before these
+/// paths are reached rather than being folded in behind an Option.
+fn full_attn(a: &AttnWeights) -> &FullAttn {
+    match a {
+        AttnWeights::Full(f) => f,
+        // Unreachable today: qwen35 construction is still refused in main.rs,
+        // so no linear block can reach here. The deltanet encoder replaces this
+        // arm in the next commit of this lane.
+        AttnWeights::Linear(_) => {
+            panic!("qwen35 gated-deltanet block reached the full-attention path — not wired yet")
+        }
+    }
+}
 use crate::engine::Session;
 use crate::gpu::metal as gpu;
 use half::{bf16, f16};
@@ -433,18 +449,19 @@ impl<'a> LowMemSession<'a> {
     ) {
         let e = self.e;
         let cfg = &e.cfg;
+        let fa = full_attn(&lw.attn);
         let (h, hd, kvd) = (cfg.hidden_size, self.e.dims.head_dim, self.e.dims.kv_dim);
         let v_base = (self.chunk * kvd * 4) as u64; // V's half of the kvs staging
 
         // Attention half.
         self.enc_rmsnorm(enc, &self.x, 0, &lw.input_ln, &self.xn, n);
-        self.enc_matmul_paged(enc, pool, &lw.q, &self.xn, &self.q, n, 0, self.e.dims.q_dim);
-        self.enc_matmul_paged(enc, pool, &lw.k, &self.xn, &self.kvs, n, 0, kvd);
-        self.enc_matmul_paged(enc, pool, &lw.v, &self.xn, &self.kvs, n, v_base, kvd);
+        self.enc_matmul_paged(enc, pool, &fa.q, &self.xn, &self.q, n, 0, self.e.dims.q_dim);
+        self.enc_matmul_paged(enc, pool, &fa.k, &self.xn, &self.kvs, n, 0, kvd);
+        self.enc_matmul_paged(enc, pool, &fa.v, &self.xn, &self.kvs, n, v_base, kvd);
         // qwen3 normalizes every head of q and k before RoPE. q is f32 in its
         // own buffer; k is still in the f32 staging half, which is why this
         // lands BEFORE the f32_to_f16 spans below rather than after.
-        if let (Some(qn), Some(kn)) = (&lw.q_norm, &lw.k_norm) {
+        if let (Some(qn), Some(kn)) = (&fa.q_norm, &fa.k_norm) {
             self.enc_rmsnorm_dim(enc, &self.q, 0, qn, n * cfg.num_attention_heads, hd);
             self.enc_rmsnorm_dim(enc, &self.kvs, 0, kn, n * cfg.num_key_value_heads, hd);
         }
@@ -517,7 +534,7 @@ impl<'a> LowMemSession<'a> {
                 MTLSize::new(256, 1, 1),
             );
         }
-        self.enc_matmul_paged(enc, pool, &lw.o, &self.att, &self.xb, n, 0, h);
+        self.enc_matmul_paged(enc, pool, &fa.o, &self.att, &self.xb, n, 0, h);
         self.enc_elem(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
 
         // SwiGLU MLP half.
@@ -542,14 +559,15 @@ impl<'a> LowMemSession<'a> {
     ) {
         let e = self.e;
         let cfg = &e.cfg;
+        let fa = full_attn(&lw.attn);
         let hd = e.dims.head_dim;
         let kv_byte_off = (e.win.slot_of(pos) * e.dims.kv_dim * 2) as u64;
 
         self.enc_rmsnorm(enc, &self.x, 0, &lw.input_ln, &self.xn, 1);
-        self.enc_matvec_bound(enc, Fam::Mv, &lw.q, &plan.q, &self.xn, &self.q, 0, 4);
-        self.enc_matvec_bound(enc, Fam::MvH, &lw.k, &plan.k, &self.xn, &self.k_cache[l], kv_byte_off, 2);
-        self.enc_matvec_bound(enc, Fam::MvH, &lw.v, &plan.v, &self.xn, &self.v_cache[l], kv_byte_off, 2);
-        if let (Some(qn), Some(kn)) = (&lw.q_norm, &lw.k_norm) {
+        self.enc_matvec_bound(enc, Fam::Mv, &fa.q, &plan.q, &self.xn, &self.q, 0, 4);
+        self.enc_matvec_bound(enc, Fam::MvH, &fa.k, &plan.k, &self.xn, &self.k_cache[l], kv_byte_off, 2);
+        self.enc_matvec_bound(enc, Fam::MvH, &fa.v, &plan.v, &self.xn, &self.v_cache[l], kv_byte_off, 2);
+        if let (Some(qn), Some(kn)) = (&fa.q_norm, &fa.k_norm) {
             self.enc_rmsnorm_dim(enc, &self.q, 0, qn, cfg.num_attention_heads, hd);
             self.enc_rmsnorm_h(enc, &self.k_cache[l], kv_byte_off, kn, cfg.num_key_value_heads, hd);
         }
@@ -599,7 +617,7 @@ impl<'a> LowMemSession<'a> {
                 MTLSize::new(hd as u64, 1, 1),
             );
         }
-        self.enc_matvec_bound(enc, Fam::MvA, &lw.o, &plan.o, &self.att, &self.x, 0, 4);
+        self.enc_matvec_bound(enc, Fam::MvA, &fa.o, &plan.o, &self.att, &self.x, 0, 4);
 
         self.enc_rmsnorm(enc, &self.x, 0, &lw.post_ln, &self.xn, 1);
         // SwiGLU: gate and up share [inter, h], so their pages split identically.
@@ -787,7 +805,7 @@ fn retire(
 
 fn layer_pages(lw: &LayerWeights) -> Vec<(&PagedTensor, usize)> {
     let mut v = Vec::new();
-    for t in [&lw.q, &lw.k, &lw.v, &lw.o, &lw.gate, &lw.up, &lw.down] {
+    for t in lw.paged() {
         for b in 0..t.n_pages {
             v.push((t, b));
         }
@@ -844,6 +862,7 @@ fn plan_decode(
     lw: &LayerWeights,
     inflight: &mut Vec<(metal::CommandBuffer, u64)>,
 ) -> crate::Result<(u64, LayerPlan)> {
+    let fa = full_attn(&lw.attn);
     let ep = pool.begin_cb();
     let mut bind_all = |t: &PagedTensor| -> crate::Result<Vec<Bind>> {
         let mut binds = Vec::with_capacity(t.n_pages);
@@ -870,10 +889,10 @@ fn plan_decode(
     Ok((
         ep,
         LayerPlan {
-            q: bind_all(&lw.q)?,
-            k: bind_all(&lw.k)?,
-            v: bind_all(&lw.v)?,
-            o: bind_all(&lw.o)?,
+            q: bind_all(&fa.q)?,
+            k: bind_all(&fa.k)?,
+            v: bind_all(&fa.v)?,
+            o: bind_all(&fa.o)?,
             gate: bind_all(&lw.gate)?,
             up: bind_all(&lw.up)?,
             down: bind_all(&lw.down)?,
