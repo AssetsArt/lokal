@@ -102,6 +102,12 @@ pub(super) struct LowMemSession<'a> {
     scores: Buffer,
     partials: Buffer,
     logits: Buffer, // one row: [vocab]
+    /// qwen35 only: per-linear-layer recurrent state (conv + delta), f32,
+    /// read-modify-written once per step by the kernel lane. ONE live state
+    /// per sequence — no rollback in v1: a session serves exactly one prompt
+    /// and serve builds a fresh session per request, so nothing ever rewinds.
+    #[allow(dead_code)] // read-modify-write lands with the qwen35 kernel lane
+    q35: Option<crate::gpu::metal::Qwen35States>,
     /// Pool counters as they stood when prefill finished, so the drop line can
     /// report decode's staging on its own. Decode is where residency is proved:
     /// prefill always stages the model once, decode must stage nothing.
@@ -142,6 +148,10 @@ impl<'a> LowMemSession<'a> {
             } else {
                 gpu::f32_buffer(d, chunk * cfg.num_attention_heads * cap)
             },
+            q35: e
+                .q35_layout
+                .as_ref()
+                .map(|l| crate::gpu::metal::Qwen35States::new(d, l)),
             partials: gpu::f32_buffer(
                 d,
                 cfg.num_attention_heads * (cap / gpu::ATTN_SPLIT) * (e.dims.head_dim + 2),

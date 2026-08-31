@@ -46,6 +46,9 @@ const OVERHEAD_MB: usize = 256;
 struct MemoryPlan {
     kv_bytes: usize,
     act_bytes: usize,
+    /// qwen35 only: recurrent conv+delta state, f32, per sequence. A FIXED
+    /// term like activations — constant in context length, never per-token.
+    state_bytes: usize,
     pool_bytes: usize,
 }
 
@@ -82,11 +85,24 @@ fn memory_plan(
     dims: Dims,
     win: &WindowCfg,
     budget_mb: usize,
+    q35: Option<&gguf::Qwen35Meta>,
 ) -> crate::Result<MemoryPlan> {
     let (h, hd, kvd) = (dims.hidden, dims.head_dim, dims.kv_dim);
     let chunk = gpu::PREFILL_CHUNK;
     // KV store: K and V, f16, cap slots per layer — closed-form in the window.
-    let kv_bytes = cfg.num_hidden_layers * win.cap * kvd * 2 * 2;
+    // On qwen35 KV exists ONLY on the full-attention trunk layers (16 of 64 on
+    // the 27B); the 48 linear layers carry the fixed recurrent state instead.
+    // The MTP block is outside the meta's map entirely, so its attention can
+    // never be counted here (the "17th attention layer" misconception).
+    let n_kv_layers = match q35 {
+        Some(m) => m.is_recurrent.iter().filter(|&&r| !r).count(),
+        None => cfg.num_hidden_layers,
+    };
+    let state_bytes = q35.map_or(0, |m| {
+        let n_linear = m.is_recurrent.iter().filter(|&&r| r).count();
+        n_linear * (m.conv_state_elems + m.delta_state_elems) * 4
+    });
+    let kv_bytes = n_kv_layers * win.cap * kvd * 2 * 2;
     // One session's activation scratch, mirroring LowMemSession::new.
     let scores = if hd == gpu::FLASH_HEAD_DIM {
         4
@@ -101,22 +117,26 @@ fn memory_plan(
         + scores
         + cfg.num_attention_heads * (win.cap / gpu::ATTN_SPLIT) * (hd + 2) * 4
         + cfg.vocab_size * 4;                            // logits
-    let fixed = kv_bytes + act_bytes + (OVERHEAD_MB << 20);
+    let fixed = kv_bytes + act_bytes + state_bytes + (OVERHEAD_MB << 20);
     let budget = budget_mb << 20;
     let floor = 4 * PAGE_BYTES;
     if budget < fixed + floor {
         return Err(format!(
-            "--memory-budget {budget_mb} MB cannot hold the working set: KV {} MB (window {} × {} layers) + activations {} MB + runtime overhead {} MB leaves less than the {} MB weight-pool floor — raise the budget or shrink --context-window",
+            "--memory-budget {budget_mb} MB cannot hold the working set: KV {} MB (window {} × {} layers){} + activations {} MB + runtime overhead {} MB leaves less than the {} MB weight-pool floor — raise the budget or shrink --context-window",
             kv_bytes >> 20,
             win.w,
-            cfg.num_hidden_layers,
+            n_kv_layers,
+            match state_bytes {
+                0 => String::new(),
+                b => format!(" + recurrent state {} MB (constant in ctx)", b >> 20),
+            },
             act_bytes >> 20,
             OVERHEAD_MB,
             floor >> 20,
         )
         .into());
     }
-    Ok(MemoryPlan { kv_bytes, act_bytes, pool_bytes: budget - fixed })
+    Ok(MemoryPlan { kv_bytes, act_bytes, state_bytes, pool_bytes: budget - fixed })
 }
 
 /// Sliding-window attention geometry. The KV store per layer is a SINK region
@@ -408,6 +428,17 @@ impl LowMemSource {
 
     /// Explicit head dim when the checkpoint states one (GGUF always does).
     /// None means "derive it", which is right for every safetensors model here.
+    /// qwen35 only: the hybrid-trunk metadata (recurrency map + state sizes).
+    /// None for every other architecture and for safetensors.
+    pub fn qwen35(&self) -> Option<gguf::Qwen35Meta> {
+        match self {
+            LowMemSource::Gguf(g) if g.arch.arch == "qwen35" => {
+                gguf::qwen35_meta(&g.file).ok()
+            }
+            _ => None,
+        }
+    }
+
     pub fn head_dim(&self) -> Option<usize> {
         match self {
             LowMemSource::Safetensors(_) => None,
@@ -562,6 +593,9 @@ pub struct LowMemEngine {
     gqa: (u64, [u64; 4]),
     /// Sliding-window geometry — the backend's core semantic.
     win: WindowCfg,
+    /// qwen35 only: what sessions allocate their recurrent state from.
+    /// None on every other architecture (existing paths untouched).
+    q35_layout: Option<crate::gpu::metal::Qwen35Layout>,
     /// LOKAL_LOWMEM_SYNC=1: wait out every command buffer before the next —
     /// the bisect mode for anything that smells like an eviction race.
     sync: bool,
@@ -806,7 +840,10 @@ impl LowMemEngine {
         // The budget split (D9). LOKAL_LOWMEM_POOL_MB stays as a debug override
         // that pins the pool directly, bypassing the arithmetic.
         let budget_mb = opts.memory_budget_mb.unwrap_or(BUDGET_MB_DEFAULT);
-        let plan = memory_plan(&cfg, dims, &win, budget_mb)?;
+        let q35_meta = source.qwen35();
+        let plan = memory_plan(&cfg, dims, &win, budget_mb, q35_meta.as_ref())?;
+        let q35_layout =
+            q35_meta.as_ref().map(crate::gpu::metal::Qwen35Layout::from_meta);
         let pool_bytes = match std::env::var("LOKAL_LOWMEM_POOL_MB") {
             Ok(v) => v.parse::<usize>().map(|mb| mb << 20).unwrap_or(plan.pool_bytes),
             Err(_) => plan.pool_bytes,
@@ -839,8 +876,13 @@ impl LowMemEngine {
             );
         }
         // The one-line budget arithmetic, printed at load (D9).
+        let n_kv_layers = q35_meta
+            .as_ref()
+            .map_or(cfg.num_hidden_layers, |m| {
+                m.is_recurrent.iter().filter(|&&r| !r).count()
+            });
         eprintln!(
-            "lowmem: {} — budget {} MB = weights {} MB (paged, ≤{} MB pages) + KV {} MB (window {} +{} sink × {} layers) + activations {} MB + overhead {} MB",
+            "lowmem: {} — budget {} MB = weights {} MB (paged, ≤{} MB pages) + KV {} MB (window {} +{} sink × {} layers){} + activations {} MB + overhead {} MB",
             device.name(),
             budget_mb,
             pool_bytes >> 20,
@@ -848,7 +890,12 @@ impl LowMemEngine {
             plan.kv_bytes >> 20,
             win.w,
             win.sink,
-            cfg.num_hidden_layers,
+            n_kv_layers,
+            match plan.state_bytes {
+                0 => String::new(),
+                // Per SEQUENCE, not per token — the whole point of the term.
+                b => format!(" + recurrent state {} MB (constant in ctx)", b >> 20),
+            },
             plan.act_bytes >> 20,
             OVERHEAD_MB,
         );
@@ -861,6 +908,7 @@ impl LowMemEngine {
             gqa: gpu::gqa_decode_dims(&cfg, dims.head_dim),
             sync: std::env::var("LOKAL_LOWMEM_SYNC").is_ok_and(|v| v == "1"),
             win,
+            q35_layout,
             clip_flag,
             clip_warned: std::sync::atomic::AtomicBool::new(false),
             cfg,
@@ -967,15 +1015,82 @@ mod tests {
     fn budget_arithmetic_refuses_impossible_budgets() {
         let cfg = qwen05b_cfg();
         let win = WindowCfg::new(2048, 4).unwrap();
-        let err = match memory_plan(&cfg, Dims::new(&cfg, None), &win, 300) {
+        let err = match memory_plan(&cfg, Dims::new(&cfg, None), &win, 300, None) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("a 300 MB budget must be refused"),
         };
         assert!(err.contains("--memory-budget 300"), "{err}");
         assert!(err.contains("weight-pool floor"), "{err}");
-        let plan = memory_plan(&cfg, Dims::new(&cfg, None), &win, 4096).unwrap();
-        let total = plan.kv_bytes + plan.act_bytes + (OVERHEAD_MB << 20) + plan.pool_bytes;
+        let plan = memory_plan(&cfg, Dims::new(&cfg, None), &win, 4096, None).unwrap();
+        let total = plan.kv_bytes
+            + plan.act_bytes
+            + plan.state_bytes
+            + (OVERHEAD_MB << 20)
+            + plan.pool_bytes;
         assert_eq!(total, 4096 << 20);
+        assert_eq!(plan.state_bytes, 0, "no recurrent term without qwen35 meta");
         assert!(plan.pool_bytes >= 4 * PAGE_BYTES);
+    }
+
+    /// A trunk-shaped meta for budget tests: interval-4 recurrency over
+    /// `trunk` layers with the REAL 27B per-layer state sizes.
+    fn q35_meta_27b(trunk: usize) -> gguf::Qwen35Meta {
+        let is_recurrent: Vec<bool> = (0..trunk).map(|i| (i + 1) % 4 != 0).collect();
+        gguf::Qwen35Meta {
+            trunk_layers: trunk,
+            nextn_layers: 1,
+            full_attention_interval: 4,
+            is_recurrent,
+            d_conv: 4,
+            d_state: 128,
+            n_group: 16,
+            dt_rank: 48,
+            d_inner: 6144,
+            rope_sections: [11, 11, 10, 0],
+            conv_state_elems: 3 * (6144 + 2 * 16 * 128), // 30,720
+            delta_state_elems: 128 * 6144,               // 786,432
+        }
+    }
+
+    /// The qwen35 budget shape: KV over the 16 ATTENTION layers only, plus a
+    /// fixed recurrent-state term that is constant in the window (i.e. in
+    /// context) — and no trace of the MTP block's attention (the map's length
+    /// is the trunk, so a 17th KV layer cannot even be expressed).
+    #[test]
+    fn budget_arithmetic_qwen35_kv_on_attention_layers_only() {
+        let mut cfg = qwen05b_cfg();
+        cfg.num_hidden_layers = 64;
+        let dims = Dims::new(&cfg, None);
+        let meta = q35_meta_27b(64);
+        assert_eq!(meta.is_recurrent.iter().filter(|&&r| !r).count(), 16);
+
+        let win = WindowCfg::new(2048, 4).unwrap();
+        let plan = memory_plan(&cfg, dims, &win, 4096, Some(&meta)).unwrap();
+        // KV: 16 layers, f16 K+V — identical to a 16-layer dense model, and
+        // 4x smaller than the 64-layer misread.
+        assert_eq!(plan.kv_bytes, 16 * win.cap * dims.kv_dim * 2 * 2);
+        // State: 48 linear layers × (conv + delta) × f32 — the 27B's ≈150 MB.
+        assert_eq!(plan.state_bytes, 48 * (30_720 + 786_432) * 4);
+        assert_eq!(plan.state_bytes >> 20, 149);
+        let total = plan.kv_bytes
+            + plan.act_bytes
+            + plan.state_bytes
+            + (OVERHEAD_MB << 20)
+            + plan.pool_bytes;
+        assert_eq!(total, 4096 << 20);
+
+        // Constant in ctx: a 4x window moves KV, never the state term.
+        let wide = WindowCfg::new(8192, 4).unwrap();
+        let p2 = memory_plan(&cfg, dims, &wide, 4096, Some(&meta)).unwrap();
+        assert_eq!(p2.state_bytes, plan.state_bytes);
+        assert!(p2.kv_bytes > plan.kv_bytes);
+
+        // The refusal text carries the new term and the honest layer count.
+        let err = match memory_plan(&cfg, dims, &win, 300, Some(&meta)) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a 300 MB budget must be refused"),
+        };
+        assert!(err.contains("recurrent state 149 MB"), "{err}");
+        assert!(err.contains("× 16 layers"), "{err}");
     }
 }

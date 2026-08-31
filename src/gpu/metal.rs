@@ -236,6 +236,10 @@ pub struct MetalEngine {
     /// Quantized-GGUF execution (weights stay quant, dequantized on read).
     /// None = the dense f16 paths, untouched.
     quant: Option<QuantState>,
+    /// qwen35 only: the recurrency map + state sizes sessions allocate from.
+    /// None on every other architecture. Set by the engine constructor that
+    /// lane C lands; sessions honor it today.
+    pub(crate) q35_layout: Option<Qwen35Layout>,
     /// True geometry, derived from the checkpoint (qwen3 violates the
     /// hidden/n_heads identity, so cfg.head_dim()/kv_dim() are never read on
     /// hot paths — these are).
@@ -333,6 +337,95 @@ struct MatmulPagedParams {
     out_dim: u32,
     n_rows: u32,
     y_stride: u32,
+}
+
+/// qwen35's recurrent session state: one conv + one delta buffer per LINEAR
+/// trunk layer, f32, read-modify-written once per forward step. Sized by the
+/// checkpoint's real dims (27B: conv 30,720 el + delta 786,432 el per layer,
+/// 48 layers ≈ 150 MB per sequence — CONSTANT in context length). Attention
+/// layers carry None; the MTP block is never in the map at all (layout length
+/// is the TRUNK — the "17th attention layer" misconception must not reach an
+/// allocator). One live state per sequence: no rollback in v1 — greedy CLI and
+/// per-request serve sessions never rewind (documented limitation; llama.cpp's
+/// snapshot ring is the reference if speculative decoding ever needs it).
+pub(crate) struct Qwen35States {
+    /// Index = trunk layer id. None = full-attention layer (KV lives there instead).
+    pub layers: Vec<Option<Qwen35LayerState>>,
+    pub conv_elems: usize,
+    pub delta_elems: usize,
+}
+
+pub(crate) struct Qwen35LayerState {
+    /// Rolling conv history, (d_conv−1)·C f32 — layout [channel][d_conv−1],
+    /// oldest first (matches lowmem::qwen35_ref::conv_step).
+    pub conv: Buffer,
+    /// Delta-rule state [S, S, H_v] f32 — i the contraction index
+    /// (s[i + j·S + h·S·S], matches lowmem::qwen35_ref::delta_decode_step).
+    pub delta: Buffer,
+}
+
+/// What a qwen35-aware engine hands its sessions so they can allocate states:
+/// the per-trunk-layer recurrency map plus the two per-layer element counts.
+/// The C/D seam — changes go through the lead, never pairwise.
+#[derive(Clone)]
+pub(crate) struct Qwen35Layout {
+    pub is_recurrent: Vec<bool>,
+    pub conv_elems: usize,
+    pub delta_elems: usize,
+}
+
+impl Qwen35Layout {
+    /// The one meta→layout translation, so no caller re-derives sizes (where
+    /// the 17-layer misconception would creep back in): the map is exactly the
+    /// TRUNK's is_recurrent — the MTP block is not in the meta's map at all.
+    pub fn from_meta(m: &crate::lowmem::gguf::Qwen35Meta) -> Self {
+        Self {
+            is_recurrent: m.is_recurrent.clone(),
+            conv_elems: m.conv_state_elems,
+            delta_elems: m.delta_state_elems,
+        }
+    }
+}
+
+impl Qwen35States {
+    /// Zero-initialized states — zeroing is load-bearing: an empty conv
+    /// history contributes silence and an empty delta state attends nothing.
+    pub fn new(device: &Device, layout: &Qwen35Layout) -> Self {
+        let layers = layout
+            .is_recurrent
+            .iter()
+            .map(|&r| {
+                r.then(|| Qwen35LayerState {
+                    conv: f32_zero_buffer(device, layout.conv_elems),
+                    delta: f32_zero_buffer(device, layout.delta_elems),
+                })
+            })
+            .collect();
+        Self { layers, conv_elems: layout.conv_elems, delta_elems: layout.delta_elems }
+    }
+
+    /// Back to the start-of-sequence state (a new prompt on a reused session).
+    pub fn reset(&self) {
+        for l in self.layers.iter().flatten() {
+            unsafe {
+                std::ptr::write_bytes(l.conv.contents() as *mut u8, 0, self.conv_elems * 4);
+                std::ptr::write_bytes(l.delta.contents() as *mut u8, 0, self.delta_elems * 4);
+            }
+        }
+    }
+
+    /// The honest budget figure (what the lowmem plan and banners report).
+    pub fn total_bytes(&self) -> usize {
+        self.layers.iter().flatten().count() * (self.conv_elems + self.delta_elems) * 4
+    }
+}
+
+/// Zero-filled f32 buffer (the f16 twin exists above; recurrent states are f32
+/// because the delta rule accumulates into them across the whole sequence).
+pub(crate) fn f32_zero_buffer(device: &Device, len: usize) -> Buffer {
+    let buf = device.new_buffer((len * 4) as u64, MTLResourceOptions::StorageModeShared);
+    unsafe { std::ptr::write_bytes(buf.contents() as *mut u8, 0, len * 4) };
+    buf
 }
 
 /// Destination spans for writing positions [pos0, pos0+n) into the windowed
@@ -636,6 +729,7 @@ impl MetalEngine {
             device,
             win: win_state,
             quant: None,
+            q35_layout: None,
             dims,
             pipes,
             blocks,
@@ -1394,6 +1488,7 @@ impl MetalEngine {
             queue,
             device,
             win: win_state,
+            q35_layout: None, // lane C's constructor sets this for qwen35 files
             dims,
             quant: Some(QuantState {
                 source,
@@ -1507,6 +1602,7 @@ impl MetalEngine {
             partials,
             xh,
             kvs,
+            q35: self.q35_layout.as_ref().map(|l| Qwen35States::new(&self.device, l)),
             k_cache,
             v_cache,
             kv_base,
@@ -1561,6 +1657,8 @@ pub(crate) struct MetalSession<'a> {
     partials: Buffer, // decode attention: [heads × windows × (head_dim + 2)]
     xh: Buffer,       // half staging for tensor-ops matmul inputs
     kvs: Buffer,      // window mode: fresh K/V f32 staging before the ring scatter
+    /// qwen35: the per-linear-layer recurrent states (None elsewhere).
+    q35: Option<Qwen35States>,
     k_cache: Vec<Buffer>,
     v_cache: Vec<Buffer>,
     kv_base: u64, // byte offset of this session's slot when the cache is pooled
@@ -2193,6 +2291,14 @@ impl MetalEngine {
 
     pub(crate) fn make_batcher(&self, n_slots: usize, max_seq: usize) -> Option<MetalBatcher<'_>> {
         let cfg = &self.cfg;
+        // qwen35 v1: continuous batching needs per-slot recurrent state with
+        // decode continuity, and decode_step never goes through a session (a
+        // fresh slot_session would hand every step a zeroed state). Serve
+        // falls back to per-request sessions, each owning its own state —
+        // the same v1 shape as quant files in the batcher.
+        if self.q35_layout.is_some() {
+            return None;
+        }
         // The batched kernels are the fused-decode family — same requirements.
         if self.dims.head_dim > DEC_TG || !self.dims.head_dim.is_multiple_of(4) || n_slots > SPEC_MAX {
             return None;
@@ -2474,5 +2580,84 @@ mod tests {
             layers,
             t.elapsed()
         );
+    }
+
+    /// qwen35 session-state lifecycle: allocate → zeroed, read-modify-write
+    /// sticks within a sequence, reset → zeroed again; attention layers hold
+    /// no state; the map's length is exactly the trunk (the MTP block cannot
+    /// even be expressed, so its attention can never allocate).
+    #[test]
+    fn qwen35_states_lifecycle() {
+        let device = Device::system_default().expect("metal device");
+        // Interval-4 trunk of 8: layers 3 and 7 are attention.
+        let layout = Qwen35Layout {
+            is_recurrent: (0..8).map(|i| (i + 1) % 4 != 0).collect(),
+            conv_elems: 6,
+            delta_elems: 10,
+        };
+        let st = Qwen35States::new(&device, &layout);
+        assert_eq!(st.layers.len(), 8, "map length is the trunk, nothing more");
+        for (i, l) in st.layers.iter().enumerate() {
+            assert_eq!(l.is_some(), (i + 1) % 4 != 0, "layer {i}");
+        }
+        assert_eq!(st.total_bytes(), 6 * (6 + 10) * 4);
+
+        let read = |b: &Buffer, n: usize| unsafe {
+            std::slice::from_raw_parts(b.contents() as *const f32, n).to_vec()
+        };
+        let l0 = st.layers[0].as_ref().unwrap();
+        assert_eq!(read(&l0.conv, 6), vec![0.0; 6], "fresh conv state is silence");
+        assert_eq!(read(&l0.delta, 10), vec![0.0; 10], "fresh delta state attends nothing");
+
+        // The kernel lane's contract: read, modify, write back — and the write
+        // must still be there on the next step of the SAME sequence.
+        unsafe {
+            let c = l0.conv.contents() as *mut f32;
+            for i in 0..6 {
+                *c.add(i) = read(&l0.conv, 6)[i] + (i as f32 + 1.0);
+            }
+            *(l0.delta.contents() as *mut f32).add(9) = -2.5;
+        }
+        assert_eq!(read(&l0.conv, 6), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(read(&l0.delta, 10)[9], -2.5);
+        // Other layers are untouched — no aliasing between layer buffers.
+        let l1 = st.layers[1].as_ref().unwrap();
+        assert_eq!(read(&l1.conv, 6), vec![0.0; 6]);
+
+        // New sequence on a reused session: reset returns to start-of-sequence.
+        st.reset();
+        assert_eq!(read(&l0.conv, 6), vec![0.0; 6]);
+        assert_eq!(read(&l0.delta, 10), vec![0.0; 10]);
+    }
+
+    /// The one canonical meta→layout translation carries the real sizes and
+    /// only the trunk's map.
+    #[test]
+    fn qwen35_layout_from_meta_is_trunk_shaped() {
+        let meta = crate::lowmem::gguf::Qwen35Meta {
+            trunk_layers: 64,
+            nextn_layers: 1,
+            full_attention_interval: 4,
+            is_recurrent: (0..64).map(|i| (i + 1) % 4 != 0).collect(),
+            d_conv: 4,
+            d_state: 128,
+            n_group: 16,
+            dt_rank: 48,
+            d_inner: 6144,
+            rope_sections: [11, 11, 10, 0],
+            conv_state_elems: 30_720,
+            delta_state_elems: 786_432,
+        };
+        let layout = Qwen35Layout::from_meta(&meta);
+        assert_eq!(layout.is_recurrent.len(), 64);
+        assert_eq!(layout.is_recurrent.iter().filter(|&&r| r).count(), 48);
+        assert_eq!(layout.conv_elems, 30_720);
+        assert_eq!(layout.delta_elems, 786_432);
+        // The 27B budget figure, from the layout alone (no allocation):
+        // 48 × (30,720 + 786,432) × 4 bytes ≈ 149 MB per sequence.
+        let bytes: usize = layout.is_recurrent.iter().filter(|&&r| r).count()
+            * (layout.conv_elems + layout.delta_elems)
+            * 4;
+        assert_eq!(bytes >> 20, 149);
     }
 }
