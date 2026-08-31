@@ -173,6 +173,7 @@ pub enum GgmlType {
     F32 = 0,
     F16 = 1,
     Q4_0 = 2,
+    Q5_0 = 6,
     Q8_0 = 8,
     Q4_K = 12,
     Q5_K = 13,
@@ -187,6 +188,7 @@ impl GgmlType {
             0 => Self::F32,
             1 => Self::F16,
             2 => Self::Q4_0,
+            6 => Self::Q5_0,
             8 => Self::Q8_0,
             12 => Self::Q4_K,
             13 => Self::Q5_K,
@@ -194,7 +196,6 @@ impl GgmlType {
             // Names for everything ggml defines, so the error can say what the
             // file actually holds (ggml.h enum ggml_type).
             3 => return Err("Q4_1"),
-            6 => return Err("Q5_0"),
             7 => return Err("Q5_1"),
             9 => return Err("Q8_1"),
             10 => return Err("Q2_K"),
@@ -220,7 +221,7 @@ impl GgmlType {
     pub fn blk_elems(self) -> usize {
         match self {
             Self::F32 | Self::F16 => 1,
-            Self::Q4_0 | Self::Q8_0 => 32,          // QK4_0 / QK8_0
+            Self::Q4_0 | Self::Q5_0 | Self::Q8_0 => 32, // QK4_0 / QK5_0 / QK8_0
             Self::Q4_K | Self::Q5_K | Self::Q6_K => 256, // QK_K
         }
     }
@@ -231,6 +232,7 @@ impl GgmlType {
             Self::F32 => 4,
             Self::F16 => 2,
             Self::Q4_0 => 2 + 16,            // f16 d + 32 nibbles
+            Self::Q5_0 => 2 + 4 + 16,        // f16 d + qh[4] high bits + 32 nibbles
             Self::Q8_0 => 2 + 32,            // f16 d + 32 i8
             Self::Q4_K => 2 + 2 + 12 + 128,  // d + dmin + scales[12] + qs[QK_K/2]
             Self::Q5_K => 2 + 2 + 12 + 32 + 128, // … + qh[QK_K/8]
@@ -298,6 +300,22 @@ pub fn dequant_row_ref(ty: GgmlType, src: &[u8], out: &mut [f32]) {
                     let q = blk[2 + j];
                     y[j] = ((q & 0x0F) as i32 - 8) as f32 * d;
                     y[j + 16] = ((q >> 4) as i32 - 8) as f32 * d;
+                }
+            }
+        }
+        GgmlType::Q5_0 => {
+            // dequantize_row_q5_0: the 5th bit of element j lives at qh bit j
+            // (first half) / j+16 (second half); values are unsigned-5-bit - 16.
+            for (b, y) in out.chunks_exact_mut(32).enumerate() {
+                let blk = &src[b * 22..b * 22 + 22];
+                let d = f16_bits_at(blk, 0);
+                let qh = u32::from_le_bytes(blk[2..6].try_into().unwrap());
+                for j in 0..16 {
+                    let xh0 = (((qh >> j) << 4) & 0x10) as u8;
+                    let xh1 = ((qh >> (j + 12)) & 0x10) as u8;
+                    let q = blk[6 + j];
+                    y[j] = (((q & 0x0F) | xh0) as i32 - 16) as f32 * d;
+                    y[j + 16] = (((q >> 4) | xh1) as i32 - 16) as f32 * d;
                 }
             }
         }
@@ -397,6 +415,7 @@ mod gguf_seam_tests {
     fn blk_bytes_match_ggml_struct_sizes() {
         // The static_asserts in ggml-common.h pin these exact sizes.
         assert_eq!(GgmlType::Q4_0.blk_bytes(), 18);
+        assert_eq!(GgmlType::Q5_0.blk_bytes(), 22);
         assert_eq!(GgmlType::Q8_0.blk_bytes(), 34);
         assert_eq!(GgmlType::Q4_K.blk_bytes(), 144);
         assert_eq!(GgmlType::Q5_K.blk_bytes(), 176);
@@ -419,6 +438,25 @@ mod gguf_seam_tests {
         assert_eq!(y[0], -10.0);
         assert_eq!(y[16], 4.0);
         assert!(y[1..16].iter().chain(&y[17..]).all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn q5_0_hand_vector() {
+        // d=0.5; qh = 0x00010001 (bit 0 and bit 16 set); qs[0]=0x21:
+        // y[0]  = ((1 | 16) - 16) * 0.5 = 0.5     (high bit from qh bit 0)
+        // y[16] = ((2 | 16) - 16) * 0.5 = 1.0     (high bit from qh bit 16)
+        // every other element: (0 | 0) - 16 -> -8.0
+        let mut blk = vec![0u8; 22];
+        blk[..2].copy_from_slice(&f16b(0.5));
+        blk[2] = 0x01;
+        blk[4] = 0x01;
+        blk[6] = 0x21;
+        let mut y = [0f32; 32];
+        dequant_row_ref(GgmlType::Q5_0, &blk, &mut y);
+        assert_eq!(y[0], 0.5);
+        assert_eq!(y[16], 1.0);
+        assert_eq!(y[1], -8.0);
+        assert_eq!(y[31], -8.0);
     }
 
     #[test]
