@@ -555,7 +555,7 @@ pub struct AneEngine {
 }
 
 impl AneEngine {
-    pub fn new(model: Model, model_dir: &Path) -> crate::Result<Self> {
+    pub fn new(model: Model, model_dir: &Path, attn_window: Option<(usize, usize)>) -> crate::Result<Self> {
         // Graphs live in the lokal-owned graph directory (hub::graph_location),
         // with the model directory as the legacy fallback — graphs exported
         // straight into a snapshot dir keep working forever, sitting next to
@@ -688,7 +688,14 @@ impl AneEngine {
                 rungs.join(", ")
             );
         }
-        Ok(Self { metal: MetalEngine::new(model)?, graphs, windowed, front })
+        if let Some((w, _)) = attn_window {
+            eprintln!(
+                "ANE window mode: the Core ML graphs compute full causal attention, which \
+                 below position {w} is EXACTLY the window+sink result — the ANE serves those \
+                 positions, windowed Metal takes everything past them"
+            );
+        }
+        Ok(Self { metal: MetalEngine::new_with_window(model, attn_window)?, graphs, windowed, front })
     }
 }
 
@@ -710,6 +717,9 @@ impl Engine for AneEngine {
         }))
     }
     fn batcher(&self, n_slots: usize, max_seq: usize) -> Option<Box<dyn Batcher + '_>> {
+        if self.metal.window_size().is_some() {
+            return None; // D4: window mode serves through per-request sessions
+        }
         let inner = self.metal.make_batcher(n_slots, max_seq)?;
         Some(Box::new(AneBatcher { engine: self, inner }))
     }
@@ -1050,6 +1060,18 @@ impl Session for AneSession<'_> {
     /// the last position's logits and the ANE graphs deliberately omit lm_head (one
     /// Metal step is cheaper than shipping a vocab-sized matmul through Core ML).
     fn prefill(&mut self, ids: &[u32]) -> crate::Result<Vec<f32>> {
+        // Window mode's HARD cutoff, before every other routing rule (D3): the
+        // Core ML graphs compute full causal attention, which for a query at
+        // position q < W is EXACTLY the window+sink result — and past W is not.
+        // So the ANE serves positions 0..W through the normal routing below
+        // (its Metal half runs on the windowed session, where q < W is still
+        // exact), and everything past W runs windowed Metal.
+        if let Some(w) = self.metal.window() {
+            if ids.len() > w {
+                let _ = self.prefill(&ids[..w])?; // head ≤ W — cannot re-enter
+                return self.metal.prefill_from(&ids[w..], w);
+            }
+        }
         let want = ids.len().saturating_sub(1);
         if want < ANE_MIN {
             // Say so — the user picked -b hybrid and would otherwise wonder why the

@@ -77,16 +77,22 @@ pub fn create(
     backend: &str,
     model: Model,
     model_dir: &std::path::Path,
+    win: Option<(usize, usize)>,
 ) -> crate::Result<Box<dyn Engine>> {
-    let _ = model_dir; // unused on platforms without a backend that needs it
+    let _ = (model_dir, win); // unused on platforms without a backend that needs them
     match backend {
-        "cpu" => Ok(Box::new(CpuEngine { model })),
+        "cpu" => {
+            if win.is_some() {
+                return Err("--context-window needs a GPU-windowed backend — use -b metal, -b hybrid, or -b lowmem".into());
+            }
+            Ok(Box::new(CpuEngine { model }))
+        }
         #[cfg(target_os = "macos")]
-        "metal" => Ok(Box::new(crate::gpu::metal::MetalEngine::new(model)?)),
+        "metal" => Ok(Box::new(crate::gpu::metal::MetalEngine::new_with_window(model, win)?)),
         #[cfg(target_os = "macos")]
         // "ane" is the old name for this backend, kept so existing scripts run.
         #[cfg(target_os = "macos")]
-        "hybrid" | "ane" => Ok(Box::new(crate::ane::AneEngine::new(model, model_dir)?)),
+        "hybrid" | "ane" => Ok(Box::new(crate::ane::AneEngine::new(model, model_dir, win)?)),
         other => Err(format!(
             "unknown backend \"{other}\" — available: cpu{}",
             if cfg!(target_os = "macos") { ", metal, hybrid, lowmem" } else { "" }
@@ -105,13 +111,6 @@ pub struct LowMemOpts {
     pub attention_sink: Option<usize>,
 }
 
-impl LowMemOpts {
-    pub fn any_set(&self) -> bool {
-        self.memory_budget_mb.is_some()
-            || self.context_window.is_some()
-            || self.attention_sink.is_some()
-    }
-}
 
 /// The lowmem backend is created from the model DIRECTORY, not a loaded Model —
 /// the whole point of that backend is never materializing the full model in RAM,

@@ -222,6 +222,53 @@ pub struct MetalEngine {
     blocks: Vec<GpuBlock>,
     norm: Buffer,
     lm_head: GpuLinear,
+    /// Opt-in sliding-window mode (--context-window): the geometry plus the
+    /// attention pipelines re-specialized with lowmem's LM_* function
+    /// constants. None = full causal, bit-for-bit the backend's only behavior
+    /// before this mode existed.
+    win: Option<WinState>,
+}
+
+/// The sliding-window add-on: geometry shared with lowmem, plus the three
+/// attention pipelines built from the same kernel source with the LM_* window
+/// constants set (everything else — GEMMs, rope, norms — is untouched).
+pub(crate) struct WinState {
+    pub cfg: crate::lowmem::WindowCfg,
+    flash: ComputePipelineState,
+    fallback: ComputePipelineState,
+    dec_partial: ComputePipelineState,
+}
+
+/// Destination spans for writing positions [pos0, pos0+n) into the windowed
+/// store: (first chunk row, first slot, length) — at most the sink part plus
+/// the ring part split once at the wrap (lowmem's write_spans, same shape).
+fn win_write_spans(win: &crate::lowmem::WindowCfg, pos0: usize, n: usize) -> Vec<(usize, usize, usize)> {
+    let end = pos0 + n;
+    let mut spans = Vec::with_capacity(3);
+    if pos0 < win.sink {
+        spans.push((0, pos0, win.sink.min(end) - pos0));
+    }
+    let mut p = pos0.max(win.sink);
+    while p < end {
+        let rel = (p - win.sink) % win.ring;
+        let len = (win.ring - rel).min(end - p);
+        spans.push((p - pos0, win.sink_pad + rel, len));
+        p += len;
+    }
+    spans
+}
+
+/// lowmem's WindowCfg constructor is private to its module; this mirrors its
+/// exact formula (sink_pad/ring 128-aligned, ring carries a full prefill chunk
+/// of slack) — challenge 7c1a09cf tracks unifying the two at integration, and
+/// a unit test pins this mirror to lowmem's own values.
+pub(crate) fn window_cfg(w: usize, sink: usize) -> crate::Result<crate::lowmem::WindowCfg> {
+    if w == 0 || sink > w {
+        return Err(format!("invalid window config: window {w}, sink {sink}").into());
+    }
+    let sink_pad = sink.next_multiple_of(128);
+    let ring = (w + PREFILL_CHUNK).next_multiple_of(128);
+    Ok(crate::lowmem::WindowCfg { w, sink, sink_pad, ring, cap: sink_pad + ring })
 }
 
 // Apple documents MTLDevice / MTLCommandQueue / MTLBuffer / MTLComputePipelineState as
@@ -270,8 +317,11 @@ pub(crate) fn f16_empty_buffer(device: &Device, len: usize) -> Buffer {
 }
 
 impl MetalEngine {
-    /// Takes a loaded CPU-side Model and moves it onto the GPU (the Model is dropped after).
-    pub fn new(model: Model) -> crate::Result<Self> {
+    /// Takes a loaded CPU-side Model and moves it onto the GPU (the Model is
+    /// dropped after). `win`: Some((window, sink)) opts into sliding-window attention — the
+    /// window pipelines must be specialized while the shader library is alive,
+    /// which is why the choice happens at engine build, not per session.
+    pub fn new_with_window(model: Model, win: Option<(usize, usize)>) -> crate::Result<Self> {
         let device = Device::system_default().ok_or("no Metal-capable GPU found")?;
         let queue = device.new_command_queue();
 
@@ -354,6 +404,58 @@ impl MetalEngine {
             attention_decode_reduce_batch: pipe("attention_decode_reduce_batch")?,
         };
 
+        // Window mode: re-specialize the three attention kernels with the LM_*
+        // constants (indices 20-23, exactly as lowmem builds them; GQA_CHUNK
+        // rides at 0 for the decode kernel).
+        let win_state = match win {
+            None => None,
+            Some((w, sink)) => {
+                let wc = window_cfg(w, sink)?;
+                let win_pipe = |name: &str, gqa: bool| -> crate::Result<ComputePipelineState> {
+                    let consts = FunctionConstantValues::new();
+                    if gqa {
+                        consts.set_constant_value_at_index(
+                            &gqa_chunk as *const u32 as *const _,
+                            MTLDataType::UInt,
+                            0,
+                        );
+                    }
+                    for (v, idx) in [
+                        (wc.sink as u32, 20u64),
+                        (wc.sink_pad as u32, 21),
+                        (wc.ring as u32, 22),
+                        (wc.w as u32, 23),
+                    ] {
+                        consts.set_constant_value_at_index(
+                            &v as *const u32 as *const _,
+                            MTLDataType::UInt,
+                            idx,
+                        );
+                    }
+                    let f = lib
+                        .get_function(name, Some(consts))
+                        .map_err(|e| format!("kernel {name}: {e}"))?;
+                    device
+                        .new_compute_pipeline_state_with_function(&f)
+                        .map_err(|e| format!("kernel {name}: {e}").into())
+                };
+                let kv_mb = model.cfg.num_hidden_layers * wc.cap * model.cfg.kv_dim() * 2 * 2;
+                eprintln!(
+                    "Metal window mode: window {} (+{} sink) — KV is a ring of {} slots/layer, {:.0} MB total, flat in context length",
+                    wc.w,
+                    wc.sink,
+                    wc.cap,
+                    kv_mb as f64 / 1e6
+                );
+                Some(WinState {
+                    cfg: wc,
+                    flash: win_pipe("attention_prefill_flash", false)?,
+                    fallback: win_pipe("attention", false)?,
+                    dec_partial: win_pipe("attention_decode_partial", true)?,
+                })
+            }
+        };
+
         fn lin(device: &Device, l: &crate::model::Linear) -> GpuLinear {
             let has_bias = l.bias.is_some();
             let zero_bias;
@@ -397,6 +499,7 @@ impl MetalEngine {
             cfg: model.cfg,
             queue,
             device,
+            win: win_state,
             pipes,
         blocks,
         })
@@ -644,7 +747,10 @@ impl MetalEngine {
         };
         if self.cfg.head_dim() == FLASH_HEAD_DIM {
             // Flash path: no scores scratch, one threadgroup per (head, 16-row tile).
-            enc.set_compute_pipeline_state(&self.pipes.attention_prefill_flash);
+            enc.set_compute_pipeline_state(match &self.win {
+                Some(w) => &w.flash,
+                None => &self.pipes.attention_prefill_flash,
+            });
             enc.set_buffer(0, Some(q), 0);
             enc.set_buffer(1, Some(k_cache), cache_off);
             enc.set_buffer(2, Some(v_cache), cache_off);
@@ -661,7 +767,10 @@ impl MetalEngine {
             );
             return;
         }
-        enc.set_compute_pipeline_state(&self.pipes.attention);
+        enc.set_compute_pipeline_state(match &self.win {
+            Some(w) => &w.fallback,
+            None => &self.pipes.attention,
+        });
         enc.set_buffer(0, Some(q), 0);
         enc.set_buffer(1, Some(k_cache), cache_off);
         enc.set_buffer(2, Some(v_cache), cache_off);
@@ -673,6 +782,23 @@ impl MetalEngine {
             MTLSize::new(self.cfg.num_attention_heads as u64, n_rows as u64, 1),
             MTLSize::new(256, 1, 1),
         );
+    }
+
+    fn enc_f32_to_f16(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        src: &Buffer,
+        src_off: u64,
+        dst: &Buffer,
+        dst_off: u64,
+        dim: usize,
+    ) {
+        let d = dim as u32;
+        enc.set_compute_pipeline_state(&self.pipes.f32_to_f16);
+        enc.set_buffer(0, Some(src), src_off);
+        enc.set_buffer(1, Some(dst), dst_off);
+        enc.set_bytes(2, 4, &d as *const u32 as *const _);
+        dispatch_grid(enc, dim);
     }
 
     /// Decode-only: x[row] += W·in + bias — o_proj/down_proj with the residual fused.
@@ -778,7 +904,13 @@ impl MetalEngine {
         out: &Buffer,
         pos: usize,
     ) {
-        let n_splits = (pos + 1).div_ceil(ATTN_SPLIT);
+        // Window mode: every split of the bounded store is dispatched (the
+        // constant split count is what makes decode cost flat); the LM_*
+        // kernel masks validity per slot. Full causal keeps the growing count.
+        let n_splits = match &self.win {
+            Some(w) => w.cfg.cap / ATTN_SPLIT,
+            None => (pos + 1).div_ceil(ATTN_SPLIT),
+        };
         let p = AttnDecParams {
             head_dim: self.cfg.head_dim() as u32,
             n_heads: self.cfg.num_attention_heads as u32,
@@ -788,7 +920,10 @@ impl MetalEngine {
         };
         let heads = self.cfg.num_attention_heads as u64;
         let (grid_x, tg_mem) = self.gqa_decode_dims();
-        enc.set_compute_pipeline_state(&self.pipes.attention_decode_partial);
+        enc.set_compute_pipeline_state(match &self.win {
+            Some(w) => &w.dec_partial,
+            None => &self.pipes.attention_decode_partial,
+        });
         enc.set_buffer(0, Some(q), 0);
         enc.set_buffer(1, Some(k_cache), cache_off);
         enc.set_buffer(2, Some(v_cache), cache_off);
@@ -880,6 +1015,11 @@ impl Engine for MetalEngine {
         Ok(Box::new(self.raw_session(max_seq)))
     }
     fn batcher(&self, n_slots: usize, max_seq: usize) -> Option<Box<dyn crate::engine::Batcher + '_>> {
+        if self.win.is_some() {
+            // D4: the batcher pool keeps the full-causal KV layout; window mode
+            // serves through per-request sessions (the server's existing fallback).
+            return None;
+        }
         self.make_batcher(n_slots, max_seq)
             .map(|b| Box::new(b) as Box<dyn crate::engine::Batcher>)
     }
@@ -890,11 +1030,18 @@ impl MetalEngine {
     pub(crate) fn raw_session(&self, max_seq: usize) -> MetalSession<'_> {
         let cfg = &self.cfg;
         let d = &self.device;
+        // Window mode: KV is a ring of cap slots per layer — O(window), not
+        // O(context) — exactly lowmem's store layout so the LM_* kernels read
+        // it unchanged.
+        let kv_slots = match &self.win {
+            Some(w) => w.cfg.cap,
+            None => max_seq + FLASH_C,
+        };
         let caches = (0..cfg.num_hidden_layers)
-            .map(|_| f16_empty_buffer(d, (max_seq + FLASH_C) * cfg.kv_dim()))
+            .map(|_| f16_empty_buffer(d, kv_slots * cfg.kv_dim()))
             .collect::<Vec<_>>();
         let v_caches = (0..cfg.num_hidden_layers)
-            .map(|_| f16_empty_buffer(d, (max_seq + FLASH_C) * cfg.kv_dim()))
+            .map(|_| f16_empty_buffer(d, kv_slots * cfg.kv_dim()))
             .collect::<Vec<_>>();
         let scratch = self.session_scratch(max_seq);
         self.session_with_cache(max_seq, caches, v_caches, 0, scratch)
@@ -908,6 +1055,12 @@ impl MetalEngine {
         let cfg = &self.cfg;
         let d = &self.device;
         let chunk = PREFILL_CHUNK.min(max_seq); // scratch sized per chunk (decode uses row 0 only)
+        // Attention scratch is strided by the KV extent: max_seq full-causal,
+        // the ring cap under a window.
+        let kv_extent = match &self.win {
+            Some(w) => w.cfg.cap,
+            None => max_seq,
+        };
         SessionScratch {
             ids: d.new_buffer((chunk * 4) as u64, MTLResourceOptions::StorageModeShared),
             x: f32_buffer(d, chunk * cfg.hidden_size),
@@ -923,13 +1076,21 @@ impl MetalEngine {
             scores: if cfg.head_dim() == FLASH_HEAD_DIM {
                 f32_buffer(d, 1)
             } else {
-                f32_buffer(d, chunk * cfg.num_attention_heads * max_seq)
+                f32_buffer(d, chunk * cfg.num_attention_heads * kv_extent)
             },
             partials: f32_buffer(
                 d,
-                cfg.num_attention_heads * max_seq.div_ceil(ATTN_SPLIT) * (cfg.head_dim() + 2),
+                cfg.num_attention_heads * kv_extent.div_ceil(ATTN_SPLIT) * (cfg.head_dim() + 2),
             ),
             xh: f16_empty_buffer(d, chunk * cfg.hidden_size.max(cfg.intermediate_size)),
+            // Window mode stages fresh K/V rows in f32 here, then scatters them
+            // into the ring as f16 spans (lowmem's exact write path). One float
+            // of stub keeps the binding cheap when the mode is off.
+            kvs: if self.win.is_some() {
+                f32_buffer(d, 2 * chunk * cfg.kv_dim())
+            } else {
+                f32_buffer(d, 1)
+            },
         }
     }
 
@@ -943,7 +1104,8 @@ impl MetalEngine {
         kv_base: u64,
         scratch: SessionScratch,
     ) -> MetalSession<'_> {
-        let SessionScratch { ids, x, xn, q, att, xb, gate, up, logits, scores, partials, xh } = scratch;
+        let SessionScratch { ids, x, xn, q, att, xb, gate, up, logits, scores, partials, xh, kvs } =
+            scratch;
         MetalSession {
             ids,
             x,
@@ -957,6 +1119,7 @@ impl MetalEngine {
             scores,
             partials,
             xh,
+            kvs,
             k_cache,
             v_cache,
             kv_base,
@@ -984,6 +1147,8 @@ pub(crate) struct SessionScratch {
     partials: Buffer,
     /// Half staging for the tensor-ops matmul inputs (widest activation row).
     xh: Buffer,
+    /// Window mode's fresh-K/V f32 staging (1-float stub otherwise).
+    kvs: Buffer,
 }
 
 /// Where a chunk's layer-`layer0` input comes from (see `MetalSession::run_from`).
@@ -1008,6 +1173,7 @@ pub(crate) struct MetalSession<'a> {
     scores: Buffer,
     partials: Buffer, // decode attention: [heads × windows × (head_dim + 2)]
     xh: Buffer,       // half staging for tensor-ops matmul inputs
+    kvs: Buffer,      // window mode: fresh K/V f32 staging before the ring scatter
     k_cache: Vec<Buffer>,
     v_cache: Vec<Buffer>,
     kv_base: u64, // byte offset of this session's slot when the cache is pooled
@@ -1039,7 +1205,14 @@ impl MetalSession<'_> {
         let e = self.engine;
         let cfg = &e.cfg;
         let h = cfg.hidden_size;
-        let kv_byte_off = self.kv_base + (pos0 * cfg.kv_dim() * 2) as u64; // this chunk's first (f16) cache row
+        // This chunk's first (f16) cache row. Under a window the row is the
+        // RING SLOT of pos0 — for decode (n == 1) that is the whole story;
+        // prefill writes go through the staging + span-scatter path instead.
+        let kv_slot0 = match &e.win {
+            Some(w) => w.cfg.slot_of(pos0),
+            None => pos0,
+        };
+        let kv_byte_off = self.kv_base + (kv_slot0 * cfg.kv_dim() * 2) as u64;
 
         // Unified memory: write the input straight into the buffer pre-commit.
         match src {
@@ -1077,7 +1250,7 @@ impl MetalSession<'_> {
                 // Same math as the prefill path below, with qkv / swiglu / residual
                 // adds folded into single launches and flash-decoding attention.
                 e.enc_rmsnorm(enc, &self.x, &blk.input_layernorm, &self.xn, 1);
-                let kv_off_elems = (self.kv_base / 2) as usize + pos0 * cfg.kv_dim();
+                let kv_off_elems = (self.kv_base / 2) as usize + kv_slot0 * cfg.kv_dim();
                 e.enc_qkv(enc, blk, &self.xn, &self.q, &self.k_cache[l], &self.v_cache[l], kv_off_elems);
                 e.enc_rope_qk(enc, &self.q, &self.k_cache[l], kv_byte_off, pos0);
                 e.enc_attention_decode(enc, &self.q, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.partials, &self.att, pos0);
@@ -1094,10 +1267,55 @@ impl MetalSession<'_> {
             e.enc_rmsnorm_hf(enc, &self.x, &blk.input_layernorm, &self.xn, &self.xh, n);
             bar!(&self.xn, &self.xh);
             e.enc_linear(enc, &blk.q_proj, &self.xn, 0, &self.q, 0, n, Some(&self.xh), false, conc);
-            e.enc_linear_kv(enc, &blk.k_proj, &self.xn, &self.k_cache[l], kv_byte_off, n, Some(&self.xh));
-            e.enc_linear_kv(enc, &blk.v_proj, &self.xn, &self.v_cache[l], kv_byte_off, n, Some(&self.xh));
-            bar!(&self.q, &self.k_cache[l], &self.v_cache[l]);
-            {
+            if let Some(w) = &e.win {
+                // Window mode (lowmem's exact write path): project fresh K/V
+                // into the f32 staging, rope q standalone, then per destination
+                // span convert the rows into the ring as f16 and rotate K there
+                // by its TRUE positions — storage is slots, RoPE is absolute.
+                let kvd = cfg.kv_dim();
+                let hd = cfg.head_dim();
+                let v_base = self.kvs.length() / 2; // bytes: V's half of the staging
+                e.enc_linear(enc, &blk.k_proj, &self.xn, 0, &self.kvs, 0, n, Some(&self.xh), false, conc);
+                e.enc_linear(enc, &blk.v_proj, &self.xn, 0, &self.kvs, v_base, n, Some(&self.xh), false, conc);
+                bar!(&self.q, &self.kvs);
+                let rp = RopeParams {
+                    head_dim: hd as u32,
+                    n_heads: cfg.num_attention_heads as u32,
+                    pos0: pos0 as u32,
+                    theta: cfg.rope_theta,
+                    n_rows: n as u32,
+                };
+                enc.set_compute_pipeline_state(&e.pipes.rope);
+                enc.set_buffer(0, Some(&self.q), 0);
+                enc.set_bytes(1, size_of::<RopeParams>() as u64, &rp as *const _ as *const _);
+                dispatch_grid(enc, n * cfg.num_attention_heads * hd / 2);
+                for &(row, slot, len) in &win_write_spans(&w.cfg, pos0, n) {
+                    let src_off = (row * kvd * 4) as u64;
+                    let dst_off = (slot * kvd * 2) as u64;
+                    e.enc_f32_to_f16(enc, &self.kvs, src_off, &self.k_cache[l], dst_off, len * kvd);
+                    e.enc_f32_to_f16(enc, &self.kvs, v_base + src_off, &self.v_cache[l], dst_off, len * kvd);
+                    // Concurrent encoder (unlike lowmem's serial one): the rope
+                    // reads the rows the convert just wrote — order them.
+                    bar!(&self.k_cache[l]);
+                    let rp = RopeParams {
+                        head_dim: hd as u32,
+                        n_heads: cfg.num_key_value_heads as u32,
+                        pos0: (pos0 + row) as u32,
+                        theta: cfg.rope_theta,
+                        n_rows: len as u32,
+                    };
+                    enc.set_compute_pipeline_state(&e.pipes.rope_h);
+                    enc.set_buffer(0, Some(&self.k_cache[l]), dst_off);
+                    enc.set_bytes(1, size_of::<RopeParams>() as u64, &rp as *const _ as *const _);
+                    dispatch_grid(enc, len * cfg.num_key_value_heads * hd / 2);
+                }
+                // kvs rides in the barrier too: the NEXT layer's projections
+                // overwrite the staging the converts above still read.
+                bar!(&self.q, &self.k_cache[l], &self.v_cache[l], &self.kvs);
+            } else {
+                e.enc_linear_kv(enc, &blk.k_proj, &self.xn, &self.k_cache[l], kv_byte_off, n, Some(&self.xh));
+                e.enc_linear_kv(enc, &blk.v_proj, &self.xn, &self.v_cache[l], kv_byte_off, n, Some(&self.xh));
+                bar!(&self.q, &self.k_cache[l], &self.v_cache[l]);
                 // One fused launch rotates q (f32) and the fresh k cache rows (f16);
                 // per-element math identical to the separate rope/rope_h dispatches.
                 let hd = cfg.head_dim();
@@ -1117,7 +1335,11 @@ impl MetalSession<'_> {
                 bar!(&self.q, &self.k_cache[l]);
             }
             {
-                e.enc_attention(enc, &self.q, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.scores, &self.att, pos0, n, self.max_seq, &self.xh);
+                let kv_extent = match &e.win {
+                    Some(w) => w.cfg.cap, // the fallback kernel's scores stride
+                    None => self.max_seq,
+                };
+                e.enc_attention(enc, &self.q, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.scores, &self.att, pos0, n, kv_extent, &self.xh);
                 bar!(&self.att, &self.xh);
             }
             e.enc_linear(enc, &blk.o_proj, &self.att, 0, &self.xb, 0, n, Some(&self.xh), e.cfg.head_dim() != FLASH_HEAD_DIM, conc);
@@ -1174,6 +1396,11 @@ impl MetalSession<'_> {
         &self.engine.cfg
     }
 
+    /// The engine's window size, if the session runs in window mode.
+    pub(crate) fn window(&self) -> Option<usize> {
+        self.engine.win.as_ref().map(|w| w.cfg.w)
+    }
+
     /// Write K,V computed elsewhere (e.g. on the ANE) into the cache at pos0 onward,
     /// converting to the cache's f16 on the way. With unified memory this is the
     /// whole "device transfer".
@@ -1181,14 +1408,23 @@ impl MetalSession<'_> {
         let kvd = self.engine.cfg.kv_dim();
         let base = (self.kv_base / 2) as usize;
         unsafe {
-            let kp = (self.k_cache[layer].contents() as *mut u16).add(base + pos0 * kvd);
-            for (i, &x) in k.iter().enumerate() {
-                *kp.add(i) = f16::from_f32(x).to_bits();
+            let kp = self.k_cache[layer].contents() as *mut u16;
+            let vp = self.v_cache[layer].contents() as *mut u16;
+            for r in 0..k.len() / kvd {
+                let slot = self.kv_slot(pos0 + r);
+                for i in 0..kvd {
+                    *kp.add(base + slot * kvd + i) = f16::from_f32(k[r * kvd + i]).to_bits();
+                    *vp.add(base + slot * kvd + i) = f16::from_f32(v[r * kvd + i]).to_bits();
+                }
             }
-            let vp = (self.v_cache[layer].contents() as *mut u16).add(base + pos0 * kvd);
-            for (i, &x) in v.iter().enumerate() {
-                *vp.add(i) = f16::from_f32(x).to_bits();
-            }
+        }
+    }
+
+    /// Position -> cache row: identity full-causal, the ring slot under a window.
+    fn kv_slot(&self, p: usize) -> usize {
+        match &self.engine.win {
+            Some(w) => w.cfg.slot_of(p),
+            None => p,
         }
     }
 
@@ -1200,10 +1436,23 @@ impl MetalSession<'_> {
         let kvd = self.engine.cfg.kv_dim();
         let base = (self.kv_base / 2) as usize;
         unsafe {
-            let kp = (self.k_cache[layer].contents() as *mut u16).add(base + pos0 * kvd);
-            std::ptr::copy_nonoverlapping(k.as_ptr(), kp, k.len());
-            let vp = (self.v_cache[layer].contents() as *mut u16).add(base + pos0 * kvd);
-            std::ptr::copy_nonoverlapping(v.as_ptr(), vp, v.len());
+            let kp = self.k_cache[layer].contents() as *mut u16;
+            let vp = self.v_cache[layer].contents() as *mut u16;
+            for r in 0..k.len() / kvd {
+                // Per-row: the ring can wrap mid-chunk under a window (full
+                // causal degenerates to the old two-memcpy copy, row by row).
+                let slot = self.kv_slot(pos0 + r);
+                std::ptr::copy_nonoverlapping(
+                    k.as_ptr().add(r * kvd),
+                    kp.add(base + slot * kvd),
+                    kvd,
+                );
+                std::ptr::copy_nonoverlapping(
+                    v.as_ptr().add(r * kvd),
+                    vp.add(base + slot * kvd),
+                    kvd,
+                );
+            }
         }
     }
 
@@ -1275,6 +1524,11 @@ pub(crate) struct MetalBatcher<'a> {
 unsafe impl Send for MetalBatcher<'_> {}
 
 impl MetalEngine {
+    /// The engine's configured window size (None = full causal).
+    pub(crate) fn window_size(&self) -> Option<usize> {
+        self.win.as_ref().map(|w| w.cfg.w)
+    }
+
     pub(crate) fn make_batcher(&self, n_slots: usize, max_seq: usize) -> Option<MetalBatcher<'_>> {
         let cfg = &self.cfg;
         // The batched kernels are the fused-decode family — same requirements.
@@ -1517,6 +1771,19 @@ impl Session for MetalSession<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn window_cfg_mirror_matches_lowmem_formula() {
+        // Pins the metal-side mirror (challenge 7c1a09cf) to lowmem's values:
+        // sink_pad = sink aligned to 128, ring = (w + PREFILL_CHUNK) aligned.
+        let w = super::window_cfg(2048, 4).unwrap();
+        assert_eq!((w.w, w.sink, w.sink_pad, w.ring, w.cap), (2048, 4, 128, 2560, 2688));
+        assert_eq!(w.slot_of(3), 3);
+        assert_eq!(w.slot_of(4), 128);
+        assert_eq!(w.slot_of(4 + 2560), 128); // ring wrap
+        assert!(super::window_cfg(0, 0).is_err());
+        assert!(super::window_cfg(64, 128).is_err());
+    }
+
     use super::*;
 
     /// Not a correctness test: measures the host-side f32→f16 loop that write_kv runs

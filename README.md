@@ -193,6 +193,30 @@ every chunk, which was the right call when Metal prefill ran at 1,461 tok/s
 and is ~2x slower than Metal today. If it is on disk it stays idle (a
 notice says so); `LOKAL_WINDOWED_PREFILL=1` loads it for A/B comparison.
 
+### Sliding-window mode (optional)
+
+`--context-window W [--attention-sink N]` opts `-b metal` and `-b hybrid` into
+the flat-cost attention the lowmem backend runs by construction: each query
+attends its last W positions plus N pinned "sink" tokens, and KV memory becomes
+a fixed ring — O(window), flat in context length (Qwen 0.5B at 32k context:
+~400 MB of full KV vs ~35 MB of ring at W=2048). The trade is real and the
+mode is DEFAULT OFF: these models were trained full-causal, and each layer only
+attends its own window — though beyond-window context still influences output
+through depth (each position summarizes ITS window at the layer below, so the
+effective receptive field is roughly layers × window, the same mechanism that
+lets Mistral's sliding window carry long documents). Without the flags,
+behavior is bit-for-bit unchanged. On `-b hybrid`, the ANE's graphs compute full causal
+attention, which below position W is EXACTLY the window+sink result — so the
+ANE serves those positions and windowed Metal takes everything past them, no
+graph re-export, no approximation. Speed-wise the mode is a
+long-context play, not a general win: at W=2048 on Qwen 0.5B the windowed
+prefill curve is flat (2,669 / 2,495 / 2,716 tok/s at 2k/4k/8k) where full
+attention starts higher and falls (3,164 / 3,149 / 2,402) — the lines cross
+around 8k, and past it the gap only widens while full-causal KV keeps
+growing. In serve mode a window means per-request sessions (the batcher pool
+keeps the full-causal layout), `--draft` is refused, and RoPE positions past
+the trained length degrade quality — same caveat as lowmem.
+
 The export step needs [uv](https://docs.astral.sh/uv/) and runs offline.
 Placement is verified, not assumed: inspecting the compiled graph with the
 MLComputePlan API shows 1,733 ops on the NeuralEngine device and 6 on the CPU,

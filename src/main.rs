@@ -62,8 +62,11 @@ Options:
                            than available RAM; uses a bounded attention window and may reduce
                            long-context quality) [cpu]
       --memory-budget <MB> lowmem only: total working-set budget [4096]
-      --context-window <N> lowmem only: sliding attention window in tokens [2048]
-      --attention-sink <N> lowmem only: pinned initial tokens, 0 disables [4]
+      --context-window <N> sliding attention window in tokens — opt-in on metal/hybrid
+                           (KV memory goes O(window); the model loses sight of tokens
+                           beyond the window, trading long-range recall for flat cost),
+                           always on for lowmem [lowmem: 2048]
+      --attention-sink <N> with --context-window: pinned initial tokens, 0 disables [4]
   -p, --prompt <text>      prompt text [\"Once upon a time\"]
   -n, --max-tokens <N>     maximum number of tokens to generate [200]
   -t, --temperature <T>    0 = greedy (fully deterministic), higher = more adventurous [0.7]
@@ -149,6 +152,25 @@ fn run() -> Result<()> {
         }
         return Ok(());
     }
+    // --context-window/--attention-sink opt metal and hybrid into sliding-window
+    // attention (lowmem keeps its own wiring); --memory-budget stays lowmem-only.
+    let win: Option<(usize, usize)> = match (args.backend.as_str(), args.lowmem.context_window) {
+        ("lowmem", _) | (_, None) => None,
+        (_, Some(w)) => Some((w, args.lowmem.attention_sink.unwrap_or(4))),
+    };
+    if win.is_some() {
+        if args.lowmem.memory_budget_mb.is_some() {
+            return Err("--memory-budget applies to -b lowmem only".into());
+        }
+        if args.draft.is_some() {
+            return Err(
+                "--draft cannot be combined with --context-window — speculative verification \
+                 under a window is unproven; drop one of the two"
+                    .into(),
+            );
+        }
+    }
+
     // A .gguf file is its own checkpoint format: config and tokenizer come out
     // of the file itself, weights are (possibly) quantized. Everything else
     // stays the config.json + tokenizer.json + safetensors directory layout.
@@ -161,7 +183,7 @@ fn run() -> Result<()> {
 
     #[cfg(target_os = "macos")]
     let (cfg, tokenizer, engine) = if is_gguf {
-        gguf_setup(&args, &dir)?
+        gguf_setup(&args, &dir, win)?
     } else {
         let cfg = config::ModelConfig::load(&dir.join("config.json"))?;
         let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))?;
@@ -182,11 +204,11 @@ fn run() -> Result<()> {
         None if args.backend == "lowmem" => {
             engine::create_lowmem(&dir, cfg.clone(), &args.lowmem)?
         }
-        None if args.lowmem.any_set() => {
-            return Err(
-                "--memory-budget, --context-window, and --attention-sink apply to -b lowmem only"
-                    .into(),
-            );
+        None if args.lowmem.memory_budget_mb.is_some() => {
+            return Err("--memory-budget applies to -b lowmem only".into());
+        }
+        None if args.lowmem.attention_sink.is_some() && args.lowmem.context_window.is_none() => {
+            return Err("--attention-sink needs --context-window".into());
         }
         None => {
             let t0 = Instant::now();
@@ -202,7 +224,7 @@ fn run() -> Result<()> {
                 model.n_params as f64 / 1e6,
                 t0.elapsed().as_secs_f64(),
             );
-            engine::create(&args.backend, model, &dir)?
+            engine::create(&args.backend, model, &dir, win)?
         }
     };
     eprintln!("backend: {}", engine.name());
@@ -229,7 +251,7 @@ fn run() -> Result<()> {
                 "hybrid" | "ane" | "lowmem" => "metal",
                 b => b,
             };
-            let dengine = engine::create(dbackend, dmodel, &ddir)?;
+            let dengine = engine::create(dbackend, dmodel, &ddir, None)?;
             eprintln!("draft: {name} ({})", dengine.name());
             Some(dengine)
         }
@@ -243,6 +265,27 @@ fn run() -> Result<()> {
             args.port,
             args.max_concurrent,
         );
+    }
+
+    // LOKAL_DEBUG_TOPK=N: prefill the prompt, print the final position's top-N
+    // (token id, logit) pairs, and exit. The perturbation gates assert on these
+    // directly — an argmax flip is never implied by a logits change
+    // (protocol:gate-scripts), so window semantics are proved at logit level.
+    if let Some(k) = std::env::var("LOKAL_DEBUG_TOPK").ok().and_then(|v| v.parse::<usize>().ok()) {
+        let ids = tokenizer
+            .encode(args.opt.prompt.as_str(), true)
+            .map_err(|e| format!("tokenize: {e}"))?
+            .get_ids()
+            .to_vec();
+        println!("ntok\t{}", ids.len()); // gates assert equal lengths across perturbations
+        let mut session = engine.session(ids.len() + 1)?;
+        let logits = session.prefill(&ids)?;
+        let mut ranked: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (id, logit) in ranked.into_iter().take(k) {
+            println!("topk\t{id}\t{logit:.6}");
+        }
+        return Ok(());
     }
 
     // CLI mode: echo the prompt, then stream generated text after it.
@@ -278,6 +321,7 @@ fn run() -> Result<()> {
 fn gguf_setup(
     args: &Args,
     path: &std::path::Path,
+    win: Option<(usize, usize)>,
 ) -> Result<(config::ModelConfig, tokenizers::Tokenizer, Option<Box<dyn engine::Engine>>)> {
     use lowmem::gguf;
     let g = gguf::GgufFile::open(path)?;
@@ -319,11 +363,8 @@ fn gguf_setup(
                 )
                 .into());
             }
-            if args.lowmem.any_set() {
-                return Err(
-                    "--memory-budget, --context-window, and --attention-sink apply to -b lowmem only"
-                        .into(),
-                );
+            if args.lowmem.memory_budget_mb.is_some() {
+                return Err("--memory-budget applies to -b lowmem only".into());
             }
             // The honest RAM cost is the EXPANDED f32 size, not the file size —
             // a 4 GB Q4 file is ~28 GB of f32. Checked before any allocation.
@@ -356,7 +397,7 @@ fn gguf_setup(
                 t0.elapsed().as_secs_f64()
             );
             let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-            Some(engine::create(&args.backend, model, parent)?)
+            Some(engine::create(&args.backend, model, parent, win)?)
         }
         other => {
             return Err(format!(
