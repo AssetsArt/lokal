@@ -110,6 +110,40 @@ inline void lm_scale_min_k4(uint j, device const uchar *q, thread uint &sc, thre
 
 // Q2_K: scales[16] | qs[64] | d | dmin (84 B). Each scale byte packs a 4-bit
 // scale (low) and a 4-bit min (high) for one 16-element group.
+// ggml's kvalues_iq4nl (ggml-common.h), verbatim: the 16-entry non-linear
+// codebook both IQ4 types index with a 4-bit quant. Not a formula.
+constant int lm_kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113
+};
+
+// IQ4_NL: d | qs[16] (18 B). Low nibbles are the first 16 outputs, high
+// nibbles the second 16 — not interleaved.
+inline float lm_dequant_iq4_nl(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 5) * 18;
+    float d = lm_f16_at(b);
+    uint j = col & 31;
+    uchar q = b[2 + (j & 15)];
+    uint nib = (j < 16) ? (q & 0x0F) : (q >> 4);
+    return d * (float)lm_kvalues_iq4nl[nib];
+}
+
+// IQ4_XS: d | scales_h(u16) | scales_l[4] | qs[128] (136 B). Each of the 8
+// sub-blocks takes a 6-bit scale split across scales_l (low 4) and scales_h
+// (high 2), biased by -32.
+inline float lm_dequant_iq4_xs(device const uchar *row, uint col) {
+    device const uchar *b = row + (col >> 8) * 136;
+    float d = lm_f16_at(b);
+    uint scales_h = (uint)b[2] | ((uint)b[3] << 8);
+    uint i = col & 255;
+    uint ib = i >> 5, w = i & 31;
+    uint hf = w >> 4, j = w & 15;
+    int ls = (int)((b[4 + ib / 2] >> (4 * (ib % 2))) & 0x0F)
+           | (int)(((scales_h >> (2 * ib)) & 3) << 4);
+    uchar q = b[8 + ib * 16 + j];
+    uint nib = (hf == 1) ? (q >> 4) : (q & 0x0F);
+    return d * (float)(ls - 32) * (float)lm_kvalues_iq4nl[nib];
+}
+
 inline float lm_dequant_q2_K(device const uchar *row, uint col) {
     device const uchar *b = row + (col >> 8) * 84;
     float d = lm_f16_at(b + 80);
@@ -260,6 +294,38 @@ inline float lm_dot_run_q5_0(device const uchar *row, uint e0, device const floa
     return s * d;
 }
 
+inline float lm_dot_run_iq4_nl(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 5) * 18;
+    float d = lm_f16_at(b);
+    float s = 0.0f;
+    for (uint j = 0; j < 16; j++) {
+        uchar q = b[2 + j];
+        s += (float)lm_kvalues_iq4nl[q & 0x0F] * x[e0 + j];
+        s += (float)lm_kvalues_iq4nl[q >> 4] * x[e0 + j + 16];
+    }
+    return s * d;
+}
+
+inline float lm_dot_run_iq4_xs(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 8) * 136;
+    float d = lm_f16_at(b);
+    uint scales_h = (uint)b[2] | ((uint)b[3] << 8);
+    uint i = e0 & 255;
+    uint ib = i >> 5;
+    int ls = (int)((b[4 + ib / 2] >> (4 * (ib % 2))) & 0x0F)
+           | (int)(((scales_h >> (2 * ib)) & 3) << 4);
+    device const uchar *q = b + 8 + ib * 16;
+    // A 32-aligned run IS one whole sub-block: its low nibbles are the first
+    // 16 outputs and its high nibbles the second 16, so one decoded scale
+    // covers the run and both halves accumulate together.
+    float acc = 0.0f;
+    for (uint j = 0; j < 16; j++) {
+        acc += (float)lm_kvalues_iq4nl[q[j] & 0x0F] * x[e0 + j];
+        acc += (float)lm_kvalues_iq4nl[q[j] >> 4] * x[e0 + j + 16];
+    }
+    return d * (float)(ls - 32) * acc;
+}
+
 inline float lm_dot_run_q2_K(device const uchar *row, uint e0, device const float *x) {
     device const uchar *b = row + (e0 >> 8) * 84;
     float d = lm_f16_at(b + 80);
@@ -396,6 +462,8 @@ inline float lm_dot_run(device const uchar *row, uint e0, device const float *x)
         case 7: return lm_dot_run_q5_0(row, e0, x);
         case 8: return lm_dot_run_q2_K(row, e0, x);
         case 9: return lm_dot_run_q3_K(row, e0, x);
+        case 10: return lm_dot_run_iq4_nl(row, e0, x);
+        case 11: return lm_dot_run_iq4_xs(row, e0, x);
         default: return 0.0f;
     }
 }
@@ -410,6 +478,8 @@ inline float lm_dequant(device const uchar *row, uint col) {
         case 7: return lm_dequant_q5_0(row, col);
         case 8: return lm_dequant_q2_K(row, col);
         case 9: return lm_dequant_q3_K(row, col);
+        case 10: return lm_dequant_iq4_nl(row, col);
+        case 11: return lm_dequant_iq4_xs(row, col);
         default: return 0.0f;
     }
 }
@@ -464,6 +534,8 @@ inline ulong lm_row_bytes(uint in_dim) {
         case 7: return (ulong)(in_dim / 32) * 22;   // Q5_0
         case 8: return (ulong)(in_dim / 256) * 84;  // Q2_K
         case 9: return (ulong)(in_dim / 256) * 110; // Q3_K
+        case 10: return (ulong)(in_dim / 32) * 18;  // IQ4_NL
+        case 11: return (ulong)(in_dim / 256) * 136; // IQ4_XS
         default: return 0; // unused for element-addressable types
     }
 }

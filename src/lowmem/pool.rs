@@ -612,6 +612,8 @@ mod quant_oracle {
         Q5_0 = 7,
         Q2K = 8,
         Q3K = 9,
+        IQ4NL = 10,
+        IQ4XS = 11,
     }
 
     impl QType {
@@ -622,6 +624,8 @@ mod quant_oracle {
             match self {
                 QType::Q8_0 => G::Q8_0,
                 QType::Q4_0 => G::Q4_0,
+                QType::IQ4NL => G::IQ4_NL,
+                QType::IQ4XS => G::IQ4_XS,
                 QType::Q2K => G::Q2_K,
                 QType::Q3K => G::Q3_K,
                 QType::Q4K => G::Q4_K,
@@ -633,8 +637,9 @@ mod quant_oracle {
 
         fn blk_elems(self) -> usize {
             match self {
-                QType::Q8_0 | QType::Q4_0 | QType::Q5_0 => 32,
-                QType::Q4K | QType::Q6K | QType::Q5K | QType::Q2K | QType::Q3K => 256,
+                QType::Q8_0 | QType::Q4_0 | QType::Q5_0 | QType::IQ4NL => 32,
+                QType::Q4K | QType::Q6K | QType::Q5K | QType::Q2K | QType::Q3K
+                | QType::IQ4XS => 256,
             }
         }
         fn blk_bytes(self) -> usize {
@@ -647,9 +652,16 @@ mod quant_oracle {
                 QType::Q5K => 176,
                 QType::Q2K => 84,
                 QType::Q3K => 110,
+                QType::IQ4NL => 18,
+                QType::IQ4XS => 136,
             }
         }
     }
+
+    /// The seam's codebook, referenced (not copied) so a divergence is
+    /// impossible by construction — the shim's independence is in how it
+    /// INDEXES the table, not in retyping 16 magic numbers.
+    use super::super::manifest::KVALUES_IQ4NL as KV;
 
     fn f16_at(b: &[u8]) -> f32 {
         f16::from_le_bytes([b[0], b[1]]).to_f32()
@@ -681,6 +693,32 @@ mod quant_oracle {
                 // index decomposition. Two different readings of the same C: if
                 // they agree the reading is right, which one reference alone
                 // can never tell you.
+                // IQ4 pair, in ggml's sequential loop order rather than the
+                // seam's per-element decomposition.
+                QType::IQ4NL => {
+                    let d = f16_at(blk);
+                    for j in 0..16 {
+                        let q = blk[2 + j];
+                        y[j] = d * KV[(q & 0xF) as usize] as f32;
+                        y[j + 16] = d * KV[(q >> 4) as usize] as f32;
+                    }
+                }
+                QType::IQ4XS => {
+                    let d = f16_at(blk);
+                    let scales_h = u16::from_le_bytes([blk[2], blk[3]]);
+                    let mut o = 0usize;
+                    for ib in 0..8 {
+                        let ls = ((blk[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) as i32
+                            | ((((scales_h >> (2 * ib)) & 3) as i32) << 4);
+                        let dl = d * (ls - 32) as f32;
+                        let qs = &blk[8 + ib * 16..8 + ib * 16 + 16];
+                        for j in 0..16 {
+                            y[o + j] = dl * KV[(qs[j] & 0xF) as usize] as f32;
+                            y[o + j + 16] = dl * KV[(qs[j] >> 4) as usize] as f32;
+                        }
+                        o += 32;
+                    }
+                }
                 QType::Q2K => {
                     let d = f16_at(&blk[80..]);
                     let dmin = f16_at(&blk[82..]);
@@ -884,6 +922,7 @@ mod quant_oracle {
                                 b[82..84].copy_from_slice(&scale_bytes[3 - variant + 1]);
                             }
                             QType::Q3K => b[108..110].copy_from_slice(&sb),
+                            QType::IQ4NL | QType::IQ4XS => b[0..2].copy_from_slice(&sb),
                         }
                         if variant == 3 {
                             // max-magnitude quants under the max scale
@@ -897,6 +936,11 @@ mod quant_oracle {
                                 }
                                 QType::Q5K => {
                                     b[4..176].fill(0xFF); // scales, high bits, nibbles
+                                }
+                                QType::IQ4NL => b[2..18].fill(0xFF), // codebook index 15 everywhere
+                                QType::IQ4XS => {
+                                    b[2..8].fill(0xFF);   // scales_h + scales_l all set -> ls 63
+                                    b[8..136].fill(0xFF); // every nibble -> codebook 15
                                 }
                                 QType::Q2K => {
                                     b[0..16].fill(0xFF);  // every scale AND min maxed
@@ -942,6 +986,8 @@ mod quant_oracle {
             QType::Q5K,
             QType::Q2K,
             QType::Q3K,
+            QType::IQ4NL,
+            QType::IQ4XS,
         ] {
             let (n_blocks, n_rows) = (8usize, 3usize);
             let cols = n_blocks * ty.blk_elems();

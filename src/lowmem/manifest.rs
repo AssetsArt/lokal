@@ -175,6 +175,8 @@ pub enum GgmlType {
     Q4_0 = 2,
     Q2_K = 10,
     Q3_K = 11,
+    IQ4_NL = 20,
+    IQ4_XS = 23,
     Q5_0 = 6,
     Q8_0 = 8,
     Q4_K = 12,
@@ -207,10 +209,10 @@ impl GgmlType {
             17 => return Err("IQ2_XS"),
             18 => return Err("IQ3_XXS"),
             19 => return Err("IQ1_S"),
-            20 => return Err("IQ4_NL"),
+            20 => Self::IQ4_NL,
             21 => return Err("IQ3_S"),
             22 => return Err("IQ2_S"),
-            23 => return Err("IQ4_XS"),
+            23 => Self::IQ4_XS,
             24..=27 => return Err("integer tensor"),
             28 => return Err("F64"),
             29 => return Err("IQ1_M"),
@@ -223,8 +225,8 @@ impl GgmlType {
     pub fn blk_elems(self) -> usize {
         match self {
             Self::F32 | Self::F16 => 1,
-            Self::Q4_0 | Self::Q5_0 | Self::Q8_0 => 32, // QK4_0 / QK5_0 / QK8_0
-            Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K => 256, // QK_K
+            Self::Q4_0 | Self::Q5_0 | Self::Q8_0 | Self::IQ4_NL => 32, // QK4_0 / QK5_0 / QK8_0 / QK4_NL
+            Self::Q2_K | Self::Q3_K | Self::Q4_K | Self::Q5_K | Self::Q6_K | Self::IQ4_XS => 256, // QK_K
         }
     }
 
@@ -236,6 +238,8 @@ impl GgmlType {
             Self::Q4_0 => 2 + 16,            // f16 d + 32 nibbles
             Self::Q5_0 => 2 + 4 + 16,        // f16 d + qh[4] high bits + 32 nibbles
             Self::Q8_0 => 2 + 32,            // f16 d + 32 i8
+            Self::IQ4_NL => 2 + 16,          // d + qs[QK4_NL/2]
+            Self::IQ4_XS => 2 + 2 + 4 + 128, // d + scales_h + scales_l[QK_K/64] + qs[QK_K/2]
             Self::Q2_K => 16 + 64 + 2 + 2,   // scales[QK_K/16] + qs[QK_K/4] + d + dmin
             Self::Q3_K => 32 + 64 + 12 + 2,  // hmask[QK_K/8] + qs[QK_K/4] + scales[12] + d
             Self::Q4_K => 2 + 2 + 12 + 128,  // d + dmin + scales[12] + qs[QK_K/2]
@@ -279,6 +283,12 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
         )
     }
 }
+
+/// ggml's `kvalues_iq4nl` (ggml-common.h) — the 16-entry non-linear codebook
+/// both IQ4 types index with a 4-bit quant. Copied verbatim; the values are not
+/// a formula and must never be "recomputed".
+pub(crate) const KVALUES_IQ4NL: [i8; 16] =
+    [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
 
 /// Q3_K's 12 packed scale bytes -> 16 six-bit values, ggml's aux shuffle from
 /// dequantize_row_q3_K verbatim (kmask1 0x03030303, kmask2 0x0f0f0f0f). The
@@ -357,6 +367,38 @@ pub fn dequant_row_ref(ty: GgmlType, src: &[u8], out: &mut [f32]) {
         // Each of the 16 scale bytes packs a 4-bit scale (low) and a 4-bit min
         // (high) for one 16-element group; the 2-bit quants for a 128-element
         // half share one 32-byte qs run, selected by a shift of 2 per group-pair.
+        // dequantize_row_iq4_nl: d | qs[16] (18 B). Low nibbles fill the first
+        // 16 outputs, high nibbles the second 16 — not interleaved.
+        GgmlType::IQ4_NL => {
+            for (b, y) in out.chunks_exact_mut(32).enumerate() {
+                let blk = &src[b * 18..b * 18 + 18];
+                let d = f16_bits_at(blk, 0);
+                for j in 0..16 {
+                    let q = blk[2 + j];
+                    y[j] = d * KVALUES_IQ4NL[(q & 0xF) as usize] as f32;
+                    y[j + 16] = d * KVALUES_IQ4NL[(q >> 4) as usize] as f32;
+                }
+            }
+        }
+        // dequantize_row_iq4_xs: d | scales_h(u16) | scales_l[4] | qs[128]
+        // (136 B). Each of the 8 sub-blocks takes a 6-bit scale split across
+        // scales_l (low 4 bits) and scales_h (high 2), biased by -32.
+        GgmlType::IQ4_XS => {
+            for (b, y) in out.chunks_exact_mut(256).enumerate() {
+                let blk = &src[b * 136..b * 136 + 136];
+                let d = f16_bits_at(blk, 0);
+                let scales_h = u16::from_le_bytes([blk[2], blk[3]]);
+                for (i, o) in y.iter_mut().enumerate() {
+                    let (ib, w) = (i >> 5, i & 31);
+                    let (half, j) = (w >> 4, w & 15);
+                    let ls = ((blk[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) as i32
+                        | ((((scales_h >> (2 * ib)) & 3) as i32) << 4);
+                    let q = blk[8 + ib * 16 + j];
+                    let nib = if half == 1 { q >> 4 } else { q & 0xF };
+                    *o = d * (ls - 32) as f32 * KVALUES_IQ4NL[nib as usize] as f32;
+                }
+            }
+        }
         GgmlType::Q2_K => {
             for (b, y) in out.chunks_exact_mut(256).enumerate() {
                 let blk = &src[b * 84..b * 84 + 84];
@@ -682,6 +724,9 @@ mod gguf_seam_tests {
         assert_eq!(GgmlType::from_gguf(10).unwrap(), GgmlType::Q2_K);
         assert_eq!(GgmlType::from_gguf(11).unwrap(), GgmlType::Q3_K);
         assert_eq!(GgmlType::from_gguf(19).unwrap_err(), "IQ1_S");
-        assert_eq!(GgmlType::from_gguf(23).unwrap_err(), "IQ4_XS");
+        assert_eq!(GgmlType::from_gguf(23).unwrap(), GgmlType::IQ4_XS);
+        assert_eq!(GgmlType::from_gguf(20).unwrap(), GgmlType::IQ4_NL);
+        // Still refused, and this list SHRINKS as the lane lands types.
+        assert_eq!(GgmlType::from_gguf(22).unwrap_err(), "IQ2_S");
     }
 }
