@@ -109,6 +109,11 @@ Qwen/Qwen2.5-0.5B-Instruct
 TinyLlama/TinyLlama-1.1B-Chat-v1.0
 ```
 
+Qwen3-family checkpoints (`Qwen3*`, `Qwen3_5*`) are refused from safetensors
+by name: their explicit head_dim and qk-norm do not fit the Llama forward pass
+the safetensors path implements. Run those as GGUF instead (`-m
+owner/repo:Q4_K_M` or a local `.gguf`), where qwen3 is fully supported.
+
 Architectures: `LlamaForCausalLM`, `Qwen2ForCausalLM`, `MistralForCausalLM`.
 
 ### GGUF checkpoints
