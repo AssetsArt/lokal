@@ -108,6 +108,15 @@ impl Model {
     /// with the same numerics (safetensors map, GGUF dequant — spec §11: the
     /// graph must not know where tensors live).
     pub fn from_store(cfg: ModelConfig, t: &mut dyn TensorStore) -> crate::Result<Self> {
+        // The enums resolve ONCE, before the layer loop — the forward pass
+        // below IS the SwiGLU/RMSNorm-pre implementation, and these matches
+        // stop compiling the day a second variant exists.
+        match cfg.activation()? {
+            crate::config::Activation::SwiGLU => {}
+        }
+        match cfg.norm_type() {
+            crate::config::NormType::RmsNormPre => {}
+        }
         let h = cfg.hidden_size;
         // Head width comes from the checkpoint itself: qwen3's q_proj is
         // [n_heads*128, hidden] with hidden/n_heads = 64 — trusting the config

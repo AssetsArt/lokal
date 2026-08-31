@@ -667,6 +667,14 @@ impl MetalEngine {
     /// window pipelines must be specialized while the shader library is alive,
     /// which is why the choice happens at engine build, not per session.
     pub fn new_with_window(model: Model, win: Option<(usize, usize)>) -> crate::Result<Self> {
+        // Construction-time seam checks (docs/gguf-design.md §FFN/§Norm): the
+        // fused swiglu and rmsnorm pipelines are the only forms compiled in.
+        match model.cfg.activation()? {
+            crate::config::Activation::SwiGLU => {}
+        }
+        match model.cfg.norm_type() {
+            crate::config::NormType::RmsNormPre => {}
+        }
         let device = Device::system_default().ok_or("no Metal-capable GPU found")?;
         let queue = device.new_command_queue();
 
@@ -1484,6 +1492,12 @@ impl MetalEngine {
         cfg: ModelConfig,
         win: Option<(usize, usize)>,
     ) -> crate::Result<Self> {
+        match cfg.activation()? {
+            crate::config::Activation::SwiGLU => {}
+        }
+        match cfg.norm_type() {
+            crate::config::NormType::RmsNormPre => {}
+        }
         use std::collections::HashMap;
         let device = Device::system_default().ok_or("no Metal-capable GPU found")?;
         let queue = device.new_command_queue();

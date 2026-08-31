@@ -782,6 +782,15 @@ impl LowMemEngine {
     /// Built from the model DIRECTORY, not a loaded Model — nothing here ever
     /// materializes the full model in RAM.
     pub fn new(dir: &Path, cfg: ModelConfig, opts: &LowMemOpts) -> crate::Result<Self> {
+        // Construction-time seam checks (docs/gguf-design.md §FFN/§Norm): the
+        // staged swiglu pipelines and rmsnorm kernels below are the only forms
+        // this backend builds — a second enum variant must be wired here first.
+        match cfg.activation()? {
+            crate::config::Activation::SwiGLU => {}
+        }
+        match cfg.norm_type() {
+            crate::config::NormType::RmsNormPre => {}
+        }
         let t0 = Instant::now();
         let mut source = LowMemSource::open(dir)?;
         eprintln!(
@@ -1333,6 +1342,7 @@ mod tests {
 
     fn qwen05b_cfg() -> ModelConfig {
         ModelConfig {
+            hidden_act: None,
             architectures: vec!["Qwen2ForCausalLM".into()],
             hidden_size: 896,
             intermediate_size: 4864,

@@ -215,7 +215,10 @@ pub fn model_config(g: &GgufFile) -> crate::Result<(crate::config::ModelConfig, 
             Ok(id) => crate::config::EosIds::One(id as u32),
             Err(_) => crate::config::EosIds::default(),
         },
-    };
+        // GGUF llama-family checkpoints carry no activation key; None resolves
+    // to the family default (SwiGLU) through ModelConfig::activation().
+    hidden_act: None,
+};
     Ok((cfg, GgufArch { arch, qk_norm, head_dim }))
 }
 
