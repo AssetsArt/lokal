@@ -153,6 +153,7 @@ struct Pipelines {
     bias_add: ComputePipelineState,
     matmul_h: ComputePipelineState,
     rmsnorm: ComputePipelineState,
+    rmsnorm_h_inplace: ComputePipelineState,
     rmsnorm_hf: ComputePipelineState,
     silu_mul_hf: ComputePipelineState,
     rope: ComputePipelineState,
@@ -205,6 +206,9 @@ struct GpuLinear {
 
 struct GpuBlock {
     input_layernorm: Buffer,
+    /// qwen3: per-head q/k RMSNorm (f16), pre-RoPE. None elsewhere.
+    q_norm: Option<Buffer>,
+    k_norm: Option<Buffer>,
     q_proj: GpuLinear,
     k_proj: GpuLinear,
     v_proj: GpuLinear,
@@ -232,6 +236,23 @@ pub struct MetalEngine {
     /// Quantized-GGUF execution (weights stay quant, dequantized on read).
     /// None = the dense f16 paths, untouched.
     quant: Option<QuantState>,
+    /// True geometry, derived from the checkpoint (qwen3 violates the
+    /// hidden/n_heads identity, so cfg.head_dim()/kv_dim() are never read on
+    /// hot paths — these are).
+    dims: crate::lowmem::Dims,
+}
+
+
+/// lowmem's Dims constructor is module-private; same three lines, same reason
+/// as the WindowCfg mirror (fields are pub, the formula is fixed).
+fn dims_of(cfg: &ModelConfig, head_dim: Option<usize>) -> crate::lowmem::Dims {
+    let hd = head_dim.unwrap_or_else(|| cfg.head_dim());
+    crate::lowmem::Dims {
+        hidden: cfg.hidden_size,
+        head_dim: hd,
+        q_dim: cfg.num_attention_heads * hd,
+        kv_dim: cfg.num_key_value_heads * hd,
+    }
 }
 
 /// The sliding-window add-on: geometry shared with lowmem, plus the three
@@ -261,6 +282,9 @@ pub(crate) struct QuantLinear {
 pub(crate) struct QuantBlock {
     input_layernorm: Buffer,
     post_attention_layernorm: Buffer,
+    /// qwen3's per-head q/k RMSNorm weights (f16), pre-RoPE. None elsewhere.
+    q_norm: Option<Buffer>,
+    k_norm: Option<Buffer>,
     q_proj: QuantLinear,
     k_proj: QuantLinear,
     v_proj: QuantLinear,
@@ -399,11 +423,12 @@ impl MetalEngine {
 
         // Kernels are compiled at runtime — edit kernels.metal and just cargo run again.
         let lib = device
-            .new_library_with_source(&shader_source(model.cfg.kv_dim()), &CompileOptions::new())
+            .new_library_with_source(&shader_source(model.kv_dim), &CompileOptions::new())
             .map_err(|e| format!("failed to compile kernels.metal: {e}"))?;
+        let dims = dims_of(&model.cfg, Some(model.head_dim));
         let pipes = Self::build_pipelines(&device, &lib, &model.cfg)?;
-        let win_state = Self::build_win_state(&device, &lib, &model.cfg, win)?;
-        Self::finish_dense(device, queue, model, pipes, win_state)
+        let win_state = Self::build_win_state(&device, &lib, &model.cfg, dims.kv_dim, win)?;
+        Self::finish_dense(device, queue, model, pipes, win_state, dims)
     }
 
     /// The full dense pipeline set — code moved verbatim from the constructor
@@ -467,6 +492,7 @@ impl MetalEngine {
             bias_add: pipe("bias_add")?,
             matmul_h: pipe("matmul_h")?,
             rmsnorm: pipe("rmsnorm")?,
+            rmsnorm_h_inplace: pipe("rmsnorm_h_inplace")?,
             rmsnorm_hf: pipe("rmsnorm_hf")?,
             silu_mul_hf: pipe("silu_mul_hf")?,
             rope: pipe("rope")?,
@@ -497,6 +523,7 @@ impl MetalEngine {
         device: &Device,
         lib: &metal::Library,
         cfg: &ModelConfig,
+        kvd: usize,
         win: Option<(usize, usize)>,
     ) -> crate::Result<Option<WinState>> {
         let gqa_chunk =
@@ -533,7 +560,7 @@ impl MetalEngine {
                         .new_compute_pipeline_state_with_function(&f)
                         .map_err(|e| format!("kernel {name}: {e}").into())
                 };
-                let kv_mb = cfg.num_hidden_layers * wc.cap * cfg.kv_dim() * 2 * 2;
+                let kv_mb = cfg.num_hidden_layers * wc.cap * kvd * 2 * 2;
                 eprintln!(
                     "Metal window mode: window {} (+{} sink) — KV is a ring of {} slots/layer, {:.0} MB total, flat in context length",
                     wc.w,
@@ -560,6 +587,7 @@ impl MetalEngine {
         model: Model,
         pipes: Pipelines,
         win_state: Option<WinState>,
+        dims: crate::lowmem::Dims,
     ) -> crate::Result<Self> {
         fn lin(device: &Device, l: &crate::model::Linear) -> GpuLinear {
             let has_bias = l.bias.is_some();
@@ -585,6 +613,8 @@ impl MetalEngine {
             .iter()
             .map(|b| GpuBlock {
                 input_layernorm: f16_buffer(&device, &b.input_layernorm),
+                q_norm: b.q_norm.as_ref().map(|w| f16_buffer(&device, w)),
+                k_norm: b.k_norm.as_ref().map(|w| f16_buffer(&device, w)),
                 q_proj: lin(&device, &b.q_proj),
                 k_proj: lin(&device, &b.k_proj),
                 v_proj: lin(&device, &b.v_proj),
@@ -606,6 +636,7 @@ impl MetalEngine {
             device,
             win: win_state,
             quant: None,
+            dims,
             pipes,
             blocks,
         })
@@ -782,6 +813,44 @@ impl MetalEngine {
         enc.dispatch_thread_groups(MTLSize::new(n_rows as u64, 1, 1), MTLSize::new(256, 1, 1));
     }
 
+    /// qwen3's per-head q/k norm, f32 rows in place (rmsnorm with x == y and a
+    /// caller-chosen row width — one "row" here is one HEAD, dim = head_dim).
+    fn enc_rmsnorm_dim(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: &Buffer,
+        weight: &Buffer,
+        n_rows: usize,
+        dim: usize,
+    ) {
+        let p = NormParams { dim: dim as u32, eps: self.cfg.rms_norm_eps };
+        enc.set_compute_pipeline_state(&self.pipes.rmsnorm);
+        enc.set_buffer(0, Some(x), 0);
+        enc.set_buffer(1, Some(weight), 0);
+        enc.set_buffer(2, Some(x), 0); // in place
+        enc.set_bytes(3, size_of::<NormParams>() as u64, &p as *const _ as *const _);
+        enc.dispatch_thread_groups(MTLSize::new(n_rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
+    /// Same, for f16 rows already sitting in the KV cache (k after a fused
+    /// decode projection) — the rmsnorm_h_inplace kernel gguf-kernels shipped.
+    fn enc_rmsnorm_h_inplace(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: &Buffer,
+        x_off: u64,
+        weight: &Buffer,
+        n_rows: usize,
+        dim: usize,
+    ) {
+        let p = NormParams { dim: dim as u32, eps: self.cfg.rms_norm_eps };
+        enc.set_compute_pipeline_state(&self.pipes.rmsnorm_h_inplace);
+        enc.set_buffer(0, Some(x), x_off);
+        enc.set_buffer(1, Some(weight), 0);
+        enc.set_bytes(2, size_of::<NormParams>() as u64, &p as *const _ as *const _);
+        enc.dispatch_thread_groups(MTLSize::new(n_rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+    }
+
     /// Prefill rmsnorm: writes the normalized row in f32 AND half (the half copy
     /// feeds the tensor-ops matmuls without a separate conversion pass).
     fn enc_rmsnorm_hf(
@@ -814,7 +883,7 @@ impl MetalEngine {
         n_rows: usize,
         f16: bool, // true = an f16 buffer (rows in the KV cache), false = f32 (q)
     ) {
-        let hd = self.cfg.head_dim();
+        let hd = self.dims.head_dim;
         let p = RopeParams {
             head_dim: hd as u32,
             n_heads: n_heads as u32,
@@ -844,14 +913,14 @@ impl MetalEngine {
         out_h: &Buffer,
     ) {
         let p = AttnParams {
-            head_dim: self.cfg.head_dim() as u32,
+            head_dim: self.dims.head_dim as u32,
             n_heads: self.cfg.num_attention_heads as u32,
             n_kv_heads: self.cfg.num_key_value_heads as u32,
             pos0: pos0 as u32,
             max_seq: max_seq as u32,
             n_rows: n_rows as u32,
         };
-        if self.cfg.head_dim() == FLASH_HEAD_DIM {
+        if self.dims.head_dim == FLASH_HEAD_DIM {
             // Flash path: no scores scratch, one threadgroup per (head, 16-row tile).
             enc.set_compute_pipeline_state(match &self.win {
                 Some(w) => &w.flash,
@@ -981,7 +1050,7 @@ impl MetalEngine {
         kv_byte_off: u64,
         pos: usize,
     ) {
-        let hd = self.cfg.head_dim();
+        let hd = self.dims.head_dim;
         let p = RopeQkParams {
             head_dim: hd as u32,
             n_q_heads: self.cfg.num_attention_heads as u32,
@@ -1018,7 +1087,7 @@ impl MetalEngine {
             None => (pos + 1).div_ceil(ATTN_SPLIT),
         };
         let p = AttnDecParams {
-            head_dim: self.cfg.head_dim() as u32,
+            head_dim: self.dims.head_dim as u32,
             n_heads: self.cfg.num_attention_heads as u32,
             n_kv_heads: self.cfg.num_key_value_heads as u32,
             pos: pos as u32,
@@ -1049,12 +1118,12 @@ impl MetalEngine {
         enc.set_bytes(2, size_of::<AttnDecParams>() as u64, &p as *const _ as *const _);
         enc.dispatch_thread_groups(
             MTLSize::new(heads, 1, 1),
-            MTLSize::new(self.cfg.head_dim() as u64, 1, 1),
+            MTLSize::new(self.dims.head_dim as u64, 1, 1),
         );
     }
 
     fn gqa_decode_dims(&self) -> (u64, [u64; 4]) {
-        gqa_decode_dims(&self.cfg)
+        gqa_decode_dims_hd(&self.cfg, self.dims.head_dim)
     }
 
     fn enc_elementwise(
@@ -1079,6 +1148,12 @@ impl MetalEngine {
 /// MAX_GQA_CHUNK q heads of one kv head's group. Free function because the
 /// lowmem backend dispatches the same kernels from its own engine.
 pub(crate) fn gqa_decode_dims(cfg: &ModelConfig) -> (u64, [u64; 4]) {
+    gqa_decode_dims_hd(cfg, cfg.head_dim())
+}
+
+/// The hd-aware form: qwen3's true head_dim is 2x the config identity, and the
+/// threadgroup allocations below must be sized by the REAL width.
+pub(crate) fn gqa_decode_dims_hd(cfg: &ModelConfig, head_dim: usize) -> (u64, [u64; 4]) {
     let group = cfg.num_attention_heads / cfg.num_key_value_heads;
     let chunk = group.min(MAX_GQA_CHUNK);
     let grid_x = (cfg.num_key_value_heads * group.div_ceil(chunk)) as u64;
@@ -1088,7 +1163,7 @@ pub(crate) fn gqa_decode_dims(cfg: &ModelConfig) -> (u64, [u64; 4]) {
     (
         grid_x,
         [
-            f32s(chunk * cfg.head_dim()),
+            f32s(chunk * head_dim),
             f32s(chunk * ATTN_SPLIT),
             f32s(DEC_TG * (chunk | 1)),
             f32s(chunk * (DEC_TG / 32) + chunk),
@@ -1147,15 +1222,16 @@ impl MetalEngine {
         let queue = device.new_command_queue();
         let mut source = LowMemSource::open(path)?;
         source.make_gpu_views(&device);
+        let dims = dims_of(&cfg, source.head_dim());
 
-        let shader = shader_source(cfg.kv_dim());
+        let shader = shader_source(dims.kv_dim);
         let lib = device
             .new_library_with_source(&shader, &CompileOptions::new())
             .map_err(|e| format!("failed to compile kernels.metal: {e}"))?;
         // (identical construction to new_with_window below — the dense
         // pipelines keep the fast library and their exact existing code)
         let dense = Self::build_pipelines(&device, &lib, &cfg)?;
-        let win_state = Self::build_win_state(&device, &lib, &cfg, win)?;
+        let win_state = Self::build_win_state(&device, &lib, &cfg, dims.kv_dim, win)?;
 
         // Quant pipelines: precise fast-math-off library, one set per selector
         // present in the file (gguf-kernels doctrine — see lowmem's twin).
@@ -1271,17 +1347,26 @@ impl MetalEngine {
             Ok(QuantLinear { w, w_off, bias, in_dim: in_dim as u32, out_dim: out_dim as u32, sel })
         };
 
-        let (h, kvd, inter) = (cfg.hidden_size, cfg.kv_dim(), cfg.intermediate_size);
+        let (h, kvd, inter) = (cfg.hidden_size, dims.kv_dim, cfg.intermediate_size);
+        let q_dim = dims.q_dim;
         let mut blocks = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{i}");
             blocks.push(QuantBlock {
                 input_layernorm: norm_buf(&format!("{p}.input_layernorm.weight"))?,
                 post_attention_layernorm: norm_buf(&format!("{p}.post_attention_layernorm.weight"))?,
-                q_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.q_proj"), h, h)?,
+                q_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.q_proj"), h, q_dim)?,
                 k_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.k_proj"), h, kvd)?,
                 v_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.v_proj"), h, kvd)?,
-                o_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.o_proj"), h, h)?,
+                o_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.o_proj"), q_dim, h)?,
+                q_norm: match source.has(&format!("{p}.self_attn.q_norm.weight")) {
+                    true => Some(f16_buffer(&device, &source.read_f32(&format!("{p}.self_attn.q_norm.weight"))?)),
+                    false => None,
+                },
+                k_norm: match source.has(&format!("{p}.self_attn.k_norm.weight")) {
+                    true => Some(f16_buffer(&device, &source.read_f32(&format!("{p}.self_attn.k_norm.weight"))?)),
+                    false => None,
+                },
                 gate_proj: qlin(&source, &device, &zero_bias, &format!("{p}.mlp.gate_proj"), h, inter)?,
                 up_proj: qlin(&source, &device, &zero_bias, &format!("{p}.mlp.up_proj"), h, inter)?,
                 down_proj: qlin(&source, &device, &zero_bias, &format!("{p}.mlp.down_proj"), inter, h)?,
@@ -1315,6 +1400,7 @@ impl MetalEngine {
             queue,
             device,
             win: win_state,
+            dims,
             quant: Some(QuantState {
                 source,
                 blocks,
@@ -1339,10 +1425,10 @@ impl MetalEngine {
             None => max_seq + FLASH_C,
         };
         let caches = (0..cfg.num_hidden_layers)
-            .map(|_| f16_empty_buffer(d, kv_slots * cfg.kv_dim()))
+            .map(|_| f16_empty_buffer(d, kv_slots * self.dims.kv_dim))
             .collect::<Vec<_>>();
         let v_caches = (0..cfg.num_hidden_layers)
-            .map(|_| f16_empty_buffer(d, kv_slots * cfg.kv_dim()))
+            .map(|_| f16_empty_buffer(d, kv_slots * self.dims.kv_dim))
             .collect::<Vec<_>>();
         let scratch = self.session_scratch(max_seq);
         self.session_with_cache(max_seq, caches, v_caches, 0, scratch)
@@ -1366,29 +1452,35 @@ impl MetalEngine {
             ids: d.new_buffer((chunk * 4) as u64, MTLResourceOptions::StorageModeShared),
             x: f32_buffer(d, chunk * cfg.hidden_size),
             xn: f32_buffer(d, chunk * cfg.hidden_size),
-            q: f32_buffer(d, chunk * cfg.hidden_size),
-            att: f32_buffer(d, chunk * cfg.hidden_size),
+            // q and attention rows are q_dim wide — qwen3's q_dim (heads x 128)
+            // is 2x hidden, so sizing these by hidden overflows into whatever
+            // the allocator placed next (the first symptom is nondeterminism).
+            q: f32_buffer(d, chunk * cfg.hidden_size.max(self.dims.q_dim)),
+            att: f32_buffer(d, chunk * cfg.hidden_size.max(self.dims.q_dim)),
             xb: f32_buffer(d, chunk * cfg.hidden_size),
             gate: f32_buffer(d, chunk * cfg.intermediate_size),
             up: f32_buffer(d, chunk * cfg.intermediate_size),
             logits: f32_buffer(d, SPEC_MAX * cfg.vocab_size),
             // The flash prefill path never touches scores; keep a 1-float stub so
             // the fallback binding stays valid without the (huge) allocation.
-            scores: if cfg.head_dim() == FLASH_HEAD_DIM {
+            scores: if self.dims.head_dim == FLASH_HEAD_DIM {
                 f32_buffer(d, 1)
             } else {
                 f32_buffer(d, chunk * cfg.num_attention_heads * kv_extent)
             },
             partials: f32_buffer(
                 d,
-                cfg.num_attention_heads * kv_extent.div_ceil(ATTN_SPLIT) * (cfg.head_dim() + 2),
+                cfg.num_attention_heads * kv_extent.div_ceil(ATTN_SPLIT) * (self.dims.head_dim + 2),
             ),
-            xh: f16_empty_buffer(d, chunk * cfg.hidden_size.max(cfg.intermediate_size)),
+            xh: f16_empty_buffer(
+                d,
+                chunk * cfg.hidden_size.max(cfg.intermediate_size).max(self.dims.q_dim),
+            ),
             // Window mode stages fresh K/V rows in f32 here, then scatters them
             // into the ring as f16 spans (lowmem's exact write path). One float
             // of stub keeps the binding cheap when the mode is off.
             kvs: if self.win.is_some() || self.quant.is_some() {
-                f32_buffer(d, 2 * chunk * cfg.kv_dim())
+                f32_buffer(d, 2 * chunk * self.dims.kv_dim)
             } else {
                 f32_buffer(d, 1)
             },
@@ -1516,7 +1608,7 @@ impl MetalSession<'_> {
             Some(w) => w.cfg.slot_of(pos0),
             None => pos0,
         };
-        let kv_byte_off = self.kv_base + (kv_slot0 * cfg.kv_dim() * 2) as u64;
+        let kv_byte_off = self.kv_base + (kv_slot0 * e.dims.kv_dim * 2) as u64;
 
         // Unified memory: write the input straight into the buffer pre-commit.
         match src {
@@ -1529,7 +1621,7 @@ impl MetalSession<'_> {
         }
 
         let cb = e.queue.new_command_buffer();
-        let fused_decode = n == 1 && cfg.head_dim() <= DEC_TG && cfg.head_dim().is_multiple_of(4);
+        let fused_decode = n == 1 && e.dims.head_dim <= DEC_TG && e.dims.head_dim.is_multiple_of(4);
         // Decode keeps the serial encoder (every dispatch depends on the previous
         // one anyway). Prefill uses a concurrent encoder with explicit barriers so
         // independent dispatches — q/k/v projections, the rope pair, gate/up — can
@@ -1554,8 +1646,12 @@ impl MetalSession<'_> {
                 // Same math as the prefill path below, with qkv / swiglu / residual
                 // adds folded into single launches and flash-decoding attention.
                 e.enc_rmsnorm(enc, &self.x, &blk.input_layernorm, &self.xn, 1);
-                let kv_off_elems = (self.kv_base / 2) as usize + kv_slot0 * cfg.kv_dim();
+                let kv_off_elems = (self.kv_base / 2) as usize + kv_slot0 * e.dims.kv_dim;
                 e.enc_qkv(enc, blk, &self.xn, &self.q, &self.k_cache[l], &self.v_cache[l], kv_off_elems);
+                if let (Some(qn), Some(kn)) = (&blk.q_norm, &blk.k_norm) {
+                    e.enc_rmsnorm_dim(enc, &self.q, qn, cfg.num_attention_heads, e.dims.head_dim);
+                    e.enc_rmsnorm_h_inplace(enc, &self.k_cache[l], kv_byte_off, kn, cfg.num_key_value_heads, e.dims.head_dim);
+                }
                 e.enc_rope_qk(enc, &self.q, &self.k_cache[l], kv_byte_off, pos0);
                 e.enc_attention_decode(enc, &self.q, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.partials, &self.att, pos0);
                 e.enc_matvec_acc(enc, &blk.o_proj, &self.att, &self.x);
@@ -1576,12 +1672,17 @@ impl MetalSession<'_> {
                 // into the f32 staging, rope q standalone, then per destination
                 // span convert the rows into the ring as f16 and rotate K there
                 // by its TRUE positions — storage is slots, RoPE is absolute.
-                let kvd = cfg.kv_dim();
-                let hd = cfg.head_dim();
+                let kvd = e.dims.kv_dim;
+                let hd = e.dims.head_dim;
                 let v_base = self.kvs.length() / 2; // bytes: V's half of the staging
                 e.enc_linear(enc, &blk.k_proj, &self.xn, 0, &self.kvs, 0, n, Some(&self.xh), false, conc);
                 e.enc_linear(enc, &blk.v_proj, &self.xn, 0, &self.kvs, v_base, n, Some(&self.xh), false, conc);
                 bar!(&self.q, &self.kvs);
+                if let (Some(qn), Some(kn)) = (&blk.q_norm, &blk.k_norm) {
+                    e.enc_rmsnorm_dim(enc, &self.q, qn, n * cfg.num_attention_heads, hd);
+                    e.enc_rmsnorm_dim(enc, &self.kvs, kn, n * cfg.num_key_value_heads, hd);
+                    bar!(&self.q, &self.kvs);
+                }
                 let rp = RopeParams {
                     head_dim: hd as u32,
                     n_heads: cfg.num_attention_heads as u32,
@@ -1620,9 +1721,16 @@ impl MetalSession<'_> {
                 e.enc_linear_kv(enc, &blk.k_proj, &self.xn, &self.k_cache[l], kv_byte_off, n, Some(&self.xh));
                 e.enc_linear_kv(enc, &blk.v_proj, &self.xn, &self.v_cache[l], kv_byte_off, n, Some(&self.xh));
                 bar!(&self.q, &self.k_cache[l], &self.v_cache[l]);
+                if let (Some(qn), Some(kn)) = (&blk.q_norm, &blk.k_norm) {
+                    // qwen3: every head of q (f32) and the fresh k rows (f16,
+                    // already in the cache) normalize BEFORE RoPE.
+                    e.enc_rmsnorm_dim(enc, &self.q, qn, n * cfg.num_attention_heads, e.dims.head_dim);
+                    e.enc_rmsnorm_h_inplace(enc, &self.k_cache[l], kv_byte_off, kn, n * cfg.num_key_value_heads, e.dims.head_dim);
+                    bar!(&self.q, &self.k_cache[l]);
+                }
                 // One fused launch rotates q (f32) and the fresh k cache rows (f16);
                 // per-element math identical to the separate rope/rope_h dispatches.
-                let hd = cfg.head_dim();
+                let hd = e.dims.head_dim;
                 let rp = RopeQkPrefillParams {
                     head_dim: hd as u32,
                     n_q_heads: cfg.num_attention_heads as u32,
@@ -1644,9 +1752,9 @@ impl MetalSession<'_> {
                     None => self.max_seq,
                 };
                 e.enc_attention(enc, &self.q, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.scores, &self.att, pos0, n, kv_extent, &self.xh);
-                bar!(&self.att, &self.xh);
+                bar!(&self.att, &self.xh, &self.scores);
             }
-            e.enc_linear(enc, &blk.o_proj, &self.att, 0, &self.xb, 0, n, Some(&self.xh), e.cfg.head_dim() != FLASH_HEAD_DIM, conc);
+            e.enc_linear(enc, &blk.o_proj, &self.att, 0, &self.xb, 0, n, Some(&self.xh), e.dims.head_dim != FLASH_HEAD_DIM, conc);
             bar!(&self.xb);
             e.enc_elementwise(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
             bar!(&self.x);
@@ -1765,7 +1873,7 @@ impl MetalSession<'_> {
         let e = self.engine;
         let q = e.quant.as_ref().expect("quant path entered without state");
         let cfg = &e.cfg;
-        let (h, kvd, hd) = (cfg.hidden_size, cfg.kv_dim(), cfg.head_dim());
+        let (h, kvd, hd) = (cfg.hidden_size, e.dims.kv_dim, e.dims.head_dim);
         let kv_slot0 = match &e.win {
             Some(w) => w.cfg.slot_of(pos0),
             None => pos0,
@@ -1821,6 +1929,10 @@ impl MetalSession<'_> {
                 self.enc_qmv(enc, &q.pipe(blk.q_proj.sel).matvec, &blk.q_proj, &self.xn, &self.q, 0);
                 self.enc_qmv(enc, &q.pipe(blk.k_proj.sel).matvec_h, &blk.k_proj, &self.xn, &self.k_cache[l], kv_byte_off);
                 self.enc_qmv(enc, &q.pipe(blk.v_proj.sel).matvec_h, &blk.v_proj, &self.xn, &self.v_cache[l], kv_byte_off);
+                if let (Some(qn), Some(kn)) = (&blk.q_norm, &blk.k_norm) {
+                    e.enc_rmsnorm_dim(enc, &self.q, qn, cfg.num_attention_heads, hd);
+                    e.enc_rmsnorm_h_inplace(enc, &self.k_cache[l], kv_byte_off, kn, cfg.num_key_value_heads, hd);
+                }
                 e.enc_rope_qk(enc, &self.q, &self.k_cache[l], kv_byte_off, pos0);
                 e.enc_attention_decode(enc, &self.q, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.partials, &self.att, pos0);
                 self.enc_qmv(enc, &q.pipe(blk.o_proj.sel).matvec_acc, &blk.o_proj, &self.att, &self.x, 0);
@@ -1847,6 +1959,13 @@ impl MetalSession<'_> {
             self.enc_qmm(enc, &q.pipe(blk.k_proj.sel).matmul_pg, &blk.k_proj, &self.xn, 0, &self.kvs, 0, n);
             self.enc_qmm(enc, &q.pipe(blk.v_proj.sel).matmul_pg, &blk.v_proj, &self.xn, 0, &self.kvs, v_base, n);
             bar!(&self.q, &self.kvs);
+            if let (Some(qn), Some(kn)) = (&blk.q_norm, &blk.k_norm) {
+                // qwen3: per-head norm before RoPE — q in place (f32), k while
+                // still in the f32 staging half (why this precedes the spans).
+                e.enc_rmsnorm_dim(enc, &self.q, qn, n * cfg.num_attention_heads, hd);
+                e.enc_rmsnorm_dim(enc, &self.kvs, kn, n * cfg.num_key_value_heads, hd);
+                bar!(&self.q, &self.kvs);
+            }
             {
                 let rp = RopeParams {
                     head_dim: hd as u32,
@@ -1889,7 +2008,7 @@ impl MetalSession<'_> {
                     None => self.max_seq,
                 };
                 e.enc_attention(enc, &self.q, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.scores, &self.att, pos0, n, kv_extent, &self.xh);
-                bar!(&self.att);
+                bar!(&self.att, &self.scores);
             }
             self.enc_qmm(enc, &q.pipe(blk.o_proj.sel).matmul_pg, &blk.o_proj, &self.att, 0, &self.xb, 0, n);
             bar!(&self.xb);
@@ -1954,7 +2073,7 @@ impl MetalSession<'_> {
     /// converting to the cache's f16 on the way. With unified memory this is the
     /// whole "device transfer".
     pub(crate) fn write_kv(&mut self, layer: usize, pos0: usize, k: &[f32], v: &[f32]) {
-        let kvd = self.engine.cfg.kv_dim();
+        let kvd = self.engine.dims.kv_dim;
         let base = (self.kv_base / 2) as usize;
         unsafe {
             let kp = self.k_cache[layer].contents() as *mut u16;
@@ -1982,7 +2101,7 @@ impl MetalSession<'_> {
     /// on the ANE thread (it needs the f16 rows anyway, to feed the next chunk's
     /// past), which keeps the conversion off the thread driving the GPU.
     pub(crate) fn write_kv_bits(&mut self, layer: usize, pos0: usize, k: &[u16], v: &[u16]) {
-        let kvd = self.engine.cfg.kv_dim();
+        let kvd = self.engine.dims.kv_dim;
         let base = (self.kv_base / 2) as usize;
         unsafe {
             let kp = self.k_cache[layer].contents() as *mut u16;
@@ -2081,11 +2200,11 @@ impl MetalEngine {
     pub(crate) fn make_batcher(&self, n_slots: usize, max_seq: usize) -> Option<MetalBatcher<'_>> {
         let cfg = &self.cfg;
         // The batched kernels are the fused-decode family — same requirements.
-        if cfg.head_dim() > DEC_TG || !cfg.head_dim().is_multiple_of(4) || n_slots > SPEC_MAX {
+        if self.dims.head_dim > DEC_TG || !self.dims.head_dim.is_multiple_of(4) || n_slots > SPEC_MAX {
             return None;
         }
         let d = &self.device;
-        let (h, kvd) = (cfg.hidden_size, cfg.kv_dim());
+        let (h, kvd) = (cfg.hidden_size, self.dims.kv_dim);
         let splits_max = max_seq.div_ceil(ATTN_SPLIT);
         Some(MetalBatcher {
             k_cache: (0..cfg.num_hidden_layers)
@@ -2107,7 +2226,7 @@ impl MetalEngine {
             logits: f32_buffer(d, n_slots * cfg.vocab_size),
             partials: f32_buffer(
                 d,
-                n_slots * cfg.num_attention_heads * splits_max * (cfg.head_dim() + 2),
+                n_slots * cfg.num_attention_heads * splits_max * (self.dims.head_dim + 2),
             ),
             session_scratch: self.session_scratch(max_seq),
             splits_max,
@@ -2121,7 +2240,7 @@ impl MetalBatcher<'_> {
     /// A regular MetalSession whose cache is this pool's `slot` — prefill reuses the
     /// whole existing path (chunked matmul prefill, ANE handoff via write_kv).
     pub(crate) fn slot_session(&self, slot: usize) -> MetalSession<'_> {
-        let kvd = self.engine.cfg.kv_dim();
+        let kvd = self.engine.dims.kv_dim;
         let base = (slot * self.max_seq * kvd * 2) as u64;
         self.engine.session_with_cache(
             self.max_seq,
@@ -2145,7 +2264,7 @@ impl crate::engine::Batcher for MetalBatcher<'_> {
         let cfg = &e.cfg;
         let n = rows.len();
         let h = cfg.hidden_size;
-        let (hd, kvd) = (cfg.head_dim(), cfg.kv_dim());
+        let (hd, kvd) = (self.engine.dims.head_dim, self.engine.dims.kv_dim);
         unsafe {
             let idp = self.ids.contents() as *mut u32;
             let mp = self.meta.contents() as *mut RowMeta;

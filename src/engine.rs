@@ -92,7 +92,16 @@ pub fn create(
         #[cfg(target_os = "macos")]
         // "ane" is the old name for this backend, kept so existing scripts run.
         #[cfg(target_os = "macos")]
-        "hybrid" | "ane" => Ok(Box::new(crate::ane::AneEngine::new(model, model_dir, win)?)),
+        "hybrid" | "ane" => {
+            if model.blocks.first().is_some_and(|b| b.q_norm.is_some()) {
+                return Err(
+                    "this architecture needs per-head q/k RMSNorm, which the ANE prefill \
+                     graphs do not compute — use -b metal or -b lowmem"
+                        .into(),
+                );
+            }
+            Ok(Box::new(crate::ane::AneEngine::new(model, model_dir, win)?))
+        }
         other => Err(format!(
             "unknown backend \"{other}\" — available: cpu{}",
             if cfg!(target_os = "macos") { ", metal, hybrid, lowmem" } else { "" }
@@ -173,7 +182,7 @@ impl Engine for CpuEngine {
     fn session(&self, max_seq: usize) -> crate::Result<Box<dyn Session + '_>> {
         Ok(Box::new(CpuSession {
             model: &self.model,
-            cache: KvCache::new(&self.model.cfg, max_seq),
+            cache: KvCache::new(&self.model.cfg, max_seq, self.model.kv_dim),
         }))
     }
 }
