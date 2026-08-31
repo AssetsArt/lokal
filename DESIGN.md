@@ -284,6 +284,15 @@ kernels dequantize at read time instead. Consequences worth knowing:
 - **A quantized embedding table stays quantized**, gathered and dequantized one
   row per token — the same reasoning that keeps the f16 table off the GPU.
 
+**What a refusal means, and what it does not.** An unsupported quantization is
+reported in ONE sweep — every type the build cannot run, with tensor counts and
+an example each — because a mixed low-bit checkpoint carries several at once and
+raising on the first offender teaches its requirements one re-download at a
+time. Separately: an unsloth-style repo also ships `mmproj-*.gguf` and an MTP
+directory. Those are a multimodal projector and multi-token-prediction weights,
+not part of the text model; lokal loads the text model alone and ignoring them
+is correct, not an omission to be fixed.
+
 Correctness rests on a bit-for-bit oracle rather than on output looking
 reasonable: GPU dequantization is compared against the CPU reference on
 adversarial blocks (subnormal scales, all-zero, max-magnitude) for every type,
