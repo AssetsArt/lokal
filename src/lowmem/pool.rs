@@ -453,13 +453,14 @@ mod quant_oracle {
         Q4_0 = 3,
         Q4K = 4,
         Q6K = 5,
+        Q5K = 6,
     }
 
     impl QType {
         fn blk_elems(self) -> usize {
             match self {
                 QType::Q8_0 | QType::Q4_0 => 32,
-                QType::Q4K | QType::Q6K => 256,
+                QType::Q4K | QType::Q6K | QType::Q5K => 256,
             }
         }
         fn blk_bytes(self) -> usize {
@@ -468,6 +469,7 @@ mod quant_oracle {
                 QType::Q4_0 => 18,
                 QType::Q4K => 144,
                 QType::Q6K => 210,
+                QType::Q5K => 176,
             }
         }
     }
@@ -539,6 +541,33 @@ mod quant_oracle {
                         is += 2;
                     }
                 }
+                QType::Q5K => {
+                    let d = f16_at(blk);
+                    let min = f16_at(&blk[2..]);
+                    let scales = &blk[4..16];
+                    let qh = &blk[16..48];
+                    let qs = &blk[48..176];
+                    let mut is = 0usize;
+                    let (mut u1, mut u2) = (1u8, 2u8);
+                    for j in (0..256).step_by(64) {
+                        let ql = &qs[j / 2..j / 2 + 32];
+                        let (sc, m) = scale_min_k4(is, scales);
+                        let d1 = d * sc as f32;
+                        let m1 = min * m as f32;
+                        let (sc, m) = scale_min_k4(is + 1, scales);
+                        let d2 = d * sc as f32;
+                        let m2 = min * m as f32;
+                        for l in 0..32 {
+                            let hi1: u32 = if qh[l] & u1 != 0 { 16 } else { 0 };
+                            let hi2: u32 = if qh[l] & u2 != 0 { 16 } else { 0 };
+                            y[j + l] = d1 * ((ql[l] & 0x0F) as u32 + hi1) as f32 - m1;
+                            y[j + 32 + l] = d2 * ((ql[l] >> 4) as u32 + hi2) as f32 - m2;
+                        }
+                        is += 2;
+                        u1 <<= 2;
+                        u2 <<= 2;
+                    }
+                }
                 QType::Q6K => {
                     let d = f16_at(&blk[208..]);
                     for n in (0..256).step_by(128) {
@@ -594,7 +623,7 @@ mod quant_oracle {
                         let sb = scale_bytes[variant];
                         match ty {
                             QType::Q8_0 | QType::Q4_0 => b[0..2].copy_from_slice(&sb),
-                            QType::Q4K => {
+                            QType::Q4K | QType::Q5K => {
                                 b[0..2].copy_from_slice(&sb);
                                 b[2..4].copy_from_slice(&scale_bytes[3 - variant + 1]);
                             }
@@ -608,6 +637,9 @@ mod quant_oracle {
                                 QType::Q4K => {
                                     b[4..16].fill(0xFF); // all scale/min bits set
                                     b[16..144].fill(0xFF);
+                                }
+                                QType::Q5K => {
+                                    b[4..176].fill(0xFF); // scales, high bits, nibbles
                                 }
                                 QType::Q6K => {
                                     b[0..192].fill(0xFF);
@@ -635,7 +667,7 @@ mod quant_oracle {
             .new_library_with_source(&gpu::shader_source(128), &opts)
             .expect("kernels.metal compiles");
 
-        for ty in [QType::Q8_0, QType::Q4_0, QType::Q4K, QType::Q6K] {
+        for ty in [QType::Q8_0, QType::Q4_0, QType::Q4K, QType::Q6K, QType::Q5K] {
             let (n_blocks, n_rows) = (8usize, 3usize);
             let cols = n_blocks * ty.blk_elems();
             let row_bytes = n_blocks * ty.blk_bytes();

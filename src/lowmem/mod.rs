@@ -222,13 +222,15 @@ impl LowMemEngine {
                 .new_compute_pipeline_state_with_function(&f)
                 .map_err(|e| format!("kernel {name}: {e}").into())
         };
-        let bf16_pipe = |name: &str| -> crate::Result<ComputePipelineState> {
+        // Weight-encoding selector (LM_W_QTYPE at index 25): 1 = raw bf16 over
+        // the mmap views; 2..6 = the GGUF quant types (those come from the
+        // precise fast-math-off library when the engine wires them).
+        let qtype_pipe = |name: &str, qtype: u32| -> crate::Result<ComputePipelineState> {
             let consts = FunctionConstantValues::new();
-            let yes = true;
             consts.set_constant_value_at_index(
-                &yes as *const bool as *const _,
-                MTLDataType::Bool,
-                24,
+                &qtype as *const u32 as *const _,
+                MTLDataType::UInt,
+                25,
             );
             let f = lib
                 .get_function(name, Some(consts))
@@ -295,10 +297,10 @@ impl LowMemEngine {
             add_inplace: pipe("add_inplace")?,
         };
         let direct = DirectPipes {
-            matvec: bf16_pipe("matvec")?,
-            matvec_h: bf16_pipe("matvec_h")?,
-            matvec_acc: bf16_pipe("matvec_acc")?,
-            matvec_swiglu: bf16_pipe("matvec_swiglu")?,
+            matvec: qtype_pipe("matvec", 1)?,
+            matvec_h: qtype_pipe("matvec_h", 1)?,
+            matvec_acc: qtype_pipe("matvec_acc", 1)?,
+            matvec_swiglu: qtype_pipe("matvec_swiglu", 1)?,
         };
 
         // Small weights (norms, biases): eagerly resident, a few hundred KB —
