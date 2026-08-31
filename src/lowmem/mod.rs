@@ -16,6 +16,7 @@ pub(crate) mod gguf;
 pub(crate) mod qwen35_ref;
 pub(crate) mod iq_grids;
 pub(crate) mod manifest;
+#[allow(dead_code)] // consumers arrive with lane C
 mod pool;
 
 use crate::config::ModelConfig;
