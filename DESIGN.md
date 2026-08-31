@@ -444,6 +444,22 @@ gate now samples both. For resident-decode physics, read the 0.5B rows above —
 those measured clean. To collect the headline on an actually-idle box, see
 `benchmarks/README.md`.
 
+### Design doc, matrix, and the naming rule
+
+The GGUF design doc — the lokal-adapted version of the human's GGUF v2 spec,
+with the backend × format support matrix (every cell proven by running it) —
+is [docs/gguf-design.md](docs/gguf-design.md). GGUF code lives in `src/gguf/`
+(container / dequant / arch / tokenizer): a checkpoint format every backend
+reads, never a backend detail. The CPU deltanet oracle is `src/deltanet_ref.rs`.
+
+**The naming rule (binding for new code):** an architecture name appears ONLY
+where behavior is keyed on the arch string — metadata parsing (`Qwen35Meta`,
+`qwen35_meta`), tokenizer splits, refusal text, and their tests. Everything
+mechanical carries the mechanism's name: `DeltaNetStates`, not `Qwen35States`
+(deltanet is the mechanism; qwen35 is its first user), and never `Hybrid*` for
+non-backend machinery — that word is a backend's name. A mechanism reused by a
+second model must not make the second model wear the first model's name.
+
 ## Where the time goes
 
 "matvec dominates" is a statement about the CPU backend, not about the system.
