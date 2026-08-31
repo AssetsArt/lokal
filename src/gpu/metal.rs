@@ -1054,7 +1054,7 @@ impl MetalEngine {
     }
 
     fn gqa_decode_dims(&self) -> (u64, [u64; 4]) {
-        gqa_decode_dims(&self.cfg)
+        gqa_decode_dims(&self.cfg, self.cfg.head_dim())
     }
 
     fn enc_elementwise(
@@ -1078,7 +1078,7 @@ impl MetalEngine {
 /// kernels: one threadgroup per (kv head × group chunk, window), covering up to
 /// MAX_GQA_CHUNK q heads of one kv head's group. Free function because the
 /// lowmem backend dispatches the same kernels from its own engine.
-pub(crate) fn gqa_decode_dims(cfg: &ModelConfig) -> (u64, [u64; 4]) {
+pub(crate) fn gqa_decode_dims(cfg: &ModelConfig, head_dim: usize) -> (u64, [u64; 4]) {
     let group = cfg.num_attention_heads / cfg.num_key_value_heads;
     let chunk = group.min(MAX_GQA_CHUNK);
     let grid_x = (cfg.num_key_value_heads * group.div_ceil(chunk)) as u64;
@@ -1088,7 +1088,7 @@ pub(crate) fn gqa_decode_dims(cfg: &ModelConfig) -> (u64, [u64; 4]) {
     (
         grid_x,
         [
-            f32s(chunk * cfg.head_dim()),
+            f32s(chunk * head_dim),
             f32s(chunk * ATTN_SPLIT),
             f32s(DEC_TG * (chunk | 1)),
             f32s(chunk * (DEC_TG / 32) + chunk),

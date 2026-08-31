@@ -90,10 +90,11 @@ fn memory_plan(
     } else {
         chunk * cfg.num_attention_heads * win.cap * 4
     };
-    let act_bytes = 5 * chunk * h * 4                    // x, xn, q, att, xb
+    let act_bytes = 3 * chunk * h * 4                    // x, xn, xb
+        + 2 * chunk * dims.q_dim * 4                     // q, att (q_dim != h on qwen3)
         + 2 * chunk * cfg.intermediate_size * 4          // gate, up
         + 2 * chunk * kvd * 4                            // kvs staging
-        + chunk * h * 2                                  // xh
+        + chunk * dims.q_dim * 2                         // xh (o_proj input)
         + scores
         + cfg.num_attention_heads * (win.cap / gpu::ATTN_SPLIT) * (hd + 2) * 4
         + cfg.vocab_size * 4;                            // logits
@@ -843,7 +844,7 @@ impl LowMemEngine {
         unsafe { *(clip_flag.contents() as *mut u32) = 0 };
 
         Ok(Self {
-            gqa: gpu::gqa_decode_dims(&cfg),
+            gqa: gpu::gqa_decode_dims(&cfg, dims.head_dim),
             sync: std::env::var("LOKAL_LOWMEM_SYNC").is_ok_and(|v| v == "1"),
             win,
             clip_flag,

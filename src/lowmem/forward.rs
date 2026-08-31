@@ -125,13 +125,18 @@ impl<'a> LowMemSession<'a> {
                 .collect(),
             x: gpu::f32_buffer(d, chunk * h),
             xn: gpu::f32_buffer(d, chunk * h),
-            q: gpu::f32_buffer(d, chunk * h),
-            att: gpu::f32_buffer(d, chunk * h),
+            // q and att hold per-head rows: chunk * q_dim, which equals
+            // chunk * hidden everywhere EXCEPT qwen3 (explicit head_dim makes
+            // q_dim = 2*hidden on the 0.6B) — sizing them by `h` was a real
+            // overflow, found by Tiësto fixing the same bug in metal (b3bd4db6).
+            q: gpu::f32_buffer(d, chunk * e.dims.q_dim),
+            att: gpu::f32_buffer(d, chunk * e.dims.q_dim),
             xb: gpu::f32_buffer(d, chunk * h),
             gate: gpu::f32_buffer(d, chunk * cfg.intermediate_size),
             up: gpu::f32_buffer(d, chunk * cfg.intermediate_size),
             kvs: gpu::f32_buffer(d, 2 * chunk * kvd),
-            xh: gpu::f16_empty_buffer(d, chunk * h),
+            // xh feeds o_proj with att's half copy — q_dim wide, not hidden.
+            xh: gpu::f16_empty_buffer(d, chunk * e.dims.q_dim),
             scores: if e.dims.head_dim == gpu::FLASH_HEAD_DIM {
                 gpu::f32_buffer(d, 1) // flash path never reads it — stub binding
             } else {
