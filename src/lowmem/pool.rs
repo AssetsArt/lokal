@@ -145,6 +145,24 @@ pub(super) struct WeightPool {
     /// f32→f16 clips past 65504 — flag an overflowing checkpoint once, at the
     /// first page that actually clips (cheaper than a full scan at open).
     overflow_warned: bool,
+    /// Staging counters. A model that fits the pool must stage every page once
+    /// and never again — the residency promise is exactly "zero stage-ins per
+    /// decode step", and a gate cannot assert that from free text.
+    stats: PoolStats,
+}
+
+/// What the pool has moved since it was built. Cheap to copy, so a caller can
+/// snapshot it at a phase boundary and diff the two.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct PoolStats {
+    pub stage_ins: u64,
+    pub stage_bytes: u64,
+    pub evictions: u64,
+    /// Over-budget decode reads that bypassed the pool and streamed straight
+    /// from the checkpoint. These move bus bytes without ever staging a page,
+    /// so a stage-in count alone would call a streaming run resident.
+    pub direct_binds: u64,
+    pub direct_bytes: u64,
 }
 
 impl WeightPool {
@@ -161,7 +179,13 @@ impl WeightPool {
             free: HashMap::new(),
             free_bytes: 0,
             overflow_warned: false,
+            stats: PoolStats::default(),
         }
+    }
+
+    /// Staging counters so far — diff two snapshots to get one phase's traffic.
+    pub fn stats(&self) -> PoolStats {
+        self.stats
     }
 
     /// Stage-ins queued since the last call — the caller encodes them before
@@ -256,6 +280,8 @@ impl WeightPool {
                     .new_buffer(need as u64, MTLResourceOptions::StorageModeShared),
             };
             self.stage(mf, t, *b, &buf)?;
+            self.stats.stage_ins += 1;
+            self.stats.stage_bytes += need as u64;
             self.clock += 1;
             self.used += need;
             self.pages.insert(
@@ -297,6 +323,8 @@ impl WeightPool {
             let (r0, rows) = t.block_rows(block);
             if let Some((view, off)) = mf.gpu_span(&t.name, r0, r0 + rows)? {
                 if off % 4 == 0 {
+                    self.stats.direct_binds += 1;
+                    self.stats.direct_bytes += need as u64;
                     return Ok(Ok(Bind::Direct(view.clone(), off)));
                 }
             }
@@ -343,6 +371,7 @@ impl WeightPool {
                 self.used -= p.bytes;
                 self.free_bytes += p.bytes;
                 self.free.entry(p.bytes).or_default().push(p.buf);
+                self.stats.evictions += 1;
                 Evict::Done
             }
             None if in_flight_only => Evict::AllInFlight,

@@ -10,7 +10,7 @@
 //!     chunk touches at most `chunk` scattered rows, which never justifies
 //!     keeping a vocab × hidden table resident.
 
-use super::pool::{Admit, Bind, PagedTensor, PendingConvert, WeightPool};
+use super::pool::{Admit, Bind, PagedTensor, PendingConvert, PoolStats, WeightPool};
 use super::{LayerWeights, LowMemEngine};
 use crate::engine::Session;
 use crate::gpu::metal as gpu;
@@ -103,6 +103,11 @@ pub(super) struct LowMemSession<'a> {
     scores: Buffer,
     partials: Buffer,
     logits: Buffer, // one row: [vocab]
+    /// Pool counters as they stood when prefill finished, so the drop line can
+    /// report decode's staging on its own. Decode is where residency is proved:
+    /// prefill always stages the model once, decode must stage nothing.
+    mark: PoolStats,
+    decode_steps: u64,
 }
 
 impl<'a> LowMemSession<'a> {
@@ -138,6 +143,8 @@ impl<'a> LowMemSession<'a> {
                 cfg.num_attention_heads * (cap / gpu::ATTN_SPLIT) * (cfg.head_dim() + 2),
             ),
             logits: gpu::f32_buffer(d, cfg.vocab_size),
+            mark: PoolStats::default(),
+            decode_steps: 0,
             e,
             chunk,
         }
@@ -800,6 +807,7 @@ fn plan_decode(
 
 impl Session for LowMemSession<'_> {
     fn forward(&mut self, token: u32, pos: usize) -> crate::Result<Vec<f32>> {
+        self.decode_steps += 1;
         self.run(&[token], pos, true)
     }
 
@@ -813,6 +821,37 @@ impl Session for LowMemSession<'_> {
             logits = self.run(chunk, pos0, last)?;
             pos0 += chunk.len();
         }
+        // The prefill/decode boundary: everything staged from here on is decode
+        // traffic, which is what the residency gate actually measures.
+        if let Ok(pool) = self.e.pool.lock() {
+            self.mark = pool.stats();
+        }
         Ok(logits)
+    }
+}
+
+/// `LOKAL_LOWMEM_STATS=1` prints one structured line per session at drop. It
+/// exists for the residency gate: a checkpoint that fits the pool must show
+/// `decode_stage_ins=0`, and asserting that on a parsed field beats grepping
+/// prose that could change wording under us.
+impl Drop for LowMemSession<'_> {
+    fn drop(&mut self) {
+        if !std::env::var("LOKAL_LOWMEM_STATS").is_ok_and(|v| v == "1") {
+            return;
+        }
+        let Ok(pool) = self.e.pool.lock() else { return };
+        let (end, m) = (pool.stats(), self.mark);
+        eprintln!(
+            "lowmem: stats prefill_stage_ins={} prefill_MB={} decode_stage_ins={} decode_MB={} \
+             decode_direct_binds={} decode_direct_MB={} decode_steps={} evictions={}",
+            m.stage_ins,
+            m.stage_bytes >> 20,
+            end.stage_ins - m.stage_ins,
+            (end.stage_bytes - m.stage_bytes) >> 20,
+            end.direct_binds - m.direct_binds,
+            (end.direct_bytes - m.direct_bytes) >> 20,
+            self.decode_steps,
+            end.evictions,
+        );
     }
 }
