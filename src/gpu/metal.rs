@@ -117,6 +117,8 @@ struct RopeQkParams {
     n_kv_heads: u32,
     pos: u32,
     theta: f32,
+    /// Leading dims that rotate; head_dim except on qwen35 (partial RoPE).
+    rot_dim: u32,
 }
 #[repr(C)]
 struct RopeQkPrefillParams {
@@ -185,6 +187,15 @@ struct Pipelines {
     rope_qk_batch: ComputePipelineState,
     attention_decode_partial_batch: ComputePipelineState,
     attention_decode_reduce_batch: ComputePipelineState,
+    // qwen35's gated-deltanet block — shared kernel source with lowmem, so the
+    // two engines dispatch the SAME code and byte-identity is achievable.
+    ssm_conv_decode: ComputePipelineState,
+    delta_decode_step: ComputePipelineState,
+    delta_gates: ComputePipelineState,
+    l2norm_rows: ComputePipelineState,
+    gated_output_norm: ComputePipelineState,
+    split_q_gate: ComputePipelineState,
+    attn_out_gate: ComputePipelineState,
 }
 
 /// Cached positions per flash-decoding window — must match ATTN_SPLIT in kernels.metal.
@@ -251,6 +262,10 @@ pub struct MetalEngine {
     /// None on every other architecture. Set by the engine constructor that
     /// lane C lands; sessions honor it today.
     pub(crate) deltanet_layout: Option<DeltaNetLayout>,
+    /// The deltanet geometry the kernels take as parameters. Stored as
+    /// DeltaDims (Copy, and what both the kernels and deltanet_ref speak)
+    /// rather than the raw meta, exactly as the lowmem engine does.
+    deltanet_dims: Option<crate::deltanet_ref::DeltaDims>,
     /// True geometry, derived from the checkpoint (qwen3 violates the
     /// hidden/n_heads identity, so cfg.head_dim()/kv_dim() are never read on
     /// hot paths — these are).
@@ -306,16 +321,65 @@ pub(crate) struct QuantLinear {
 pub(crate) struct QuantBlock {
     input_layernorm: Buffer,
     post_attention_layernorm: Buffer,
+    /// What sits between the two norms. Dense checkpoints are `Full` on every
+    /// layer; qwen35 alternates — `Linear` on the gated-deltanet blocks, `Full`
+    /// on one in `full_attention_interval`. The FFN triple below is shared
+    /// because both kinds genuinely carry it.
+    ///
+    /// Same shape as the lowmem side's `AttnWeights` (src/lowmem/mod.rs), and
+    /// deliberately so: two engines walking the same checkpoint should disagree
+    /// about scheduling, not about what a layer IS.
+    attn: QuantAttn,
+    gate_proj: QuantLinear,
+    up_proj: QuantLinear,
+    down_proj: QuantLinear,
+}
+
+/// The two shapes a trunk layer can take on the quant path. An enum rather than
+/// a bag of Options because the arms share no attention tensor at all: a linear
+/// block has no q/k/v/o and an attention block has no conv or recurrent state.
+pub(crate) enum QuantAttn {
+    Full(Box<QuantFullAttn>),
+    Linear(Box<QuantLinearAttn>),
+}
+
+pub(crate) struct QuantFullAttn {
     /// qwen3's per-head q/k RMSNorm weights (f16), pre-RoPE. None elsewhere.
     q_norm: Option<Buffer>,
     k_norm: Option<Buffer>,
+    /// On qwen35 this projects Q and the output gate JOINTLY — out_dim is
+    /// 2·n_heads·head_dim, `[q(hd)|gate(hd)]` interleaved per head.
     q_proj: QuantLinear,
     k_proj: QuantLinear,
     v_proj: QuantLinear,
     o_proj: QuantLinear,
-    gate_proj: QuantLinear,
-    up_proj: QuantLinear,
-    down_proj: QuantLinear,
+}
+
+/// qwen35's gated-deltanet block. Roles transcribed from llama.cpp
+/// (src/models/qwen35.cpp build_linear_attn); mirrors lowmem's `LinearAttn`.
+pub(crate) struct QuantLinearAttn {
+    /// hidden -> conv_channels (2·n_group·d_state + d_inner).
+    qkv: QuantLinear,
+    /// hidden -> d_inner; the `z` that gates the normalised output.
+    z_gate: QuantLinear,
+    /// d_inner -> hidden.
+    out: QuantLinear,
+    /// hidden -> n_v_heads, the delta gate's pre-activation.
+    alpha: QuantLinear,
+    /// hidden -> n_v_heads. THE SIGMOID IS THE KERNEL'S JOB (delta_gates):
+    /// qwen35.cpp:366 activates this projection and deltanet_ref's
+    /// delta_decode_step takes beta already activated.
+    beta: QuantLinear,
+    /// f32, not f16: these are stored F32 and the kernels read them as
+    /// `device const float *` while being gated bit-for-bit against an f32
+    /// reference. [channels][d_conv].
+    conv1d: Buffer,
+    /// [n_v_heads] f32 (ggml's A_NOSCAN).
+    a: Buffer,
+    /// [n_v_heads] f32.
+    dt_bias: Buffer,
+    /// [d_state] f32, the output stage's per-head RMSNorm weight.
+    ssm_norm: Buffer,
 }
 
 /// The pipelines one quant selector dispatches — built from the PRECISE
@@ -368,6 +432,39 @@ struct MatmulPagedParams {
 /// allocator). One live state per sequence: no rollback in v1 — greedy CLI and
 /// per-request serve sessions never rewind (documented limitation; llama.cpp's
 /// snapshot ring is the reference if speculative decoding ever needs it).
+/// The gated-deltanet block's working buffers on the metal path.
+///
+/// Its own buffers, not borrowed ones: conv_channels (6144 on the 2B) is WIDER
+/// than hidden (2048) AND wider than q_proj_dim (4096), so nothing existing is
+/// big enough. Same reasoning — and the same widths — as lowmem's DeltaScratch.
+/// Allocated only when the checkpoint is a deltanet hybrid.
+struct DeltaScratch {
+    qkv: Buffer,
+    z: Buffer,
+    alpha: Buffer,
+    beta_p: Buffer,
+    g: Buffer,
+    beta: Buffer,
+    conv_out: Buffer,
+    dout: Buffer,
+}
+
+impl DeltaScratch {
+    fn new(d: &Device, dims: crate::deltanet_ref::DeltaDims, chunk: usize) -> Self {
+        let (c, inner, hv) = (dims.conv_channels(), dims.d_inner(), dims.n_v_heads);
+        Self {
+            qkv: f32_buffer(d, chunk * c),
+            z: f32_buffer(d, chunk * inner),
+            alpha: f32_buffer(d, chunk * hv),
+            beta_p: f32_buffer(d, chunk * hv),
+            g: f32_buffer(d, hv),
+            beta: f32_buffer(d, hv),
+            conv_out: f32_buffer(d, c),
+            dout: f32_buffer(d, chunk * inner),
+        }
+    }
+}
+
 pub(crate) struct DeltaNetStates {
     /// Index = trunk layer id. None = full-attention layer (KV lives there instead).
     pub layers: Vec<Option<DeltaNetLayerState>>,
@@ -405,6 +502,13 @@ impl DeltaNetLayout {
             conv_elems: m.conv_state_elems,
             delta_elems: m.delta_state_elems,
         }
+    }
+}
+
+impl MetalEngine {
+    /// The deltanet geometry, or None on a non-hybrid checkpoint.
+    fn deltanet_dims(&self) -> Option<crate::deltanet_ref::DeltaDims> {
+        self.deltanet_dims
     }
 }
 
@@ -651,6 +755,13 @@ impl MetalEngine {
             attention_decode_reduce: pipe("attention_decode_reduce")?,
             silu_mul: pipe("silu_mul")?,
             add_inplace: pipe("add_inplace")?,
+            ssm_conv_decode: pipe("ssm_conv_decode")?,
+            delta_decode_step: pipe("delta_decode_step")?,
+            delta_gates: pipe("delta_gates")?,
+            l2norm_rows: pipe("l2norm_rows")?,
+            gated_output_norm: pipe("gated_output_norm")?,
+            split_q_gate: pipe("split_q_gate")?,
+            attn_out_gate: pipe("attn_out_gate")?,
             matvec_qkv_batch: default_spec("matvec_qkv_batch")?,
             matvec_acc_batch: default_spec("matvec_acc_batch")?,
             matvec_swiglu_batch: default_spec("matvec_swiglu_batch")?,
@@ -782,6 +893,7 @@ impl MetalEngine {
             win: win_state,
             quant: None,
             deltanet_layout: None,
+            deltanet_dims: None,
             dims,
             pipes,
             blocks,
@@ -1208,18 +1320,22 @@ impl MetalEngine {
         pos: usize,
     ) {
         let hd = self.dims.head_dim;
+        let rot = self.dims.rot_dim; // == hd except on qwen35 (partial RoPE)
         let p = RopeQkParams {
             head_dim: hd as u32,
             n_q_heads: self.cfg.num_attention_heads as u32,
             n_kv_heads: self.cfg.num_key_value_heads as u32,
             pos: pos as u32,
             theta: self.cfg.rope_theta,
+            rot_dim: rot as u32,
         };
         enc.set_compute_pipeline_state(&self.pipes.rope_qk_decode);
         enc.set_buffer(0, Some(q), 0);
         enc.set_buffer(1, Some(k_cache), kv_byte_off);
         enc.set_bytes(2, size_of::<RopeQkParams>() as u64, &p as *const _ as *const _);
-        dispatch_grid(enc, (self.cfg.num_attention_heads + self.cfg.num_key_value_heads) * hd / 2);
+        // Grid sized by rot_dim/2: the tail threads must not exist, or they
+        // would rotate exactly the dims that have to pass through.
+        dispatch_grid(enc, (self.cfg.num_attention_heads + self.cfg.num_key_value_heads) * rot / 2);
     }
 
     /// Decode-only attention (n_rows = 1): flash-decoding split. Falls back to the
@@ -1505,25 +1621,55 @@ impl MetalEngine {
         };
 
         let (h, kvd, inter) = (cfg.hidden_size, dims.kv_dim, cfg.intermediate_size);
-        let q_dim = dims.q_dim;
+        let q_dim = dims.q_proj_dim; // joint Q+gate on qwen35; == q_dim elsewhere
+        // qwen35's recurrency map decides which shape each trunk layer takes.
+        // None on every other checkpoint, which then takes the Full arm for all
+        // layers exactly as before.
+        let q35 = source.qwen35();
+        let f32_buf = |name: &str| -> crate::Result<Buffer> {
+            Ok(f32_buffer_from(&device, &source.read_f32(name)?))
+        };
         let mut blocks = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{i}");
+            let recurrent = q35.as_ref().is_some_and(|m| m.is_recurrent[i]);
+            let attn = if recurrent {
+                let m = q35.as_ref().expect("recurrent implies qwen35 meta");
+                let conv_channels = 2 * m.n_group * m.d_state + m.d_inner;
+                QuantAttn::Linear(Box::new(QuantLinearAttn {
+                    qkv: qlin(&source, &device, &zero_bias, &format!("{p}.gguf.attn_qkv"), h, conv_channels)?,
+                    z_gate: qlin(&source, &device, &zero_bias, &format!("{p}.gguf.attn_gate"), h, m.d_inner)?,
+                    out: qlin(&source, &device, &zero_bias, &format!("{p}.gguf.ssm_out"), m.d_inner, h)?,
+                    alpha: qlin(&source, &device, &zero_bias, &format!("{p}.gguf.ssm_alpha"), h, m.dt_rank)?,
+                    beta: qlin(&source, &device, &zero_bias, &format!("{p}.gguf.ssm_beta"), h, m.dt_rank)?,
+                    conv1d: f32_buf(&format!("{p}.gguf.ssm_conv1d.weight"))?,
+                    a: f32_buf(&format!("{p}.gguf.ssm_a"))?,
+                    dt_bias: f32_buf(&format!("{p}.gguf.ssm_dt.bias"))?,
+                    ssm_norm: f32_buf(&format!("{p}.gguf.ssm_norm.weight"))?,
+                }))
+            } else {
+                QuantAttn::Full(Box::new(QuantFullAttn {
+                    q_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.q_proj"), h, q_dim)?,
+                    k_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.k_proj"), h, kvd)?,
+                    v_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.v_proj"), h, kvd)?,
+                    o_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.o_proj"), dims.q_dim, h)?,
+                    q_norm: match source.has(&format!("{p}.self_attn.q_norm.weight")) {
+                        true => Some(f16_buffer(&device, &source.read_f32(&format!("{p}.self_attn.q_norm.weight"))?)),
+                        false => None,
+                    },
+                    k_norm: match source.has(&format!("{p}.self_attn.k_norm.weight")) {
+                        true => Some(f16_buffer(&device, &source.read_f32(&format!("{p}.self_attn.k_norm.weight"))?)),
+                        false => None,
+                    },
+                }))
+            };
             blocks.push(QuantBlock {
                 input_layernorm: norm_buf(&format!("{p}.input_layernorm.weight"))?,
-                post_attention_layernorm: norm_buf(&format!("{p}.post_attention_layernorm.weight"))?,
-                q_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.q_proj"), h, q_dim)?,
-                k_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.k_proj"), h, kvd)?,
-                v_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.v_proj"), h, kvd)?,
-                o_proj: qlin(&source, &device, &zero_bias, &format!("{p}.self_attn.o_proj"), q_dim, h)?,
-                q_norm: match source.has(&format!("{p}.self_attn.q_norm.weight")) {
-                    true => Some(f16_buffer(&device, &source.read_f32(&format!("{p}.self_attn.q_norm.weight"))?)),
-                    false => None,
-                },
-                k_norm: match source.has(&format!("{p}.self_attn.k_norm.weight")) {
-                    true => Some(f16_buffer(&device, &source.read_f32(&format!("{p}.self_attn.k_norm.weight"))?)),
-                    false => None,
-                },
+                post_attention_layernorm: norm_buf(&match q35.is_some() {
+                    true => format!("{p}.gguf.post_attention_norm.weight"),
+                    false => format!("{p}.post_attention_layernorm.weight"),
+                })?,
+                attn,
                 gate_proj: qlin(&source, &device, &zero_bias, &format!("{p}.mlp.gate_proj"), h, inter)?,
                 up_proj: qlin(&source, &device, &zero_bias, &format!("{p}.mlp.up_proj"), h, inter)?,
                 down_proj: qlin(&source, &device, &zero_bias, &format!("{p}.mlp.down_proj"), inter, h)?,
@@ -1557,7 +1703,13 @@ impl MetalEngine {
             queue,
             device,
             win: win_state,
-            deltanet_layout: None, // lane C's constructor sets this for qwen35 files
+            deltanet_layout: q35.as_ref().map(DeltaNetLayout::from_meta),
+            deltanet_dims: q35.as_ref().map(|m| crate::deltanet_ref::DeltaDims {
+                d_state: m.d_state,
+                n_v_heads: m.dt_rank,
+                n_k_heads: m.n_group,
+                d_conv: m.d_conv,
+            }),
             dims,
             quant: Some(QuantState {
                 source,
@@ -1672,6 +1824,14 @@ impl MetalEngine {
             xh,
             kvs,
             deltanet: self.deltanet_layout.as_ref().map(|l| DeltaNetStates::new(&self.device, l)),
+            ds: self
+                .deltanet_dims()
+                .map(|dd| DeltaScratch::new(&self.device, dd, PREFILL_CHUNK.min(max_seq))),
+            qg: (self.dims.q_proj_dim != self.dims.q_dim).then(|| {
+                let chunk = PREFILL_CHUNK.min(max_seq);
+                (f32_buffer(&self.device, chunk * self.dims.q_dim),
+                 f32_buffer(&self.device, chunk * self.dims.q_dim))
+            }),
             k_cache,
             v_cache,
             kv_base,
@@ -1728,6 +1888,11 @@ pub(crate) struct MetalSession<'a> {
     kvs: Buffer,      // window mode: fresh K/V f32 staging before the ring scatter
     /// qwen35: the per-linear-layer recurrent states (None elsewhere).
     deltanet: Option<DeltaNetStates>,
+    /// Deltanet working buffers; None on every non-hybrid checkpoint.
+    ds: Option<DeltaScratch>,
+    /// Joint Q+gate de-interleaved: (compact q, gate). None unless the
+    /// projection is wider than attention (qwen35).
+    qg: Option<(Buffer, Buffer)>,
     k_cache: Vec<Buffer>,
     v_cache: Vec<Buffer>,
     kv_base: u64, // byte offset of this session's slot when the cache is pooled
@@ -2025,6 +2190,177 @@ impl MetalSession<'_> {
     /// the span writer already switch on it), weights dequantized on read via
     /// the precise-library pipelines. Embeddings gather on the CPU per token
     /// through dequant_row_ref — no f16 table exists.
+    /// The deltanet scratch, which every caller below has already established
+    /// exists (a Linear arm implies a deltanet checkpoint implies the scratch).
+    fn ds_ref(&self) -> &DeltaScratch {
+        self.ds.as_ref().expect("a deltanet layer implies deltanet scratch")
+    }
+
+    /// De-interleave the joint Q+gate projection, returning the buffer the
+    /// attention path should treat as Q. A no-op returning `self.q` on every
+    /// checkpoint whose projection is not joint.
+    fn enc_split_qg(&self, enc: &ComputeCommandEncoderRef, n: usize, conc: bool) -> &Buffer {
+        let Some((qc, gate)) = &self.qg else { return &self.q };
+        let e = self.engine;
+        let (hd, heads) = (e.dims.head_dim, e.cfg.num_attention_heads);
+        #[repr(C)]
+        struct QGSplitParams {
+            head_dim: u32,
+            n_heads: u32,
+            n_rows: u32,
+        }
+        // WAR ORDERING, and the reason this lane's oracle went red at long prompts:
+        // the PREVIOUS attention layer READ this same `gate` buffer in
+        // enc_apply_qgate. On a concurrent encoder nothing stops this layer's
+        // write from landing before that read retires, and the deltanet layers
+        // in between are not a barrier — they touch different resources. So the
+        // buffers are ordered BEFORE the write, not only after it.
+        if conc {
+            enc.memory_barrier_with_resources(&[qc, gate]);
+        }
+        enc.set_compute_pipeline_state(&e.pipes.split_q_gate);
+        enc.set_buffer(0, Some(&self.q), 0);
+        enc.set_buffer(1, Some(qc), 0);
+        enc.set_buffer(2, Some(gate), 0);
+        let p = QGSplitParams { head_dim: hd as u32, n_heads: heads as u32, n_rows: n as u32 };
+        enc.set_bytes(3, size_of::<QGSplitParams>() as u64, &p as *const _ as *const _);
+        dispatch_grid(enc, n * heads * hd);
+        if conc {
+            enc.memory_barrier_with_resources(&[qc, gate]);
+        }
+        qc
+    }
+
+    /// attn · sigmoid(gate), applied AFTER attention and BEFORE wo
+    /// (qwen35.cpp:327-331). A no-op elsewhere.
+    fn enc_apply_qgate(&self, enc: &ComputeCommandEncoderRef, n: usize, conc: bool) {
+        let Some((_, gate)) = &self.qg else { return };
+        let e = self.engine;
+        let n_elem = n * e.dims.q_dim;
+        enc.set_compute_pipeline_state(&e.pipes.attn_out_gate);
+        enc.set_buffer(0, Some(&self.att), 0);
+        enc.set_buffer(1, Some(gate), 0);
+        let n32 = n_elem as u32;
+        enc.set_bytes(2, 4, &n32 as *const u32 as *const _);
+        dispatch_grid(enc, n_elem);
+        if conc {
+            enc.memory_barrier_with_resources(&[&self.att]);
+        }
+    }
+
+    /// qwen35's gated-deltanet block for `n` already-projected tokens.
+    ///
+    /// THE BARRIERS ARE THE WHOLE DIFFICULTY OF THIS PORT. lowmem runs this on a
+    /// SERIAL encoder and gets ordering for free. Metal's prefill encoder is
+    /// CONCURRENT, and this chain is strictly sequential twice over: each stage
+    /// reads the previous stage's output, AND both recurrent states are
+    /// read-modify-written IN PLACE across the token loop — token t+1's conv
+    /// reads the window token t just rolled, and its delta step reads the state
+    /// token t just mutated. So there is a barrier between every stage and, the
+    /// part that is easy to miss, between every TOKEN.
+    ///
+    /// A missing barrier here does not crash; it produces output that still
+    /// looks like text. The window-mode lane hit exactly this porting lowmem's
+    /// attention into this encoder, and only byte-identity on a tiny prompt
+    /// caught it. That is why this lane's oracle is metal==lowmem byte-identical
+    /// over 4+ runs per side rather than one run of eyeballed text.
+    fn enc_delta_block(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        la: &QuantLinearAttn,
+        l: usize,
+        n: usize,
+        conc: bool,
+    ) {
+        let e = self.engine;
+        let d = e.deltanet_dims().expect("deltanet dims on a deltanet checkpoint");
+        let ds = self.ds_ref();
+        let st = self.deltanet.as_ref().expect("deltanet states").layers[l]
+            .as_ref()
+            .expect("every linear layer owns recurrent state");
+        let eps = e.cfg.rms_norm_eps;
+        let (s_dim, hv, hk) = (d.d_state, d.n_v_heads, d.n_k_heads);
+        let (key_dim, inner, c_all) = (s_dim * hk, d.d_inner(), d.conv_channels());
+        macro_rules! bar {
+            ($($b:expr),+) => { if conc { enc.memory_barrier_with_resources(&[$($b),+]) } };
+        }
+
+        for t in 0..n {
+            let (goff, coff, zoff) =
+                ((t * hv * 4) as u64, (t * c_all * 4) as u64, (t * inner * 4) as u64);
+
+            enc.set_compute_pipeline_state(&e.pipes.delta_gates);
+            enc.set_buffer(0, Some(&ds.alpha), goff);
+            enc.set_buffer(1, Some(&ds.beta_p), goff);
+            enc.set_buffer(2, Some(&la.a), 0);
+            enc.set_buffer(3, Some(&la.dt_bias), 0);
+            enc.set_buffer(4, Some(&ds.g), 0);
+            enc.set_buffer(5, Some(&ds.beta), 0);
+            let hv32 = hv as u32;
+            enc.set_bytes(6, 4, &hv32 as *const u32 as *const _);
+            dispatch_grid(enc, hv);
+            bar!(&ds.g, &ds.beta);
+
+            #[repr(C)]
+            struct SsmConvParams {
+                channels: u32,
+                d_conv: u32,
+            }
+            enc.set_compute_pipeline_state(&e.pipes.ssm_conv_decode);
+            enc.set_buffer(0, Some(&st.conv), 0);
+            enc.set_buffer(1, Some(&ds.qkv), coff);
+            enc.set_buffer(2, Some(&la.conv1d), 0);
+            enc.set_buffer(3, Some(&ds.conv_out), 0);
+            let cp = SsmConvParams { channels: c_all as u32, d_conv: d.d_conv as u32 };
+            enc.set_bytes(4, size_of::<SsmConvParams>() as u64, &cp as *const _ as *const _);
+            dispatch_grid(enc, c_all);
+            bar!(&ds.conv_out, &st.conv);
+
+            let s32 = s_dim as u32;
+            for off in [0u64, (key_dim * 4) as u64] {
+                enc.set_compute_pipeline_state(&e.pipes.l2norm_rows);
+                enc.set_buffer(0, Some(&ds.conv_out), off);
+                enc.set_bytes(1, 4, &s32 as *const u32 as *const _);
+                enc.set_bytes(2, 4, &eps as *const f32 as *const _);
+                enc.dispatch_thread_groups(MTLSize::new(hk as u64, 1, 1), MTLSize::new(256, 1, 1));
+            }
+            bar!(&ds.conv_out);
+
+            #[repr(C)]
+            struct DeltaStepParams {
+                d_state: u32,
+                n_v_heads: u32,
+                group: u32,
+            }
+            enc.set_compute_pipeline_state(&e.pipes.delta_decode_step);
+            enc.set_buffer(0, Some(&st.delta), 0);
+            enc.set_buffer(1, Some(&ds.conv_out), 0);
+            enc.set_buffer(2, Some(&ds.conv_out), (key_dim * 4) as u64);
+            enc.set_buffer(3, Some(&ds.conv_out), (2 * key_dim * 4) as u64);
+            enc.set_buffer(4, Some(&ds.g), 0);
+            enc.set_buffer(5, Some(&ds.beta), 0);
+            enc.set_buffer(6, Some(&ds.dout), zoff);
+            let dp = DeltaStepParams {
+                d_state: s32,
+                n_v_heads: hv as u32,
+                group: (hv / hk) as u32,
+            };
+            enc.set_bytes(7, size_of::<DeltaStepParams>() as u64, &dp as *const _ as *const _);
+            dispatch_grid(enc, s_dim * hv);
+            bar!(&ds.dout, &st.delta);
+
+            enc.set_compute_pipeline_state(&e.pipes.gated_output_norm);
+            enc.set_buffer(0, Some(&ds.dout), zoff);
+            enc.set_buffer(1, Some(&la.ssm_norm), 0);
+            enc.set_buffer(2, Some(&ds.z), zoff);
+            enc.set_bytes(3, 4, &s32 as *const u32 as *const _);
+            enc.set_bytes(4, 4, &eps as *const f32 as *const _);
+            enc.dispatch_thread_groups(MTLSize::new(hv as u64, 1, 1), MTLSize::new(256, 1, 1));
+            // Closing the token: the next iteration reads BOTH states in place.
+            bar!(&ds.dout, &st.conv, &st.delta);
+        }
+    }
+
     fn run_from_quant(
         &mut self,
         src: Source<'_>,
@@ -2086,19 +2422,37 @@ impl MetalSession<'_> {
         }
 
         let v_base = self.kvs.length() / 2;
+        let rot = e.dims.rot_dim; // == hd except on qwen35 (partial rope)
         for (l, blk) in q.blocks.iter().enumerate().skip(layer0) {
             if fused_decode {
                 e.enc_rmsnorm(enc, &self.x, &blk.input_layernorm, &self.xn, 1);
-                self.enc_qmv(enc, &q.pipe(blk.q_proj.sel).matvec, &blk.q_proj, &self.xn, &self.q, 0);
-                self.enc_qmv(enc, &q.pipe(blk.k_proj.sel).matvec_h, &blk.k_proj, &self.xn, &self.k_cache[l], kv_byte_off);
-                self.enc_qmv(enc, &q.pipe(blk.v_proj.sel).matvec_h, &blk.v_proj, &self.xn, &self.v_cache[l], kv_byte_off);
-                if let (Some(qn), Some(kn)) = (&blk.q_norm, &blk.k_norm) {
-                    e.enc_rmsnorm_dim(enc, &self.q, qn, cfg.num_attention_heads, hd);
+                match &blk.attn {
+                    QuantAttn::Linear(la) => {
+                        // Gated-deltanet block: four projections, the six-kernel
+                        // chain one token at a time, then the out projection
+                        // accumulated straight into x (what o_proj does below).
+                        self.enc_qmv(enc, &q.pipe(la.qkv.sel).matvec, &la.qkv, &self.xn, &self.ds_ref().qkv, 0);
+                        self.enc_qmv(enc, &q.pipe(la.z_gate.sel).matvec, &la.z_gate, &self.xn, &self.ds_ref().z, 0);
+                        self.enc_qmv(enc, &q.pipe(la.alpha.sel).matvec, &la.alpha, &self.xn, &self.ds_ref().alpha, 0);
+                        self.enc_qmv(enc, &q.pipe(la.beta.sel).matvec, &la.beta, &self.xn, &self.ds_ref().beta_p, 0);
+                        self.enc_delta_block(enc, la, l, 1, conc);
+                        self.enc_qmv(enc, &q.pipe(la.out.sel).matvec_acc, &la.out, &self.ds_ref().dout, &self.x, 0);
+                    }
+                    QuantAttn::Full(fa) => {
+                self.enc_qmv(enc, &q.pipe(fa.q_proj.sel).matvec, &fa.q_proj, &self.xn, &self.q, 0);
+                let qbuf = self.enc_split_qg(enc, 1, conc);
+                self.enc_qmv(enc, &q.pipe(fa.k_proj.sel).matvec_h, &fa.k_proj, &self.xn, &self.k_cache[l], kv_byte_off);
+                self.enc_qmv(enc, &q.pipe(fa.v_proj.sel).matvec_h, &fa.v_proj, &self.xn, &self.v_cache[l], kv_byte_off);
+                if let (Some(qn), Some(kn)) = (&fa.q_norm, &fa.k_norm) {
+                    e.enc_rmsnorm_dim(enc, qbuf, qn, cfg.num_attention_heads, hd);
                     e.enc_rmsnorm_h_inplace(enc, &self.k_cache[l], kv_byte_off, kn, cfg.num_key_value_heads, hd);
                 }
-                e.enc_rope_qk(enc, &self.q, &self.k_cache[l], kv_byte_off, pos0);
-                e.enc_attention_decode(enc, &self.q, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.partials, &self.att, pos0);
-                self.enc_qmv(enc, &q.pipe(blk.o_proj.sel).matvec_acc, &blk.o_proj, &self.att, &self.x, 0);
+                e.enc_rope_qk(enc, qbuf, &self.k_cache[l], kv_byte_off, pos0);
+                e.enc_attention_decode(enc, qbuf, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.partials, &self.att, pos0);
+                self.enc_apply_qgate(enc, 1, conc);
+                self.enc_qmv(enc, &q.pipe(fa.o_proj.sel).matvec_acc, &fa.o_proj, &self.att, &self.x, 0);
+                    }
+                }
                 e.enc_rmsnorm(enc, &self.x, &blk.post_attention_layernorm, &self.xn, 1);
                 // gate/up dispatch separately: a mixed-quant file may hold the
                 // two halves in different encodings, and matvec_swiglu assumes
@@ -2118,67 +2472,103 @@ impl MetalSession<'_> {
             // Prefill: rmsnorm (f32), quant GEMMs, staged K/V into the cache.
             e.enc_rmsnorm(enc, &self.x, &blk.input_layernorm, &self.xn, n);
             bar!(&self.xn);
-            self.enc_qmm(enc, &q.pipe(blk.q_proj.sel).matmul_pg, &blk.q_proj, &self.xn, 0, &self.q, 0, n);
-            self.enc_qmm(enc, &q.pipe(blk.k_proj.sel).matmul_pg, &blk.k_proj, &self.xn, 0, &self.kvs, 0, n);
-            self.enc_qmm(enc, &q.pipe(blk.v_proj.sel).matmul_pg, &blk.v_proj, &self.xn, 0, &self.kvs, v_base, n);
-            bar!(&self.q, &self.kvs);
-            if let (Some(qn), Some(kn)) = (&blk.q_norm, &blk.k_norm) {
-                // qwen3: per-head norm before RoPE — q in place (f32), k while
-                // still in the f32 staging half (why this precedes the spans).
-                e.enc_rmsnorm_dim(enc, &self.q, qn, n * cfg.num_attention_heads, hd);
-                e.enc_rmsnorm_dim(enc, &self.kvs, kn, n * cfg.num_key_value_heads, hd);
+            let attn_out_done = match &blk.attn {
+                QuantAttn::Linear(la) => {
+                    // Gated-deltanet block, prefill form: the four projections,
+                    // then the decode-form chain token by token (plan v1), then
+                    // the out projection and the residual add.
+                    self.enc_qmm(enc, &q.pipe(la.qkv.sel).matmul_pg, &la.qkv, &self.xn, 0, &self.ds_ref().qkv, 0, n);
+                    self.enc_qmm(enc, &q.pipe(la.z_gate.sel).matmul_pg, &la.z_gate, &self.xn, 0, &self.ds_ref().z, 0, n);
+                    self.enc_qmm(enc, &q.pipe(la.alpha.sel).matmul_pg, &la.alpha, &self.xn, 0, &self.ds_ref().alpha, 0, n);
+                    self.enc_qmm(enc, &q.pipe(la.beta.sel).matmul_pg, &la.beta, &self.xn, 0, &self.ds_ref().beta_p, 0, n);
+                    bar!(&self.ds_ref().qkv, &self.ds_ref().z, &self.ds_ref().alpha, &self.ds_ref().beta_p);
+                    self.enc_delta_block(enc, la, l, n, conc);
+                    bar!(&self.ds_ref().dout);
+                    self.enc_qmm(enc, &q.pipe(la.out.sel).matmul_pg, &la.out, &self.ds_ref().dout, 0, &self.xb, 0, n);
+                    bar!(&self.xb);
+                    e.enc_elementwise(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
+                    bar!(&self.x);
+                }
+                QuantAttn::Full(fa) => {
+                self.enc_qmm(enc, &q.pipe(fa.q_proj.sel).matmul_pg, &fa.q_proj, &self.xn, 0, &self.q, 0, n);
+                self.enc_qmm(enc, &q.pipe(fa.k_proj.sel).matmul_pg, &fa.k_proj, &self.xn, 0, &self.kvs, 0, n);
+                self.enc_qmm(enc, &q.pipe(fa.v_proj.sel).matmul_pg, &fa.v_proj, &self.xn, 0, &self.kvs, v_base, n);
                 bar!(&self.q, &self.kvs);
-            }
-            {
-                let rp = RopeParams {
-                    head_dim: hd as u32,
-                    n_heads: cfg.num_attention_heads as u32,
-                    pos0: pos0 as u32,
-                    theta: cfg.rope_theta,
-                    n_rows: n as u32,
-                    rot_dim: hd as u32,
+                // qwen35 projects Q and the output gate together, interleaved per
+                // head; split once so qk-norm, RoPE and attention keep seeing an
+                // ordinary compact Q. A no-op on every other checkpoint.
+                let qbuf = self.enc_split_qg(enc, n, conc);
+                if let (Some(qn), Some(kn)) = (&fa.q_norm, &fa.k_norm) {
+                    // qwen3: per-head norm before RoPE — q in place (f32), k while
+                    // still in the f32 staging half (why this precedes the spans).
+                    //
+                    // NORMALIZE `qbuf`, NEVER `self.q`. On a joint Q+gate
+                    // checkpoint (qwen35) enc_split_qg has already drained
+                    // self.q into the compact q/gate pair and nothing reads it
+                    // again, so norming self.q here writes to a dead buffer and
+                    // hands attention an UN-NORMALIZED Q — fluent, wrong output
+                    // on prefill only, which is what this lane spent a session
+                    // chasing. On every other arch qbuf IS self.q, so `qbuf` is
+                    // correct in both cases and `self.q` is correct in only one.
+                    // The decode half below has always used qbuf; keep them same.
+                    e.enc_rmsnorm_dim(enc, qbuf, qn, n * cfg.num_attention_heads, hd);
+                    e.enc_rmsnorm_dim(enc, &self.kvs, kn, n * cfg.num_key_value_heads, hd);
+                    bar!(qbuf, &self.kvs);
+                }
+                {
+                    let rp = RopeParams {
+                        head_dim: hd as u32,
+                        n_heads: cfg.num_attention_heads as u32,
+                        pos0: pos0 as u32,
+                        theta: cfg.rope_theta,
+                        n_rows: n as u32,
+                        rot_dim: rot as u32,
+                    };
+                    enc.set_compute_pipeline_state(&e.pipes.rope);
+                    enc.set_buffer(0, Some(qbuf), 0);
+                    enc.set_bytes(1, size_of::<RopeParams>() as u64, &rp as *const _ as *const _);
+                    dispatch_grid(enc, n * cfg.num_attention_heads * rot / 2);
+                }
+                let spans: Vec<(usize, usize, usize)> = match &e.win {
+                    Some(w) => win_write_spans(&w.cfg, pos0, n),
+                    None => vec![(0, pos0, n)],
                 };
-                enc.set_compute_pipeline_state(&e.pipes.rope);
-                enc.set_buffer(0, Some(&self.q), 0);
-                enc.set_bytes(1, size_of::<RopeParams>() as u64, &rp as *const _ as *const _);
-                dispatch_grid(enc, n * cfg.num_attention_heads * hd / 2);
-            }
-            let spans: Vec<(usize, usize, usize)> = match &e.win {
-                Some(w) => win_write_spans(&w.cfg, pos0, n),
-                None => vec![(0, pos0, n)],
+                for &(row, slot, len) in &spans {
+                    let src_off = (row * kvd * 4) as u64;
+                    let dst_off = self.kv_base + (slot * kvd * 2) as u64;
+                    e.enc_f32_to_f16(enc, &self.kvs, src_off, &self.k_cache[l], dst_off, len * kvd);
+                    e.enc_f32_to_f16(enc, &self.kvs, v_base + src_off, &self.v_cache[l], dst_off, len * kvd);
+                    bar!(&self.k_cache[l]);
+                    let rp = RopeParams {
+                        head_dim: hd as u32,
+                        n_heads: cfg.num_key_value_heads as u32,
+                        pos0: (pos0 + row) as u32,
+                        theta: cfg.rope_theta,
+                        n_rows: len as u32,
+                        rot_dim: rot as u32,
+                    };
+                    enc.set_compute_pipeline_state(&e.pipes.rope_h);
+                    enc.set_buffer(0, Some(&self.k_cache[l]), dst_off);
+                    enc.set_bytes(1, size_of::<RopeParams>() as u64, &rp as *const _ as *const _);
+                    dispatch_grid(enc, len * cfg.num_key_value_heads * hd / 2);
+                }
+                bar!(qbuf, &self.k_cache[l], &self.v_cache[l], &self.kvs);
+                {
+                    let kv_extent = match &e.win {
+                        Some(w) => w.cfg.cap,
+                        None => self.max_seq,
+                    };
+                    e.enc_attention(enc, qbuf, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.scores, &self.att, pos0, n, kv_extent, &self.xh);
+                    bar!(&self.att, &self.scores);
+                }
+                self.enc_apply_qgate(enc, n, conc);
+                self.enc_qmm(enc, &q.pipe(fa.o_proj.sel).matmul_pg, &fa.o_proj, &self.att, 0, &self.xb, 0, n);
+                bar!(&self.xb);
+                e.enc_elementwise(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
+                bar!(&self.x);
+                }
             };
-            for &(row, slot, len) in &spans {
-                let src_off = (row * kvd * 4) as u64;
-                let dst_off = self.kv_base + (slot * kvd * 2) as u64;
-                e.enc_f32_to_f16(enc, &self.kvs, src_off, &self.k_cache[l], dst_off, len * kvd);
-                e.enc_f32_to_f16(enc, &self.kvs, v_base + src_off, &self.v_cache[l], dst_off, len * kvd);
-                bar!(&self.k_cache[l]);
-                let rp = RopeParams {
-                    head_dim: hd as u32,
-                    n_heads: cfg.num_key_value_heads as u32,
-                    pos0: (pos0 + row) as u32,
-                    theta: cfg.rope_theta,
-                    n_rows: len as u32,
-                    rot_dim: hd as u32,
-                };
-                enc.set_compute_pipeline_state(&e.pipes.rope_h);
-                enc.set_buffer(0, Some(&self.k_cache[l]), dst_off);
-                enc.set_bytes(1, size_of::<RopeParams>() as u64, &rp as *const _ as *const _);
-                dispatch_grid(enc, len * cfg.num_key_value_heads * hd / 2);
-            }
-            bar!(&self.q, &self.k_cache[l], &self.v_cache[l], &self.kvs);
-            {
-                let kv_extent = match &e.win {
-                    Some(w) => w.cfg.cap,
-                    None => self.max_seq,
-                };
-                e.enc_attention(enc, &self.q, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.scores, &self.att, pos0, n, kv_extent, &self.xh);
-                bar!(&self.att, &self.scores);
-            }
-            self.enc_qmm(enc, &q.pipe(blk.o_proj.sel).matmul_pg, &blk.o_proj, &self.att, 0, &self.xb, 0, n);
-            bar!(&self.xb);
-            e.enc_elementwise(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
-            bar!(&self.x);
+            let _ = attn_out_done;
 
             e.enc_rmsnorm(enc, &self.x, &blk.post_attention_layernorm, &self.xn, n);
             bar!(&self.xn);
@@ -2713,12 +3103,22 @@ mod tests {
         assert!(metal.len() > 10, "parsed only {} Metal structs — parser broken", metal.len());
 
         let mut checked = 0;
+        let mut unmatched = Vec::new();
         for (file, src) in [
             ("src/gpu/metal.rs", include_str!("metal.rs")),
             ("src/lowmem/forward.rs", include_str!("../lowmem/forward.rs")),
         ] {
             for (name, rust_fields) in parse_rust(src) {
-                let Some(metal_fields) = metal.get(&name) else { continue };
+                let Some(metal_fields) = metal.get(&name) else {
+                    // A Rust struct named *Params that matches NO Metal struct is
+                    // the guard's blind spot: the loop above skips it silently, so
+                    // renaming either side disables the check instead of failing
+                    // it. Collect them and fail loudly rather than `continue`.
+                    if name.ends_with("Params") {
+                        unmatched.push(format!("{file}: {name}"));
+                    }
+                    continue;
+                };
                 checked += 1;
                 assert_eq!(
                     &rust_fields, metal_fields,
@@ -2729,13 +3129,24 @@ mod tests {
                 );
             }
         }
+        assert!(
+            unmatched.is_empty(),
+            "these Rust `*Params` structs mirror no struct in kernels.metal, so NOTHING \
+             checks them: {unmatched:?}. Either the Metal struct was renamed (rename the \
+             mirror to match) or this is not a kernel mirror (then it must not be called \
+             *Params). A silently unchecked mirror is how e61c260 shipped."
+        );
         // The guard needs its own negative control: if the parsers silently
         // matched nothing, every assertion above is vacuous and the test would
-        // pass on a codebase where every mirror had drifted.
+        // pass on a codebase where every mirror had drifted. The floor tracks
+        // the real population (30 at the metal-deltanet lane) rather than a
+        // token handful, so LOSING most of the mirrors fails here too — an
+        // `>= 8` floor happily passes a run that checked eight of thirty.
         assert!(
-            checked >= 8,
-            "compared only {checked} mirrors — expected at least the eight duplicated \
-             *Params structs; the parser or the naming convention has changed"
+            checked >= 24,
+            "compared only {checked} mirrors — the duplicated *Params structs number about \
+             thirty; the parser or the naming convention has changed and most mirrors are \
+             now going unchecked"
         );
     }
 

@@ -330,10 +330,10 @@ fn gguf_backend_refusal(
 ) -> Option<String> {
     if arch == "qwen35" {
         let m = m.expect("qwen35 meta is parsed before routing");
-        if backend != "lowmem" {
+        if !matches!(backend, "lowmem" | "metal") {
             return Some(format!(
-                "qwen35 runs on -b lowmem only ({} trunk layers: {} full-attention + {} \
-                 gated-deltanet{}); -b {} has no gated-deltanet path yet",
+                "qwen35 runs on -b lowmem and -b metal ({} trunk layers: {} full-attention \
+                 + {} gated-deltanet{}); -b {} has no gated-deltanet path yet",
                 m.trunk_layers,
                 m.is_recurrent.iter().filter(|r| !**r).count(),
                 m.is_recurrent.iter().filter(|r| **r).count(),
@@ -385,17 +385,14 @@ fn gguf_setup(
         cfg.num_key_value_heads,
         cfg.vocab_size,
     );
-    // qwen35 runs on -b lowmem. Two things are still refused BY NAME rather
-    // than attempted, because both would otherwise produce plausible wrong
-    // output instead of an error:
-    //   * a checkpoint whose rope sections are not the text-broadcast layout
-    //     the MRoPE equivalence was verified on (see Qwen35Meta::
-    //     check_rope_sections — this engine has no sectioned rope kernel and
-    //     would silently rotate a vision variant as if it were text);
-    //   * every backend except lowmem, which is where the gated-deltanet block
-    //     is wired. The metal backend builds its own per-layer tensors and has
-    //     no linear-block path yet, so it would fail on a tensor name at best
-    //     and mis-read the joint Q+gate projection at worst.
+    // qwen35 runs on -b lowmem and -b metal (both walk the same shared kernel
+    // source). Still refused BY NAME rather than attempted, because it would
+    // otherwise produce plausible wrong output instead of an error: a checkpoint
+    // whose rope sections are not the text-broadcast layout the MRoPE
+    // equivalence was verified on (Qwen35Meta::check_rope_sections — neither
+    // engine has a sectioned rope kernel, and both would silently rotate a
+    // vision variant as if it were text). cpu and hybrid keep their own
+    // mechanism-named refusals in gguf_backend_refusal.
     if arch.arch == "qwen35" {
         let m = gguf::qwen35_meta(&g)?;
         m.check_rope_sections()?;
@@ -504,11 +501,13 @@ mod matrix_tests {
     #[test]
     fn gguf_matrix_refusals_by_name() {
         let m = meta_2b();
-        // qwen35 column: lowmem runs, everything else names the missing mechanism.
+        // qwen35 column: lowmem AND metal run (metal-deltanet closed that cell);
+        // everything else names the missing mechanism.
         assert_eq!(gguf_backend_refusal("lowmem", "qwen35", Some(&m)), None);
-        for b in ["cpu", "metal", "hybrid", "ane"] {
+        assert_eq!(gguf_backend_refusal("metal", "qwen35", Some(&m)), None);
+        for b in ["cpu", "hybrid", "ane"] {
             let r = gguf_backend_refusal(b, "qwen35", Some(&m)).expect(b);
-            assert!(r.contains("qwen35 runs on -b lowmem only"), "{r}");
+            assert!(r.contains("qwen35 runs on -b lowmem and -b metal"), "{r}");
             assert!(r.contains("24 trunk layers: 6 full-attention + 18"), "{r}");
             assert!(r.contains(&format!("-b {b} has no gated-deltanet path")), "{r}");
         }

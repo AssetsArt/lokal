@@ -2360,6 +2360,9 @@ struct RopeQkParams {
     uint n_kv_heads;
     uint pos;
     float theta;
+    /// Leading dims that rotate; the tail of each head passes through. Equals
+    /// head_dim except on qwen35 (rope.dimension_count 64 inside head_dim 256).
+    uint rot_dim;
 };
 
 kernel void rope_qk_decode(
@@ -2368,7 +2371,10 @@ kernel void rope_qk_decode(
     constant RopeQkParams &p [[buffer(2)]],
     uint gid [[thread_position_in_grid]])
 {
-    uint half_dim = p.head_dim / 2;
+    // Pairs live inside the rotated prefix (i with i + rot_dim/2); the grid is
+    // sized by rot_dim/2 so the tail is never visited, which is what leaves
+    // dims rot_dim..head_dim untouched.
+    uint half_dim = p.rot_dim / 2;
     uint q_pairs = p.n_q_heads * half_dim;
     if (gid >= q_pairs + p.n_kv_heads * half_dim) {
         return;
@@ -2378,7 +2384,7 @@ kernel void rope_qk_decode(
     uint h = idx / half_dim;
     uint i = idx % half_dim;
 
-    float freq = pow(p.theta, -2.0f * (float)i / (float)p.head_dim);
+    float freq = pow(p.theta, -2.0f * (float)i / (float)p.rot_dim);
     float angle = (float)p.pos * freq;
     float c;
     float s = sincos(angle, c); // one intrinsic for both — cheaper than separate sin/cos

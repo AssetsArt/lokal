@@ -56,6 +56,8 @@ struct RopeQkParams {
     n_kv_heads: u32,
     pos: u32,
     theta: f32,
+    /// Leading dims that rotate; head_dim except on qwen35 (partial RoPE).
+    rot_dim: u32,
 }
 #[repr(C)]
 struct AttnParams {
@@ -841,12 +843,13 @@ impl<'a> LowMemSession<'a> {
                 n_kv_heads: cfg.num_key_value_heads as u32,
                 pos: pos as u32,
                 theta: cfg.rope_theta,
+                rot_dim: self.e.dims.rot_dim as u32,
             };
             enc.set_compute_pipeline_state(&e.pipes.rope_qk_decode);
             enc.set_buffer(0, Some(qbuf), 0);
             enc.set_buffer(1, Some(&self.k_cache[l]), kv_byte_off);
             set_bytes(enc, 2, &p);
-            gpu::dispatch_grid(enc, (cfg.num_attention_heads + cfg.num_key_value_heads) * hd / 2);
+            gpu::dispatch_grid(enc, (cfg.num_attention_heads + cfg.num_key_value_heads) * self.e.dims.rot_dim / 2);
         }
         {
             let n_splits = e.win.cap / gpu::ATTN_SPLIT;
