@@ -509,6 +509,26 @@ pub(crate) fn state_schedule(
         .collect()
 }
 
+/// Per-layer KV cache length in f16 elements, one entry per trunk layer: the
+/// full ring on a Kv layer, a one-element stub on a Recurrent one. The stub is
+/// a legal binding that nothing reads — the recurrent layers' state is conv +
+/// delta, and their forward branch binds no cache at all. Keeping the slot
+/// (never compacting the vector) is what lets `k_cache[l]` mean layer l
+/// everywhere; it is also exactly what LowMemSession::new does.
+pub(crate) fn kv_cache_elems(
+    sched: &[LayerStateKind],
+    kv_slots: usize,
+    kv_dim: usize,
+) -> Vec<usize> {
+    sched
+        .iter()
+        .map(|k| match k {
+            LayerStateKind::Recurrent => 1,
+            LayerStateKind::Kv => kv_slots * kv_dim,
+        })
+        .collect()
+}
+
 /// What a qwen35-aware engine hands its sessions so they can allocate states:
 /// the per-trunk-layer recurrency map plus the two per-layer element counts.
 /// The C/D seam — changes go through the lead, never pairwise.
@@ -537,6 +557,48 @@ impl MetalEngine {
     /// The deltanet geometry, or None on a non-hybrid checkpoint.
     fn deltanet_dims(&self) -> Option<crate::deltanet_ref::DeltaDims> {
         self.deltanet_dims
+    }
+
+    /// THIS engine's per-layer state schedule. Every consumer inside the
+    /// backend comes through here, so recurrency is read from the layout in
+    /// exactly one place (the T3 rule) and nothing re-derives it from
+    /// `is_recurrent` on its own.
+    fn state_schedule(&self) -> Vec<LayerStateKind> {
+        state_schedule(self.cfg.num_hidden_layers, self.deltanet_layout.as_ref())
+    }
+
+    /// Stubbing a recurrent layer's KV cache is sound only because the forward
+    /// loop's own branch and the schedule agree layer for layer: a
+    /// QuantAttn::Full block binds k_cache[l], a Linear block never does, and
+    /// the f16 path has no linear variant at all, so it binds every layer
+    /// unconditionally. Checked once per session construction, where a
+    /// mismatch is a named panic instead of a GPU write past a one-element
+    /// buffer — the failure mode that has no other symptom.
+    fn assert_schedule_matches_graph(&self, sched: &[LayerStateKind]) {
+        match &self.quant {
+            Some(q) => {
+                assert_eq!(
+                    q.blocks.len(),
+                    sched.len(),
+                    "quant block count and the state schedule disagree"
+                );
+                for (l, blk) in q.blocks.iter().enumerate() {
+                    let kind = match &blk.attn {
+                        QuantAttn::Full(_) => LayerStateKind::Kv,
+                        QuantAttn::Linear(_) => LayerStateKind::Recurrent,
+                    };
+                    assert_eq!(
+                        kind, sched[l],
+                        "layer {l}: block kind and the state schedule disagree — \
+                         a stubbed KV cache would be bound by the attention half"
+                    );
+                }
+            }
+            None => assert!(
+                self.deltanet_layout.is_none(),
+                "deltanet layout on the f16 path — every f16 layer binds its KV cache"
+            ),
+        }
     }
 }
 
@@ -1776,12 +1838,27 @@ impl MetalEngine {
             Some(w) => w.cfg.cap,
             None => max_seq + FLASH_C,
         };
-        let caches = (0..cfg.num_hidden_layers)
-            .map(|_| f16_empty_buffer(d, kv_slots * self.dims.kv_dim))
-            .collect::<Vec<_>>();
-        let v_caches = (0..cfg.num_hidden_layers)
-            .map(|_| f16_empty_buffer(d, kv_slots * self.dims.kv_dim))
-            .collect::<Vec<_>>();
+        // A recurrent layer's per-layer state is the conv window plus the
+        // delta state (DeltaNetStates, allocated below); it never touches a KV
+        // cache, because the quant forward takes the QuantAttn::Linear branch,
+        // which binds neither k_cache[l] nor v_cache[l]. A full cap × kv_dim
+        // buffer there is RAM nobody ever reads — on qwen35 that is three of
+        // every four trunk layers. lowmem has stubbed them since the hybrid
+        // shipped (LowMemSession::new); this is the same stub, off the same
+        // schedule, so the two backends allocate the same shape.
+        //
+        // The SLOT is kept (a one-element buffer, still a legal binding)
+        // rather than the vector compacted, so `k_cache[l]` keeps meaning
+        // layer l at every call site and no second index can drift out of
+        // step with the recurrency map.
+        let sched = self.state_schedule();
+        self.assert_schedule_matches_graph(&sched);
+        let elems = kv_cache_elems(&sched, kv_slots, self.dims.kv_dim);
+        debug_assert_eq!(elems.len(), cfg.num_hidden_layers);
+        let caches =
+            elems.iter().map(|&n| f16_empty_buffer(d, n)).collect::<Vec<_>>();
+        let v_caches =
+            elems.iter().map(|&n| f16_empty_buffer(d, n)).collect::<Vec<_>>();
         let scratch = self.session_scratch(max_seq);
         self.session_with_cache(max_seq, caches, v_caches, 0, scratch)
     }
@@ -1876,6 +1953,7 @@ impl MetalEngine {
             }),
             k_cache,
             v_cache,
+            state: self.state_schedule(),
             kv_base,
             max_seq,
             engine: self,
@@ -1937,6 +2015,10 @@ pub(crate) struct MetalSession<'a> {
     qg: Option<(Buffer, Buffer)>,
     k_cache: Vec<Buffer>,
     v_cache: Vec<Buffer>,
+    /// The per-layer state schedule this session's caches were allocated
+    /// against: Kv layers own a real cache, Recurrent layers own a stub. Kept
+    /// so the KV write path refuses a stubbed layer by name.
+    state: Vec<LayerStateKind>,
     kv_base: u64, // byte offset of this session's slot when the cache is pooled
     max_seq: usize,
 }
@@ -2670,6 +2752,7 @@ impl MetalSession<'_> {
     /// converting to the cache's f16 on the way. With unified memory this is the
     /// whole "device transfer".
     pub(crate) fn write_kv(&mut self, layer: usize, pos0: usize, k: &[f32], v: &[f32]) {
+        self.assert_kv_layer(layer);
         let kvd = self.engine.dims.kv_dim;
         let base = (self.kv_base / 2) as usize;
         unsafe {
@@ -2685,6 +2768,19 @@ impl MetalSession<'_> {
         }
     }
 
+    /// Refuse a KV write aimed at a layer whose cache is a stub — its state is
+    /// recurrent and lives in `deltanet` instead. Once per layer per chunk, so
+    /// free next to the copy it guards, and it turns a future caller that
+    /// routes a hybrid checkpoint's linear layer through the ANE path into a
+    /// named panic rather than silent device-memory corruption.
+    fn assert_kv_layer(&self, layer: usize) {
+        assert_eq!(
+            self.state[layer],
+            LayerStateKind::Kv,
+            "write_kv on layer {layer}: that layer's state is recurrent, its KV cache is a stub"
+        );
+    }
+
     /// Position -> cache row: identity full-causal, the ring slot under a window.
     fn kv_slot(&self, p: usize) -> usize {
         match &self.engine.win {
@@ -2698,6 +2794,7 @@ impl MetalSession<'_> {
     /// on the ANE thread (it needs the f16 rows anyway, to feed the next chunk's
     /// past), which keeps the conversion off the thread driving the GPU.
     pub(crate) fn write_kv_bits(&mut self, layer: usize, pos0: usize, k: &[u16], v: &[u16]) {
+        self.assert_kv_layer(layer);
         let kvd = self.engine.dims.kv_dim;
         let base = (self.kv_base / 2) as usize;
         unsafe {
@@ -3331,6 +3428,45 @@ mod tests {
         for (l, k) in sched.iter().enumerate() {
             assert_eq!(st.layers[l].is_some(), *k == Recurrent, "slot kind, layer {l}");
         }
+    }
+
+    /// The KV stub (this lane): a Recurrent layer gets a one-element cache,
+    /// never a cap × kv_dim one — nothing reads it, because that layer's
+    /// forward branch binds no cache. The vector is NOT compacted: index l is
+    /// still layer l, which is what every call site assumes.
+    #[test]
+    fn kv_cache_is_stubbed_exactly_on_recurrent_layers() {
+        use LayerStateKind::*;
+        let (slots, kvd) = (4096usize, 4096usize);
+
+        // Dense: every layer keeps its full cache, byte for byte what the
+        // backend allocated before the stub existed.
+        let dense = state_schedule(8, None);
+        assert_eq!(kv_cache_elems(&dense, slots, kvd), vec![slots * kvd; 8]);
+
+        // Hybrid: qwen35's one-in-four map (layers 3 and 7 are attention).
+        let layout = DeltaNetLayout {
+            is_recurrent: (0..8).map(|i| (i + 1) % 4 != 0).collect(),
+            conv_elems: 6,
+            delta_elems: 10,
+        };
+        let sched = state_schedule(8, Some(&layout));
+        let elems = kv_cache_elems(&sched, slots, kvd);
+        assert_eq!(elems.len(), 8, "one slot per trunk layer, not compacted");
+        for (l, n) in elems.iter().enumerate() {
+            match sched[l] {
+                Recurrent => assert_eq!(*n, 1, "layer {l} stubbed"),
+                Kv => assert_eq!(*n, slots * kvd, "layer {l} keeps its ring"),
+            }
+        }
+        // The win, in the shape the plan states it: KV elements drop to the
+        // attention layers' share (2 of 8 here), both caches.
+        let before: usize = 8 * slots * kvd;
+        let after: usize = elems.iter().sum();
+        // Exactly the two attention layers' rings, plus 6 stub elements —
+        // a quarter of what the backend allocated before this lane.
+        assert_eq!(after, 2 * slots * kvd + 6);
+        assert!(after < before / 3, "stub must be a real reduction");
     }
 
     /// The one canonical meta→layout translation carries the real sizes and
