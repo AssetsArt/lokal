@@ -287,7 +287,10 @@ P2 is pointless if the other five kernels still run per token.
 * `ssm_conv_decode` (`kernels.metal:3475`) is a depthwise causal conv with
   d_conv = 4. Over a chunk it is a plain causal convolution with the incoming
   `(d_conv−1)`-wide window prepended: every output position depends only on the
-  input, never on another output. **Fully parallel over the chunk — 1 dispatch.**
+  input, never on another output. **Fully parallel over the chunk — 2 dispatches**
+  (read + roll: every early token READS the window the roll WRITES, and one
+  dispatch cannot do both without a cross-threadgroup race — corrected at
+  landing, lane deltanet-prefill-batching).
   The rolling-state write becomes a single store of the chunk's last
   `d_conv−1` columns. llama.cpp does the same thing with one `ggml_ssm_conv`
   over the concatenated state and inputs (`delta-net-base.cpp:449-470`
@@ -312,7 +315,10 @@ Per linear layer, per prefill chunk of `n` tokens: **P1 = 6n**, **P2 = 6**
 | | dispatches | measured / projected |
 |---|---|---|
 | P1 (today) | 2198 × 48 × 6 = **633,024** | 17.55 s measured (Studio), 13.8% of prefill |
-| P2 | 5 × 48 × 6 = **1,440** | launch cost ≈ 1,440 × ~2.2 µs ≈ **3 ms** |
+| P2 | 5 × 48 × 7 = **1,680** | launch cost ≈ 1,680 × ~2.2 µs ≈ **3.7 ms** |
+
+(7 per layer per chunk as landed — gates 1, conv 2, l2norm 2, delta 1, gated
+norm 1; the original 6 assumed a single conv dispatch, see §4.)
 
 The launch cost stops mattering; what remains is the delta step's own work and
 its state traffic, and P2 cuts that traffic from 4 accesses per element per
@@ -430,14 +436,17 @@ cells byte-identical (the change is bit-exact, so any moved cell is a defect);
 decode tok/s; larger on the 27B after `quant-matvec-rework`.
 
 ### Lane 2 — `deltanet-prefill-batching` (B1, the big one)
-*Boundary*: `src/gpu/kernels.metal`, `src/gpu/metal.rs`, `src/lowmem/forward.rs`
+*Boundary*: `src/gpu/kernels.metal`, `src/gpu/metal.rs`, `src/lowmem/forward.rs`,
+`src/lowmem/mod.rs` (two lines per new kernel: the Pipes field and its pipe()
+call — the struct lives in mod.rs, not forward.rs; omission found at claim,
+challenge befab0c5)
 (lowmem's own `for t in 0..n` loop is the twin and must move with it, unlike
 Lane 1).
 *Shape*: P2 — batch conv/gates/l2norm/output-norm over the chunk (§4), and one
 persistent-state delta kernel per layer per chunk with a 32-column tile in
 threadgroup memory (§3).
 *Gates*: the T2 set, including the n>512 prompt.
-*Expected*: 633,024 → 1,440 dispatches on the 27B prompt; delta's 30% of 2B
+*Expected*: 633,024 → 1,680 dispatches on the 27B prompt; delta's 30% of 2B
 prefill and 13.8% of 27B prefill largely recovered.
 
 ### Lane 3 — none. B2 is measured dead.
