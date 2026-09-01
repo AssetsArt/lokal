@@ -136,7 +136,7 @@ tensor sits in the 24 MB system cache the way a single reused buffer would.
 | **V0** `matmul_pg` as shipped | 46.20 / 49.53 | 42.67 / 43.78 | 1.00x | — |
 | **V1** no weight read at all | 5.30 / 5.36 | 5.67 / 5.55 | 7.5-9.3x | differs (probe) |
 | **V2** raw nibble, no scale decode | 18.98 / 19.06 | 19.22 / 19.27 | 2.2-2.6x | differs (probe) |
-| **V3** hoisted scale decode | 9.16 / 9.02 | 9.47 / 8.23 | **4.5-5.5x** | **bit-identical** |
+| **V3** hoisted scale decode | 9.16 / 9.02 | 9.47 / 8.23 | **4.2-5.5x** | **bit-identical** |
 | **V4** V3 + `uchar4` nibble loads | 9.21 / 9.06 | 9.40 / 9.36 | 4.7-5.5x | **bit-identical** |
 
 Three things fall out, and the third was a surprise:
@@ -161,6 +161,20 @@ V0's own numbers move 7% between runs while V3's barely move, which is itself
 consistent: V0 issues sixteen times the memory operations and is correspondingly
 more sensitive to a contended box. Where the two runs disagree, §7 plans against
 the **conservative** figure.
+
+An A/A control rules out the obvious way a table like this goes wrong. Mellow
+lost most of an afternoon to an A/B probe that reported 1.18x and 1.63x between
+two pipelines built from *identical* code, because whichever arm ran first ate
+the warm-up, and raised it here before this number could be cited. The harness
+now warms every pipeline before timing any, and runs the shipped kernel **again
+as the last arm**. First against last: **0.97x** on `ffn_gate/up` (41.88 vs
+43.07 ms/dispatch) and **1.02x** on `ffn_down` (40.57 vs 39.79) — within 3%, in
+opposite directions, so noise rather than arm order, and roughly 150x smaller
+than the effect being claimed. (That control run was taken on a *non-quiet* box,
+so only its ratio is used; its absolute numbers appear nowhere in this memo.)
+Across all three runs V3 lands at 5.04 / 5.49 / 5.08 on `ffn_gate/up` and
+4.51 / 5.32 / 4.19 on `ffn_down`, which is where the **4.2-5.5x** range comes
+from — and §7 plans against the 4.2.
 
 ### 1.4 The per-element decode rate is flat across quant formats
 
@@ -516,7 +530,7 @@ arms, starting with Q4_K and extending to Q5_K and Q6_K by the same argument
 **C2 is explicitly out of scope** — §1.3 measured it at zero gain, and dropping
 it removes the buffer-alignment precondition entirely.
 
-Measured leverage, conservative end of the two runs: 4.5x on `matmul_pg`'s Q4_K
+Measured leverage, conservative end of the three runs: 4.2x on `matmul_pg`'s Q4_K
 arm. Against this window's in-engine rows, fixing the Q4_K arms alone addresses
 3186.9 ms of a 5371.5 ms prefill chunk (59.3%); extending to Q5_K and Q6_K
 reaches 4921 ms (91.6%).
