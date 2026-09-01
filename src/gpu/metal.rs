@@ -1993,13 +1993,19 @@ impl MetalEngine {
             eprintln!("probe fail stage=library");
             return;
         };
-        let consts = FunctionConstantValues::new();
-        consts.set_constant_value_at_index(&sel as *const u32 as *const _, MTLDataType::UInt, 25);
-        let Ok(f) = lib.get_function("matvec", Some(consts)) else {
-            eprintln!("probe fail stage=function");
-            return;
+        // Both arms in ONE process over ONE buffer: same machine state, no rebuild
+        // between them, which is what makes the A/B worth anything on a box that
+        // drifts. accum=1 is the shipped shape; accum=4 is the probe arm.
+        let build = |accum: u32| -> Option<ComputePipelineState> {
+            let consts = FunctionConstantValues::new();
+            consts.set_constant_value_at_index(
+                &sel as *const u32 as *const _, MTLDataType::UInt, 25);
+            consts.set_constant_value_at_index(
+                &accum as *const u32 as *const _, MTLDataType::UInt, 26);
+            let f = lib.get_function("matvec", Some(consts)).ok()?;
+            d.new_compute_pipeline_state_with_function(&f).ok()
         };
-        let Ok(pipe) = d.new_compute_pipeline_state_with_function(&f) else {
+        let (Some(pipe), Some(pipe4)) = (build(1), build(4)) else {
             eprintln!("probe fail stage=pipeline");
             return;
         };
@@ -2019,6 +2025,97 @@ impl MetalEngine {
         unsafe { std::ptr::write_bytes(bias.contents() as *mut u8, 0, 2 * out_dim.max(8)) };
         let y = f32_buffer(d, out_dim.max(8));
         let p = MatvecParams { in_dim: in_dim as u32, out_dim: out_dim as u32 };
+        // ALTERNATING, WARMED, AND WITH AN A/A CONTROL — because the first version
+        // of this probe timed arm A fully, then arm B, and reported 1.18x and
+        // 1.63x for two pipelines built from IDENTICAL code. (A patch had failed
+        // to apply, so the "variant" was the shipped path; the accidental A/A
+        // control is what exposed it.) Whichever arm ran first ate the warm-up and
+        // lost. Now each pipeline is warmed before timing and the samples are
+        // interleaved, and the driver always reports an A/A ratio beside the real
+        // one so its own noise floor is visible in every result rather than
+        // assumed.
+        let warm = |pipe: &ComputePipelineState| {
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(pipe);
+            enc.set_buffer(0, Some(&wbuf), 0);
+            enc.set_buffer(1, Some(&bias), 0);
+            enc.set_buffer(2, Some(&x), 0);
+            enc.set_buffer(3, Some(&y), 0);
+            enc.set_bytes(4, size_of::<MatvecParams>() as u64, &p as *const _ as *const _);
+            dispatch_simdgroup_rows(enc, out_dim as u32);
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        };
+        let once = |pipe: &ComputePipelineState| -> u128 {
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(pipe);
+            enc.set_buffer(0, Some(&wbuf), 0);
+            enc.set_buffer(1, Some(&bias), 0);
+            enc.set_buffer(2, Some(&x), 0);
+            enc.set_buffer(3, Some(&y), 0);
+            enc.set_bytes(4, size_of::<MatvecParams>() as u64, &p as *const _ as *const _);
+            dispatch_simdgroup_rows(enc, out_dim as u32);
+            enc.end_encoding();
+            let t = std::time::Instant::now();
+            cb.commit();
+            cb.wait_until_completed();
+            t.elapsed().as_nanos()
+        };
+        let med = |mut v: Vec<u128>| -> u128 { v.sort_unstable(); v[v.len() / 2] };
+        let ab = |a: &ComputePipelineState, b: &ComputePipelineState| -> (u128, u128) {
+            warm(a);
+            warm(b);
+            let (mut va, mut vb) = (Vec::new(), Vec::new());
+            for _ in 0..7 {
+                va.push(once(a));
+                vb.push(once(b));
+            }
+            (med(va), med(vb))
+        };
+        let _unused_time = |pipe: &ComputePipelineState| -> u128 {
+            let mut ns: Vec<u128> = Vec::new();
+            for _ in 0..7 {
+                let cb = self.queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(pipe);
+                enc.set_buffer(0, Some(&wbuf), 0);
+                enc.set_buffer(1, Some(&bias), 0);
+                enc.set_buffer(2, Some(&x), 0);
+                enc.set_buffer(3, Some(&y), 0);
+                enc.set_bytes(4, size_of::<MatvecParams>() as u64, &p as *const _ as *const _);
+                dispatch_simdgroup_rows(enc, out_dim as u32);
+                enc.end_encoding();
+                let t = std::time::Instant::now();
+                cb.commit();
+                cb.wait_until_completed();
+                ns.push(t.elapsed().as_nanos());
+            }
+            ns.sort_unstable();
+            ns[ns.len() / 2]
+        };
+        let Some(pipe1b) = build(1) else {
+            eprintln!("probe fail stage=control-pipeline");
+            return;
+        };
+        let (ctl_a, ctl_b) = ab(&pipe, &pipe1b); // A/A: identical code, both arms
+        let (med1, med4) = ab(&pipe, &pipe4);
+        let gbps = |ns: u128| w.len() as f64 / (ns as f64 / 1e9) / 1e9;
+        eprintln!(
+            "probe kind=SYNTHETIC-ACCUM sel={sel} in_dim={in_dim} out_dim={out_dim} \
+             accum1_ms={:.3} accum1_gbps={:.1} accum4_ms={:.3} accum4_gbps={:.1} \
+             ratio={:.2}x AAcontrol={:.2}x bytes={}",
+            med1 as f64 / 1e6, gbps(med1),
+            med4 as f64 / 1e6, gbps(med4),
+            med1 as f64 / med4 as f64,
+            ctl_a as f64 / ctl_b as f64,
+            w.len()
+        );
+        #[allow(unreachable_code)]
+        return;
+        #[allow(unreachable_code)]
         let mut ns: Vec<u128> = Vec::new();
         for _ in 0..7 {
             let cb = self.queue.new_command_buffer();

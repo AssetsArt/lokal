@@ -58,6 +58,13 @@ kernel void embed(
 //   5 = Q6_K  210 B / 256      : ql nibbles + qh 2-bit highs, int8 scales ×16, f16 d
 //   6 = Q5_K  176 B / 256      : Q4_K plus one high bit per element (qh[32])
 //   7 = Q5_0   22 B / 32       : Q4_0 plus one high bit per element (qh u32) → (q-16)*d
+/// PROBE ONLY (lane matvec-dependency-chain): how many independent accumulators
+/// a quant run function uses. 1 = the shipped shape. Higher values reassociate
+/// the run's sum into that many chains, which is a real numerics change and is
+/// why it lives behind a function constant during the probe rather than in the
+/// shipped path. Default 1 keeps every existing pipeline byte-identical.
+constant uint LM_MV_ACCUM_FC [[function_constant(26)]];
+constant uint LM_MV_ACCUM = is_function_constant_defined(LM_MV_ACCUM_FC) ? LM_MV_ACCUM_FC : 1;
 constant uint LM_W_QTYPE_FC [[function_constant(25)]];
 constant uint LM_W_QTYPE = is_function_constant_defined(LM_W_QTYPE_FC) ? LM_W_QTYPE_FC : 0;
 
@@ -1237,6 +1244,23 @@ inline float lm_dot_run_q6_K(device const uchar *row, uint e0, device const floa
     // Q6_K's scales change every 16 elements, so a 32-run spans exactly two.
     float s0 = d * (float)sc[2 * grp];
     float s1 = d * (float)sc[1 + 2 * grp];
+    if (LM_MV_ACCUM >= 4) {
+        // PROBE ARM on the type the lm_head bar is measured on. The shipped shape
+        // already has TWO accumulators (one per 16-element scale group); this
+        // splits each into two for four independent chains, per-element
+        // expression untouched. Reassociation, hence behind LM_MV_ACCUM.
+        float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f, b3 = 0.0f;
+        for (uint l = 0; l < 32; l++) {
+            uchar lowbyte = ql[l];
+            uint low = (grp < 2) ? (lowbyte & 0x0F) : (lowbyte >> 4);
+            uint hi2 = (qh[l] >> (2 * grp)) & 3;
+            float q = (float)((int)(low | (hi2 << 4)) - 32);
+            float t = q * x[e0 + l];
+            if (l < 8) { b0 += t; } else if (l < 16) { b1 += t; }
+            else if (l < 24) { b2 += t; } else { b3 += t; }
+        }
+        return s0 * (b0 + b1) + s1 * (b2 + b3);
+    }
     float a0 = 0.0f, a1 = 0.0f;
     for (uint l = 0; l < 32; l++) {
         uchar lowbyte = ql[l];
@@ -1274,6 +1298,25 @@ inline float lm_dot_run_iq1_s(device const uchar *row, uint e0, device const flo
     uint qh = (uint)b[34 + 2 * ib] | ((uint)b[35 + 2 * ib] << 8);
     float dl = d * (float)(2 * ((qh >> 12) & 7) + 1);
     float delta = (qh & 0x8000) ? -LM_IQ1_DELTA : LM_IQ1_DELTA;
+    if (LM_MV_ACCUM >= 4) {
+        // PROBE ARM: four independent chains instead of one. The loads in this
+        // run were always independent — it is the ADDS that serialise, ~32 deep
+        // at one accumulator — so this is the minimal change that tests whether
+        // chain depth is what holds the family at 56-77 GB/s. Reassociation, so
+        // it is not bit-identical and is gated behind LM_MV_ACCUM.
+        float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+        for (uint l = 0; l < 4; l++) {
+            uint gi = (uint)b[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8);
+            ulong g = lm_iq1s_grid[gi];
+            for (uint j = 0; j < 8; j += 4) {
+                c0 += dl * ((float)(char)((g >> (8 * (j + 0))) & 0xFF) + delta) * x[e0 + l * 8 + j + 0];
+                c1 += dl * ((float)(char)((g >> (8 * (j + 1))) & 0xFF) + delta) * x[e0 + l * 8 + j + 1];
+                c2 += dl * ((float)(char)((g >> (8 * (j + 2))) & 0xFF) + delta) * x[e0 + l * 8 + j + 2];
+                c3 += dl * ((float)(char)((g >> (8 * (j + 3))) & 0xFF) + delta) * x[e0 + l * 8 + j + 3];
+            }
+        }
+        return (c0 + c1) + (c2 + c3);
+    }
     float a = 0.0f;
     for (uint l = 0; l < 4; l++) {
         uint gi = (uint)b[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8);
