@@ -42,6 +42,20 @@ first window that clears an A/A after several that did not is selection bias, an
 it is the exact failure the pre-registration exists to prevent. `ffn_down` held a
 valid A/A twice (4.7%, 3.0%) and those two windows carry the load below.
 
+A follow-up test settled the cause. Timing the shipped kernel immediately
+after each of six different predecessor arms — 12 reps each, predecessor
+order shuffled per rep — gives slow-mode fractions of 50 / 42 / 50 / 42 /
+25 / 42% against a pooled 42%, where one standard error at n=12 is 14
+percentage points. There is no predecessor effect, and the same two states
+appear under every predecessor (min 4.30-4.38 ms, max 6.08-6.94). The
+distribution is bimodal rather than noisy: a fast mode at 4.30-4.89 ms and
+a slow mode at 5.34-6.94, a ratio of 1.32x, with 42% of samples slow and
+no dependence on which arm is running. So the void windows are a property
+of the machine and not of the arm ordering, and the precondition above
+stands. (An A/A control designed with cyclic rotation was found to pin the
+control's predecessor permanently — a real defect, recorded as
+gotcha:aa-control-rotation — but it is not what caused these failures.)
+
 ## 1. The arms
 
 `ffn_gate/up` then `ffn_down`, all four runs, as multiples of C0:
