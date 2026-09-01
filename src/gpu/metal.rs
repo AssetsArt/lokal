@@ -202,6 +202,14 @@ struct Pipelines {
 pub(crate) const ATTN_SPLIT: usize = 128;
 /// Threads per decode-attention threadgroup — must match DEC_TG in kernels.metal.
 pub(crate) const DEC_TG: usize = 128;
+/// Output dims one decode-attention thread accumulates — must match MAX_DEC_DPT in
+/// kernels.metal. 1 while head_dim <= DEC_TG; qwen35's 256 needs 2.
+pub(crate) const MAX_DEC_DPT: usize = 2;
+/// The largest head_dim the fused decode path can serve. Above it the decode
+/// attention kernel has no thread geometry and the caller must fall back to the
+/// prefill-shaped encoder — which is what made qwen35 decode cost a prefill per
+/// token before this constant existed.
+pub(crate) const DEC_MAX_HD: usize = DEC_TG * MAX_DEC_DPT;
 /// Max q heads one GQA decode threadgroup covers — must match MAX_GQA_CHUNK in kernels.metal.
 pub(crate) const MAX_GQA_CHUNK: usize = 8;
 /// The head_dim the flash prefill attention kernel is specialized for (FA_HD in
@@ -1437,7 +1445,7 @@ impl MetalEngine {
     }
 
     /// Decode-only attention (n_rows = 1): flash-decoding split. Falls back to the
-    /// generic kernel via the caller when head_dim > DEC_TG.
+    /// generic kernel via the caller when head_dim > DEC_MAX_HD.
     #[allow(clippy::too_many_arguments)]
     fn enc_attention_decode(
         &self,
@@ -1530,10 +1538,21 @@ pub(crate) fn gqa_decode_dims(cfg: &ModelConfig, head_dim: usize) -> (u64, [u64;
         [
             f32s(chunk * head_dim),
             f32s(chunk * ATTN_SPLIT),
-            f32s(DEC_TG * (chunk | 1)),
+            f32s(acc_red_elems(chunk, head_dim)),
             f32s(chunk * (DEC_TG / 32) + chunk),
         ],
     )
+}
+
+/// Elements in the decode-attention `acc_red` scratch. The kernel indexes it by
+/// (position lane, output dim), so it holds P x head_dim entries: DEC_TG while
+/// head_dim <= DEC_TG (P = DEC_TG/head_dim lanes over head_dim dims), head_dim
+/// above it (P collapses to 1 and each thread carries several dims). One named
+/// rule because Rust allocates this buffer and Metal indexes it — the two must
+/// agree, and an under-allocation here is a threadgroup-memory overrun with no
+/// symptom. ACC_STRIDE's `| 1` odd stride is mirrored from the shader.
+fn acc_red_elems(chunk: usize, head_dim: usize) -> usize {
+    DEC_TG.max(head_dim) * (chunk | 1)
 }
 
 /// One-thread-per-element dispatch — kernels guard the tail with `if (gid < dim)`.
@@ -2071,6 +2090,11 @@ impl MetalSession<'_> {
         }
 
         let cb = e.queue.new_command_buffer();
+        // NOTE: still DEC_TG, not DEC_MAX_HD. The decode attention kernel would serve
+        // hd 256 here too, but the rest of this path (enc_qkv above all) has never run
+        // at hd > 128 and no f16 checkpoint in the gate table exercises it — lifting
+        // it would ship untested surface for no model that exists. The quant path is
+        // where qwen35 lives; deferred deliberately, per the lane plan.
         let fused_decode = n == 1 && e.dims.head_dim <= DEC_TG && e.dims.head_dim.is_multiple_of(4);
         // Decode keeps the serial encoder (every dispatch depends on the previous
         // one anyway). Prefill uses a concurrent encoder with explicit barriers so
@@ -2111,7 +2135,7 @@ impl MetalSession<'_> {
                 continue;
             }
 
-            // Prefill path (and the rare head_dim > DEC_TG decode): tiled matmuls.
+            // Prefill path (and the rare head_dim > DEC_MAX_HD decode): tiled matmuls.
             // Attention half. Barrier-free groups: q/k/v projections (disjoint
             // outputs, shared read-only input), the two ropes, gate/up.
             e.enc_rmsnorm_hf(enc, &self.x, &blk.input_layernorm, &self.xn, &self.xh, n);
@@ -2534,7 +2558,15 @@ impl MetalSession<'_> {
         }
 
         let cb = e.queue.new_command_buffer();
-        let fused_decode = n == 1 && hd <= DEC_TG && hd.is_multiple_of(4);
+        // Decode takes the fused path up to DEC_MAX_HD. It used to stop at DEC_TG,
+        // which excluded head_dim 256 — i.e. the WHOLE qwen35 arch, including the 48
+        // of 64 deltanet layers that have no attention constraint at all — and made
+        // every decode step run the concurrent prefill encoder: tiled matmuls at
+        // n = 1 instead of matvecs, ~80x off the memory-bound ceiling on the 27B.
+        // The only piece that was ever hd-bound is the decode attention kernel, now
+        // generalized; the Full-attn fused branch below (joint Q+gate split, per-head
+        // qk-norm, partial rope) was already written for qwen35 and simply never ran.
+        let fused_decode = n == 1 && hd <= DEC_MAX_HD && hd.is_multiple_of(4);
         let enc = if fused_decode {
             cb.new_compute_command_encoder()
         } else {
@@ -3467,6 +3499,61 @@ mod tests {
         // a quarter of what the backend allocated before this lane.
         assert_eq!(after, 2 * slots * kvd + 6);
         assert!(after < before / 3, "stub must be a real reduction");
+    }
+
+    /// The decode-attention geometry lives in two languages: kernels.metal
+    /// hard-codes it as #defines and Rust dispatches against consts that must
+    /// equal them, with nothing but a comment linking the pair. This lane made
+    /// that pairing load-bearing — MAX_DEC_DPT decides how many output dims one
+    /// thread carries, so a Rust const LARGER than the shader's would dispatch
+    /// head_dims the kernel cannot hold and write past acc_red, which on a GPU
+    /// has no symptom at all. Parsed, not listed: a hand-written table would be
+    /// one more mirror to drift.
+    #[test]
+    fn decode_geometry_defines_match_the_metal_source() {
+        // kvd only feeds the FA_KVD preamble; the #defines below are literal.
+        let src = shader_source(FLASH_HEAD_DIM);
+        let define = |name: &str| -> usize {
+            let needle = format!("#define {name} ");
+            let line = src
+                .lines()
+                .map(str::trim_start)
+                .find(|l| l.starts_with(&needle))
+                .unwrap_or_else(|| {
+                    panic!("kernels.metal has no `#define {name}` — the Rust const \
+                            that mirrors it is now pinned to nothing")
+                });
+            line[needle.len()..]
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("`#define {name}` is not a plain integer"))
+        };
+        assert_eq!(define("ATTN_SPLIT"), ATTN_SPLIT, "ATTN_SPLIT");
+        assert_eq!(define("DEC_TG"), DEC_TG, "DEC_TG");
+        assert_eq!(define("MAX_DEC_DPT"), MAX_DEC_DPT, "MAX_DEC_DPT");
+        assert_eq!(define("MAX_GQA_CHUNK"), MAX_GQA_CHUNK, "MAX_GQA_CHUNK");
+        assert_eq!(DEC_MAX_HD, DEC_TG * MAX_DEC_DPT, "the dispatch ceiling is the product");
+    }
+
+    /// acc_red is the one scratch that had to grow for head_dim > DEC_TG, and it
+    /// is ALLOCATED in Rust while INDEXED in Metal. Both regimes pinned: the
+    /// hd <= DEC_TG sizing must not move (every dense cell in the gate table was
+    /// captured through it), and hd = 256 must get one entry per dim.
+    #[test]
+    fn acc_red_covers_both_head_dim_regimes() {
+        // hd <= DEC_TG: P = DEC_TG/hd lanes x hd dims = DEC_TG entries. This is
+        // the pre-existing sizing, unchanged.
+        for hd in [64usize, 96, 128] {
+            assert_eq!(acc_red_elems(4, hd), DEC_TG * 5, "hd {hd} sizing moved");
+        }
+        // hd > DEC_TG: one position lane, every dim.
+        assert_eq!(acc_red_elems(4, 256), 256 * 5);
+        // Enough for the largest head_dim the dispatch will ever admit.
+        assert!(acc_red_elems(1, DEC_MAX_HD) >= DEC_MAX_HD);
+        // Odd stride (the shader's ACC_STRIDE = GQA_CHUNK | 1) is preserved.
+        assert_eq!(acc_red_elems(1, 128) / DEC_TG, 1);
+        assert_eq!(acc_red_elems(8, 128) / DEC_TG, 9);
     }
 
     /// The one canonical meta→layout translation carries the real sizes and
