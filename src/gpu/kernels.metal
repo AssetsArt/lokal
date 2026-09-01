@@ -3783,6 +3783,102 @@ kernel void delta_decode_step(
     out[h * s_dim + j] = o;
 }
 
+struct DeltaChunkParams {
+    uint d_state;     // S
+    uint n_v_heads;   // H_v
+    uint group;       // H_v / H_k
+    uint n_tokens;    // n
+    uint tok_stride;  // floats between tokens in the conv-output view (= C)
+    uint out_stride;  // floats between tokens in `out` (= H_v · S)
+    uint gate_stride; // floats between tokens in g / beta (= H_v)
+    uint tile;        // state columns per threadgroup
+};
+
+/// The delta rule over a WHOLE prefill chunk in one dispatch — memo §3, P2.
+///
+/// The arithmetic is `delta_decode_step`'s, unchanged, executed n times in
+/// sequence. What changes is WHERE THE STATE LIVES BETWEEN TOKENS: the decode
+/// kernel reads and writes its column in device memory twice per token, so a
+/// 512-token chunk moves the whole state 2048 times. Here each thread's column
+/// is staged into threadgroup memory once, updated in place for every token,
+/// and written back once — the same recurrence at 1/(2n) of the traffic.
+///
+/// WHY IT IS STILL BIT-EXACT, which is the whole point of not adopting the
+/// upstream fused kernel: thread (h, j) still walks the contraction index i
+/// serially, in the reference's order, and no value is ever summed by a
+/// different thread than before. The standing constraint (workspace memory
+/// ef397862) forbids splitting the CONTRACTION; this splits nothing — it moves
+/// which memory the same thread reads. Upstream's kernel additionally
+/// simd_sums the contraction because it holds the state in REGISTERS and a
+/// 128-float column does not fit; a threadgroup tile does, so we do not pay
+/// that price.
+///
+/// NO BARRIER IN THE TOKEN LOOP, deliberately: column j is read and written
+/// only by the thread that owns it (the reference's j loop has no cross-j
+/// dependency), so the tile is per-thread scratch that happens to live in
+/// threadgroup memory. A barrier here would cost and prove nothing.
+///
+/// The tile is sized by the CALLER against the device's real
+/// maxTotalThreadgroupMemory; this kernel trusts `p.tile` and the caller
+/// refuses rather than mis-sizes.
+kernel void delta_prefill_step(
+    device float *state [[buffer(0)]],       // [S·S·H_v], transposed: (i,j) at i·S + j
+    device const float *q [[buffer(1)]],     // token 0's q; token t at +t·tok_stride
+    device const float *k [[buffer(2)]],
+    device const float *v [[buffer(3)]],
+    device const float *g [[buffer(4)]],     // [n][H_v]
+    device const float *beta [[buffer(5)]],  // [n][H_v]
+    device float *out [[buffer(6)]],         // [n][H_v·S]
+    constant DeltaChunkParams &p [[buffer(7)]],
+    threadgroup float *tg [[threadgroup(0)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint2 tid2 [[thread_position_in_threadgroup]])
+{
+#pragma clang fp contract(off)
+    uint S = p.d_state;
+    uint tile = p.tile;
+    uint jl = tid2.x;
+    uint blocks = S / tile;
+    uint h = tgid.x / blocks;
+    uint j = (tgid.x % blocks) * tile + jl;
+    if (h >= p.n_v_heads) {
+        return;
+    }
+    uint kh_base = (h / p.group) * S;
+    device float *st = state + (ulong)h * S * S;
+
+    for (uint i = 0; i < S; i++) {
+        tg[i * tile + jl] = st[(ulong)i * S + j];
+    }
+
+    float scale = 1.0f / sqrt((float)S);
+    for (uint t = 0; t < p.n_tokens; t++) {
+        device const float *kh = k + (ulong)t * p.tok_stride + kh_base;
+        device const float *qh = q + (ulong)t * p.tok_stride + kh_base;
+        float ge = exp(g[(ulong)t * p.gate_stride + h]);
+        float b = beta[(ulong)t * p.gate_stride + h];
+
+        float sk = 0.0f;
+        for (uint i = 0; i < S; i++) {
+            float s = tg[i * tile + jl] * ge;
+            tg[i * tile + jl] = s;
+            sk += s * kh[i];
+        }
+        float d = (v[(ulong)t * p.tok_stride + h * S + j] - sk) * b;
+        float o = 0.0f;
+        for (uint i = 0; i < S; i++) {
+            float s = tg[i * tile + jl] + kh[i] * d;
+            tg[i * tile + jl] = s;
+            o += s * (qh[i] * scale);
+        }
+        out[(ulong)t * p.out_stride + h * S + j] = o;
+    }
+
+    for (uint i = 0; i < S; i++) {
+        st[(ulong)i * S + j] = tg[i * tile + jl];
+    }
+}
+
 /// The linear block's output stage: per-head RMSNorm(o; ssm_norm) · silu(z),
 /// in place on `o` — one threadgroup per V head (build_norm_gated).
 ///

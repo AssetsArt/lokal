@@ -755,29 +755,62 @@ impl<'a> LowMemSession<'a> {
             );
         }
 
-        // 4. the delta rule, still one dispatch per token (the state is
-        //    read-modify-written across tokens).
-        for t in 0..n {
-            let (goff, coff, zoff) =
-                ((t * hv * 4) as u64, (t * c_all * 4) as u64, (t * inner * 4) as u64);
-            enc.set_compute_pipeline_state(&e.pipes.delta_decode_step);
-            enc.set_buffer(0, Some(&st.delta), 0);
-            enc.set_buffer(1, Some(&ds.conv_out), coff);
-            enc.set_buffer(2, Some(&ds.conv_out), coff + (key_dim * 4) as u64);
-            enc.set_buffer(3, Some(&ds.conv_out), coff + (2 * key_dim * 4) as u64);
-            enc.set_buffer(4, Some(&ds.g), goff);
-            enc.set_buffer(5, Some(&ds.beta), goff);
-            enc.set_buffer(6, Some(&ds.dout), zoff);
-            set_bytes(
-                enc,
-                7,
-                &DeltaStepParams {
-                    d_state: s_dim as u32,
-                    n_v_heads: hv as u32,
-                    group: (hv / hk) as u32,
-                },
-            );
-            gpu::dispatch_grid(enc, s_dim * hv);
+        // 4. the delta rule — one dispatch for the whole chunk, or the
+        //    per-token fallback when the tile will not fit this device.
+        match gpu::delta_tile(e.device.max_threadgroup_memory_length() as usize, s_dim) {
+            Some(tile) => {
+                enc.set_compute_pipeline_state(&e.pipes.delta_prefill_step);
+                enc.set_buffer(0, Some(&st.delta), 0);
+                enc.set_buffer(1, Some(&ds.conv_out), 0);
+                enc.set_buffer(2, Some(&ds.conv_out), (key_dim * 4) as u64);
+                enc.set_buffer(3, Some(&ds.conv_out), (2 * key_dim * 4) as u64);
+                enc.set_buffer(4, Some(&ds.g), 0);
+                enc.set_buffer(5, Some(&ds.beta), 0);
+                enc.set_buffer(6, Some(&ds.dout), 0);
+                set_bytes(
+                    enc,
+                    7,
+                    &gpu::DeltaChunkParams {
+                        d_state: s_dim as u32,
+                        n_v_heads: hv as u32,
+                        group: (hv / hk) as u32,
+                        n_tokens: n as u32,
+                        tok_stride: c_all as u32,
+                        out_stride: inner as u32,
+                        gate_stride: hv as u32,
+                        tile: tile as u32,
+                    },
+                );
+                enc.set_threadgroup_memory_length(0, (tile * s_dim * 4) as u64);
+                enc.dispatch_thread_groups(
+                    MTLSize::new((hv * (s_dim / tile)) as u64, 1, 1),
+                    MTLSize::new(tile as u64, 1, 1),
+                );
+            }
+            None => {
+                for t in 0..n {
+                    let (goff, coff, zoff) =
+                        ((t * hv * 4) as u64, (t * c_all * 4) as u64, (t * inner * 4) as u64);
+                    enc.set_compute_pipeline_state(&e.pipes.delta_decode_step);
+                    enc.set_buffer(0, Some(&st.delta), 0);
+                    enc.set_buffer(1, Some(&ds.conv_out), coff);
+                    enc.set_buffer(2, Some(&ds.conv_out), coff + (key_dim * 4) as u64);
+                    enc.set_buffer(3, Some(&ds.conv_out), coff + (2 * key_dim * 4) as u64);
+                    enc.set_buffer(4, Some(&ds.g), goff);
+                    enc.set_buffer(5, Some(&ds.beta), goff);
+                    enc.set_buffer(6, Some(&ds.dout), zoff);
+                    set_bytes(
+                        enc,
+                        7,
+                        &DeltaStepParams {
+                            d_state: s_dim as u32,
+                            n_v_heads: hv as u32,
+                            group: (hv / hk) as u32,
+                        },
+                    );
+                    gpu::dispatch_grid(enc, s_dim * hv);
+                }
+            }
         }
 
         // 5. the gated output norm — rows are contiguous across (token, head).
