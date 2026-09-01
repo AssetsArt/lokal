@@ -967,7 +967,21 @@ impl<'a> LowMemSession<'a> {
         let cfg = &e.cfg;
         let (h, hd) = (cfg.hidden_size, self.e.dims.head_dim);
         let n = ids.len();
-        let fused_decode = n == 1 && hd <= gpu::DEC_TG && hd.is_multiple_of(4);
+        // DEC_MAX_HD, not DEC_TG. attn_dec_gqa_walk was generalized past a
+        // threadgroup-wide head_dim by quant-decode-hd256 (merge 46d5880) and this
+        // backend dispatches the SAME kernel, so the ceiling here was the metal
+        // path's old one left behind — qwen35 (hd 256) fell to the prefill-shaped
+        // encoder for every decode step, matmuls at n = 1.
+        //
+        // Why this is not the deferral the dense f16 path took (metal.rs's
+        // `NOTE: still DEC_TG`): that path stays capped because its FUSED enc_qkv
+        // has never run at hd > 128 and no f16 checkpoint exercises it. lowmem has
+        // no fused qkv — enc_attn_decode issues three separate bound matvecs — so
+        // every kernel this condition admits is either head_dim-agnostic (matvec,
+        // rmsnorm_dim, rope_qk_decode, which takes rot_dim) or the generalized
+        // decode-attention pair. Same shape as the metal QUANT path this backend
+        // is the twin of, and the same ceiling it now carries.
+        let fused_decode = n == 1 && hd <= gpu::DEC_MAX_HD && hd.is_multiple_of(4);
         // One session encodes at a time — concurrent serve sessions serialize
         // here and stay correct (documented D10 behavior).
         let mut pool = e.pool.lock().map_err(|_| "lowmem pool lock poisoned")?;
