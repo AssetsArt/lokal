@@ -484,8 +484,13 @@ pub(crate) struct DeltaNetLayerState {
     /// Rolling conv history, (d_conv−1)·C f32 — layout [channel][d_conv−1],
     /// oldest first (matches deltanet_ref::conv_step).
     pub conv: Buffer,
-    /// Delta-rule state [S, S, H_v] f32 — i the contraction index
-    /// (s[i + j·S + h·S·S], matches deltanet_ref::delta_decode_step).
+    /// Delta-rule state [S, S, H_v] f32 — i the contraction index. The GPU
+    /// layout is TRANSPOSED relative to the reference: s[j + i·S + h·S·S] here,
+    /// s[i + j·S + h·S·S] in deltanet_ref, so that a thread's column is strided
+    /// and adjacent threads read adjacent addresses (kernels.metal
+    /// delta_decode_step carries the full note). Allocation, zeroing and reset
+    /// are unaffected — zero is layout-invariant — and nothing outside the
+    /// kernel and its oracle reads the buffer's interior.
     pub delta: Buffer,
 }
 
@@ -4870,6 +4875,29 @@ mod deltanet_kernel_oracle {
     /// Run delta_decode_step for `steps` tokens against one persistent state,
     /// returning every step's output and the final state.
     #[allow(clippy::too_many_arguments)]
+    /// Swap i and j per head. The GPU state is transposed relative to the
+    /// reference (see delta_decode_step's layout note), so the oracle permutes
+    /// on the way in and back on the way out; the permutation is its own
+    /// inverse, which is why one helper serves both directions. Note this is the
+    /// DELTA state only — gpu_conv's state is untouched by this lane.
+    fn permute_delta_state(d: rf::DeltaDims, src: &[f32]) -> Vec<f32> {
+        let s = d.d_state;
+        let mut out = vec![0f32; src.len()];
+        for h in 0..d.n_v_heads {
+            for j in 0..s {
+                for i in 0..s {
+                    out[h * s * s + i * s + j] = src[h * s * s + j * s + i];
+                }
+            }
+        }
+        out
+    }
+
+    /// The oracle's delta step. `reference_layout = true` is the real path: the
+    /// caller hands reference-layout state and gets reference-layout state back.
+    /// `false` uploads the state RAW, i.e. in the pre-transpose orientation —
+    /// which is what the negative control needs, because a half-done transpose
+    /// (kernel moved, caller not) is exactly that.
     fn gpu_delta(
         d: rf::DeltaDims,
         state0: &[f32],
@@ -4878,6 +4906,20 @@ mod deltanet_kernel_oracle {
         v: &[Vec<f32>],
         g: &[Vec<f32>],
         beta: &[Vec<f32>],
+    ) -> (Vec<Vec<f32>>, Vec<f32>) {
+        gpu_delta_layout(d, state0, q, k, v, g, beta, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_delta_layout(
+        d: rf::DeltaDims,
+        state0: &[f32],
+        q: &[Vec<f32>],
+        k: &[Vec<f32>],
+        v: &[Vec<f32>],
+        g: &[Vec<f32>],
+        beta: &[Vec<f32>],
+        reference_layout: bool,
     ) -> (Vec<Vec<f32>>, Vec<f32>) {
         let device = Device::system_default().expect("Metal device required");
         let opts = CompileOptions::new();
@@ -4891,7 +4933,13 @@ mod deltanet_kernel_oracle {
 
         let bytes = |v: &[f32]| (std::mem::size_of_val(v)) as u64;
         let shared = MTLResourceOptions::StorageModeShared;
-        let st = device.new_buffer_with_data(state0.as_ptr() as *const _, bytes(state0), shared);
+        let uploaded = if reference_layout {
+            permute_delta_state(d, state0)
+        } else {
+            state0.to_vec()
+        };
+        let st =
+            device.new_buffer_with_data(uploaded.as_ptr() as *const _, bytes(&uploaded), shared);
         let n_out = d.d_state * d.n_v_heads;
         let out = device.new_buffer((n_out * 4) as u64, shared);
 
@@ -4934,8 +4982,9 @@ mod deltanet_kernel_oracle {
                 unsafe { std::slice::from_raw_parts(out.contents() as *const f32, n_out) }.to_vec(),
             );
         }
-        let final_state =
+        let raw =
             unsafe { std::slice::from_raw_parts(st.contents() as *const f32, state0.len()) }.to_vec();
+        let final_state = if reference_layout { permute_delta_state(d, &raw) } else { raw };
         (outs, final_state)
     }
 
@@ -5707,7 +5756,20 @@ mod deltanet_kernel_oracle {
         let rd = |b: &metal::Buffer, n: usize| unsafe {
             std::slice::from_raw_parts(b.contents() as *const f32, n)
         }.to_vec();
-        (outs, rd(&conv_state, d.conv_state_elems()), rd(&delta_state, d.delta_state_elems()))
+        // The delta state comes back in the GPU's TRANSPOSED layout and the
+        // caller compares it against the reference's, so permute it here. The
+        // conv state is not transposed and must not be touched. The upload side
+        // needs nothing: this oracle starts the delta state at zero, and zero is
+        // layout-invariant. (§7 enumerated gpu_delta/delta_inputs as the sites;
+        // this third one is the same class and is inside the boundary, so it is
+        // implementation judgment rather than a plan divergence worth a
+        // challenge — but it is the site the memo's list missed, and the
+        // existing test is what found it.)
+        (
+            outs,
+            rd(&conv_state, d.conv_state_elems()),
+            permute_delta_state(d, &rd(&delta_state, d.delta_state_elems())),
+        )
     }
 
     /// THE SINGLE-LAYER IDENTITY GATE: one real deltanet block, on real
@@ -6124,31 +6186,35 @@ mod deltanet_kernel_oracle {
         );
     }
 
-    /// The comparison must be able to see a TRANSPOSED state. The layout is
-    /// s[i + j*S + h*S*S] with i the contraction index; a kernel that swapped
-    /// i and j would produce finite, plausible numbers. Feeding the reference a
-    /// per-head transposed state has to break the match — if it does not, the
-    /// oracle is not testing the layout at all.
+    /// RE-POINTED, not deleted (docs/deltanet-chain-design.md §7 risk 1). This
+    /// control used to fire when the REFERENCE was fed a transposed state, back
+    /// when GPU and reference shared one layout. They no longer do: the kernel
+    /// reads s[j + i*S + h*S*S] and the reference s[i + j*S + h*S*S]. What must
+    /// be caught now is a HALF-DONE transpose — kernel moved, caller not — which
+    /// is exactly uploading the state in the old orientation, and which produces
+    /// finite, plausible, wrong numbers that nothing else would notice.
+    ///
+    /// This is not hypothetical: while landing this lane the kernel was
+    /// transposed before the oracle was, and the existing tests failed
+    /// immediately. This control is what keeps that true for the next change.
     #[test]
-    fn delta_oracle_sees_a_transposed_state() {
+    fn delta_oracle_sees_the_old_state_orientation() {
         let d = dims();
         let mut seed = 0x5EED_1234u32;
         let (state0, q, k, v, g, beta) = delta_inputs(d, 1, &mut seed, false);
-        let (gpu_outs, _) = gpu_delta(d, &state0, &q, &k, &v, &g, &beta);
-
-        let s = d.d_state;
-        let mut transposed = state0.clone();
-        for h in 0..d.n_v_heads {
-            for j in 0..s {
-                for i in 0..s {
-                    transposed[h * s * s + j * s + i] = state0[h * s * s + i * s + j];
-                }
-            }
-        }
-        let want = rf::delta_decode_step(&d, &mut transposed, &q[0], &k[0], &v[0], &g[0], &beta[0]);
+        let (right, right_state) = gpu_delta_layout(d, &state0, &q, &k, &v, &g, &beta, true);
+        let (wrong, wrong_state) = gpu_delta_layout(d, &state0, &q, &k, &v, &g, &beta, false);
         assert!(
-            want.iter().zip(&gpu_outs[0]).any(|(a, b)| a.to_bits() != b.to_bits()),
-            "a transposed state must change the output, or the layout is untested"
+            right[0].iter().zip(&wrong[0]).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "uploading the state in the OLD orientation must change the output — if it \
+             does not, the kernel is not reading the layout it claims and a half-done \
+             transpose would ship silently"
+        );
+        assert!(
+            right_state.iter().zip(&wrong_state).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "the resulting STATE must differ too: the kernel writes through the same \
+             addresses it reads, so a control checking only the output would miss a \
+             transpose done half-way on the write side"
         );
     }
 }

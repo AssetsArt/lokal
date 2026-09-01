@@ -3703,9 +3703,24 @@ struct DeltaStepParams {
 /// before that column is read, which is the reference's ordering restricted to
 /// one column.
 ///
-/// State layout is ggml's: s[i + j*S + h*S*S], i the CONTRACTION index. Reading
-/// it transposed gives plausible finite numbers and wrong answers — the oracle
-/// carries a transposed negative control for exactly that.
+/// STATE LAYOUT IS TRANSPOSED RELATIVE TO THE REFERENCE, deliberately, and this
+/// is the only place that fact lives in the kernel: the GPU state is
+/// s[j + i*S + h*S*S] where ggml and `deltanet_ref` use s[i + j*S + h*S*S], i
+/// the CONTRACTION index. The reason is purely addressing: a thread owns one
+/// (h, j) column and walks i, so under the reference layout adjacent threads sit
+/// S floats — 512 bytes at S=128 — apart on EVERY load, and a 32-lane simdgroup
+/// issues 32 separate line requests per instruction. Transposed, adjacent
+/// threads read adjacent addresses and the simdgroup's loads coalesce.
+///
+/// The arithmetic is untouched: i is still the contraction index and the
+/// summation order over i is exactly the reference's, so this is bit-identical
+/// to the pre-transpose kernel, not merely close. Callers that seed or read the
+/// state (the oracle) must permute; callers that only allocate, zero, or bind it
+/// (lowmem, DeltaNetStates::new/reset) need no change, because zero is
+/// layout-invariant and nothing else touches the buffer's interior.
+///
+/// Reading it in the OLD orientation gives plausible finite numbers and wrong
+/// answers — the oracle carries a negative control pointed at exactly that.
 kernel void delta_decode_step(
     device float *state [[buffer(0)]],       // [S*S*H_v], updated in place
     device const float *q [[buffer(1)]],     // [S*H_k]
@@ -3730,7 +3745,9 @@ kernel void delta_decode_step(
     uint j = gid - h * s_dim;
     uint kh_base = (h / p.group) * s_dim;
 
-    device float *st = state + (ulong)h * s_dim * s_dim + (ulong)j * s_dim;
+    // Transposed: the column's elements are S apart, so thread j and thread j+1
+    // read adjacent floats. See the layout note above.
+    device float *st = state + (ulong)h * s_dim * s_dim + (ulong)j;
     device const float *kh = k + kh_base;
     device const float *qh = q + kh_base;
 
@@ -3740,15 +3757,15 @@ kernel void delta_decode_step(
 
     float sk = 0.0f;
     for (uint i = 0; i < s_dim; i++) {
-        float s = st[i] * ge;
-        st[i] = s;
+        float s = st[i * s_dim] * ge;
+        st[i * s_dim] = s;
         sk += s * kh[i];
     }
     float d = (v[h * s_dim + j] - sk) * b;
     float o = 0.0f;
     for (uint i = 0; i < s_dim; i++) {
-        float s = st[i] + kh[i] * d;
-        st[i] = s;
+        float s = st[i * s_dim] + kh[i] * d;
+        st[i * s_dim] = s;
         // q is scaled per element exactly as the reference does it (one
         // rounding for q·scale, then the product, then the add).
         o += s * (qh[i] * scale);
