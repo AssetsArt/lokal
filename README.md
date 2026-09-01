@@ -293,8 +293,11 @@ lokal path [-m <model>]   download if needed, then print the model's local direc
 -p, --prompt <text>      prompt text
 -n, --max-tokens <N>     generation budget                      [200]
     --memory-budget <MB> lowmem: working-set budget            [4096]
-    --context-window <N> lowmem: attention window, tokens      [2048]
-    --attention-sink <N> lowmem: pinned initial tokens, 0=off     [4]
+    --context-window <N> sliding attention window, tokens — not the
+                         model's context limit; opt-in on metal/hybrid,
+                         always on for lowmem            [lowmem: 2048]
+    --attention-sink <N> with --context-window: pinned initial
+                         tokens, 0=off                            [4]
 -t, --temperature <T>    0 = greedy/deterministic               [0.7]
     --top-p <P>          nucleus sampling threshold             [0.9]
     --seed <N>           reproducible sampling
