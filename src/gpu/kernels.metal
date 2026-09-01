@@ -2826,10 +2826,15 @@ kernel void attention_prefill_flash(
 // is baked in per model via the GQA_CHUNK function constant; a group wider than
 // MAX_GQA_CHUNK is covered by several chunks (grid x = kv heads × chunks).
 //
-// Requires head_dim <= DEC_TG (the Rust side falls back to the kernel above otherwise).
+// Requires head_dim <= DEC_TG * MAX_DEC_DPT (the Rust side falls back to the kernel
+// above otherwise). Up to DEC_TG the geometry is one thread per output dim; beyond it
+// (qwen35's head_dim 256) each thread carries MAX_DEC_DPT dims — see phase 3.
 
 #define ATTN_SPLIT 128 // cached positions per window
 #define DEC_TG 128     // threads per threadgroup: one per position in the window
+// Output dims one thread accumulates in phase 3. 1 while head_dim <= DEC_TG, which is
+// what keeps that geometry — and its summation order — exactly what it always was.
+#define MAX_DEC_DPT 2
 // Upper bound on q heads per threadgroup — sizes the per-thread accumulator arrays.
 #define MAX_GQA_CHUNK 8
 // q heads actually processed per threadgroup: min(n_heads / n_kv_heads, MAX_GQA_CHUNK),
@@ -2959,25 +2964,46 @@ static GqaPartial attn_dec_gqa_walk(
     }
 
     // Weighted V sum, threads reshaped as (position lane × output dim): each V element
-    // is read once and weighted into every head of the group. tid = pl * hd + di, so
+    // is read once and weighted into every head of the group. tid = pl * W + d0, so
     // each output dim is covered by P position lanes.
-    uint P = DEC_TG / hd;
-    uint pl = tid / hd;
-    uint di = tid % hd;
-    float acc[MAX_GQA_CHUNK] = {};
+    //
+    // W is the dim lane's width. While head_dim <= DEC_TG it IS head_dim: one thread
+    // per dim, P = DEC_TG/hd position lanes, DPT = 1 — the original geometry, and at
+    // DPT = 1 the loops below issue exactly the original FMAs in the original ORDER,
+    // which is what keeps every hd <= 128 model byte-stable. Above DEC_TG there are
+    // fewer threads than dims (qwen35: 128 threads, 256 dims), so the lane narrows to
+    // DEC_TG, P collapses to 1, and each thread carries DPT dims strided by W.
+    uint W = min(hd, (uint)DEC_TG);
+    uint P = DEC_TG / W;
+    uint DPT = (hd + W - 1) / W;
+    uint pl = tid / W;
+    uint d0 = tid % W;
+    float acc[MAX_GQA_CHUNK][MAX_DEC_DPT] = {};
     if (pl < P) {
         for (uint tt = t0 + pl; tt < t_end; tt += P) {
-            float v = (float)v_cache[(ulong)tt * kvd + kv_off + di];
-            for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
-                if (g < GQA_CHUNK) {
-                    acc[g] += es[g * ATTN_SPLIT + tt - t0] * v;
+            for (uint u = 0; u < DPT; u++) {
+                uint di = d0 + u * W;
+                if (di >= hd) {
+                    break;
+                }
+                float v = (float)v_cache[(ulong)tt * kvd + kv_off + di];
+                for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
+                    if (g < GQA_CHUNK) {
+                        acc[g][u] += es[g * ATTN_SPLIT + tt - t0] * v;
+                    }
                 }
             }
         }
     }
-    for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
-        if (g < GQA_CHUNK) {
-            acc_red[tid * ACC_STRIDE + g] = acc[g];
+    for (uint u = 0; u < DPT; u++) {
+        uint di = d0 + u * W;
+        if (di >= hd) {
+            break;
+        }
+        for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
+            if (g < GQA_CHUNK) {
+                acc_red[(pl * hd + di) * ACC_STRIDE + g] = acc[g][u];
+            }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3016,19 +3042,24 @@ kernel void attention_decode_partial(
 
     device float *out = partials + ((ulong)head_base * p.n_splits + tg.y) * (hd + 2);
     ulong head_stride = (ulong)p.n_splits * (hd + 2);
-    uint P = DEC_TG / hd;
+    // The same (W, P) reshape phase 3 used: at hd <= DEC_TG that is one dim per
+    // thread and a single trip through the di loop, exactly as before.
+    uint W = min(hd, (uint)DEC_TG);
+    uint P = DEC_TG / W;
     for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
         if (g < GQA_CHUNK && g < local_n) {
             if (tid == 0) {
                 out[g * head_stride] = o.m[g];
                 out[g * head_stride + 1] = o.l[g];
             }
-            if (tid < hd) {
-                float a = 0.0f;
-                for (uint j = 0; j < P; j++) {
-                    a += acc_red[(j * hd + tid) * ACC_STRIDE + g];
+            if (tid < W) {
+                for (uint di = tid; di < hd; di += W) {
+                    float a = 0.0f;
+                    for (uint j = 0; j < P; j++) {
+                        a += acc_red[(j * hd + di) * ACC_STRIDE + g];
+                    }
+                    out[g * head_stride + 2 + di] = a;
                 }
-                out[g * head_stride + 2 + tid] = a;
             }
         }
     }
@@ -3284,19 +3315,24 @@ kernel void attention_decode_partial_batch(
     device float *out = partials
         + (((ulong)b * p.n_heads + head_base) * p.splits_max + tg.y) * (hd + 2);
     ulong head_stride = (ulong)p.splits_max * (hd + 2);
-    uint P = DEC_TG / hd;
+    // The same (W, P) reshape phase 3 used: at hd <= DEC_TG that is one dim per
+    // thread and a single trip through the di loop, exactly as before.
+    uint W = min(hd, (uint)DEC_TG);
+    uint P = DEC_TG / W;
     for (uint g = 0; g < MAX_GQA_CHUNK; g++) {
         if (g < GQA_CHUNK && g < local_n) {
             if (tid == 0) {
                 out[g * head_stride] = o.m[g];
                 out[g * head_stride + 1] = o.l[g];
             }
-            if (tid < hd) {
-                float a = 0.0f;
-                for (uint j = 0; j < P; j++) {
-                    a += acc_red[(j * hd + tid) * ACC_STRIDE + g];
+            if (tid < W) {
+                for (uint di = tid; di < hd; di += W) {
+                    float a = 0.0f;
+                    for (uint j = 0; j < P; j++) {
+                        a += acc_red[(j * hd + di) * ACC_STRIDE + g];
+                    }
+                    out[g * head_stride + 2 + di] = a;
                 }
-                out[g * head_stride + 2 + tid] = a;
             }
         }
     }
