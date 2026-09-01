@@ -190,6 +190,10 @@ struct Pipelines {
     // qwen35's gated-deltanet block — shared kernel source with lowmem, so the
     // two engines dispatch the SAME code and byte-identity is achievable.
     ssm_conv_decode: ComputePipelineState,
+    /// The chunk-wide conv pair: one dispatch for every (token, channel), then
+    /// one that rolls the window forward by the whole chunk.
+    ssm_conv_prefill: ComputePipelineState,
+    ssm_conv_roll: ComputePipelineState,
     delta_decode_step: ComputePipelineState,
     delta_gates: ComputePipelineState,
     l2norm_rows: ComputePipelineState,
@@ -871,6 +875,8 @@ impl MetalEngine {
             silu_mul: pipe("silu_mul")?,
             add_inplace: pipe("add_inplace")?,
             ssm_conv_decode: pipe("ssm_conv_decode")?,
+            ssm_conv_prefill: pipe("ssm_conv_prefill")?,
+            ssm_conv_roll: pipe("ssm_conv_roll")?,
             delta_decode_step: pipe("delta_decode_step")?,
             delta_gates: pipe("delta_gates")?,
             l2norm_rows: pipe("l2norm_rows")?,
@@ -2705,6 +2711,17 @@ impl MetalSession<'_> {
             ($($b:expr),+) => { if conc { enc.memory_barrier_with_resources(&[$($b),+]) } };
         }
 
+        // DECODE keeps the per-token chain byte-for-byte. It is one token, so
+        // there is nothing to batch, and it is the path that just earned an 11x
+        // on lowmem and a 15x here — re-routing it in the lane that rewrites
+        // prefill would put both at risk for no gain. The batched path's n = 1
+        // case is proven EQUAL to this one as a test (memo §6 T2's constructed
+        // bit-exact half), not assumed by shipping through it.
+        if n > 1 {
+            self.enc_delta_block_chunk(enc, la, l, n, conc);
+            return;
+        }
+
         for t in 0..n {
             let (goff, coff, zoff) =
                 ((t * hv * 4) as u64, (t * c_all * 4) as u64, (t * inner * 4) as u64);
@@ -2718,6 +2735,13 @@ impl MetalSession<'_> {
             enc.set_buffer(5, Some(&ds.beta), goff);
             let hv32 = hv as u32;
             enc.set_bytes(6, 4, &hv32 as *const u32 as *const _);
+            // n_tokens. NOT optional: Metal binds by index at runtime, so a
+            // buffer this kernel declares and the caller never sets is read from
+            // whatever was there — no compile error, no crash, just a guard
+            // computed from garbage. That is what this lane shipped for one
+            // build, and the cell table is what caught it.
+            let one_tok = 1u32;
+            enc.set_bytes(7, 4, &one_tok as *const u32 as *const _);
             dispatch_grid(enc, hv);
             bar!(&ds.g, &ds.beta);
 
@@ -2742,6 +2766,8 @@ impl MetalSession<'_> {
                 enc.set_buffer(0, Some(&ds.conv_out), coff + off);
                 enc.set_bytes(1, 4, &s32 as *const u32 as *const _);
                 enc.set_bytes(2, 4, &eps as *const f32 as *const _);
+                let no_stride = 0u32; // one token: the grid's y index is 0
+                enc.set_bytes(3, 4, &no_stride as *const u32 as *const _);
                 enc.dispatch_thread_groups(MTLSize::new(hk as u64, 1, 1), MTLSize::new(256, 1, 1));
             }
             bar!(&ds.conv_out);
@@ -2785,6 +2811,142 @@ impl MetalSession<'_> {
     /// Rust binary has no ambient autorelease pool — without one the diagnosis
     /// mode would grow the process for the length of the run. The untimed path
     /// keeps the exact call it has always had.
+    /// The same six stages over a WHOLE prefill chunk. Four of them have no
+    /// cross-token dependency at all and collapse to one dispatch each; the
+    /// delta rule keeps its per-token loop here and loses it in the next commit.
+    ///
+    /// Ordering, which is the whole difficulty on the CONCURRENT prefill
+    /// encoder: `ssm_conv_roll` WRITES the window `ssm_conv_prefill` READ, so
+    /// the barrier between them names `st.conv` — a write-after-read hazard,
+    /// the kind that leaves no trace when it fires because every early token
+    /// simply convolves against a window from the wrong end of the chunk and
+    /// still produces fluent text.
+    fn enc_delta_block_chunk(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        la: &QuantLinearAttn,
+        l: usize,
+        n: usize,
+        conc: bool,
+    ) {
+        let e = self.engine;
+        let d = e.deltanet_dims().expect("deltanet dims on a deltanet checkpoint");
+        let ds = self.ds_ref();
+        let st = self.deltanet.as_ref().expect("deltanet states").layers[l]
+            .as_ref()
+            .expect("every linear layer owns recurrent state");
+        let eps = e.cfg.rms_norm_eps;
+        let (s_dim, hv, hk) = (d.d_state, d.n_v_heads, d.n_k_heads);
+        let (key_dim, inner, c_all) = (s_dim * hk, d.d_inner(), d.conv_channels());
+        let s32 = s_dim as u32;
+        macro_rules! bar {
+            ($($b:expr),+) => { if conc { enc.memory_barrier_with_resources(&[$($b),+]) } };
+        }
+        #[repr(C)]
+        struct SsmConvBatchParams {
+            channels: u32,
+            d_conv: u32,
+            n_tokens: u32,
+        }
+        #[repr(C)]
+        struct DeltaStepParams {
+            d_state: u32,
+            n_v_heads: u32,
+            group: u32,
+        }
+        let cp = SsmConvBatchParams {
+            channels: c_all as u32,
+            d_conv: d.d_conv as u32,
+            n_tokens: n as u32,
+        };
+        // 1. the two per-head scalars, every token at once.
+        enc.set_compute_pipeline_state(&e.pipes.delta_gates);
+        enc.set_buffer(0, Some(&ds.alpha), 0);
+        enc.set_buffer(1, Some(&ds.beta_p), 0);
+        enc.set_buffer(2, Some(&la.a), 0);
+        enc.set_buffer(3, Some(&la.dt_bias), 0);
+        enc.set_buffer(4, Some(&ds.g), 0);
+        enc.set_buffer(5, Some(&ds.beta), 0);
+        let hv32 = hv as u32;
+        let n32 = n as u32;
+        enc.set_bytes(6, 4, &hv32 as *const u32 as *const _);
+        enc.set_bytes(7, 4, &n32 as *const u32 as *const _);
+        dispatch_grid(enc, n * hv);
+        bar!(&ds.g, &ds.beta);
+
+        // 2. the conv for every (token, channel), then the window rolled once
+        //    for the whole chunk.
+        enc.set_compute_pipeline_state(&e.pipes.ssm_conv_prefill);
+        enc.set_buffer(0, Some(&st.conv), 0);
+        enc.set_buffer(1, Some(&ds.qkv), 0);
+        enc.set_buffer(2, Some(&la.conv1d), 0);
+        enc.set_buffer(3, Some(&ds.conv_out), 0);
+        enc.set_bytes(4, size_of::<SsmConvBatchParams>() as u64, &cp as *const _ as *const _);
+        dispatch_grid(enc, n * c_all);
+        // WAR on st.conv, plus the read-after-write on conv_out.
+        bar!(&ds.conv_out, &st.conv);
+        enc.set_compute_pipeline_state(&e.pipes.ssm_conv_roll);
+        enc.set_buffer(0, Some(&st.conv), 0);
+        enc.set_buffer(1, Some(&ds.qkv), 0);
+        enc.set_bytes(2, size_of::<SsmConvBatchParams>() as u64, &cp as *const _ as *const _);
+        dispatch_grid(enc, c_all);
+        bar!(&st.conv);
+
+        // 3. l2-normalise q and k for every token — the grid's y axis is the
+        //    token and `tok_stride` walks it.
+        let cstride = c_all as u32;
+        for off in [0u64, (key_dim * 4) as u64] {
+            enc.set_compute_pipeline_state(&e.pipes.l2norm_rows);
+            enc.set_buffer(0, Some(&ds.conv_out), off);
+            enc.set_bytes(1, 4, &s32 as *const u32 as *const _);
+            enc.set_bytes(2, 4, &eps as *const f32 as *const _);
+            enc.set_bytes(3, 4, &cstride as *const u32 as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(hk as u64, n as u64, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+        bar!(&ds.conv_out);
+
+        // 4. the delta rule — still one dispatch per token; the state is
+        //    read-modify-written, so token t+1 must see token t's writes.
+        for t in 0..n {
+            let (goff, coff, zoff) =
+                ((t * hv * 4) as u64, (t * c_all * 4) as u64, (t * inner * 4) as u64);
+            enc.set_compute_pipeline_state(&e.pipes.delta_decode_step);
+            enc.set_buffer(0, Some(&st.delta), 0);
+            enc.set_buffer(1, Some(&ds.conv_out), coff);
+            enc.set_buffer(2, Some(&ds.conv_out), coff + (key_dim * 4) as u64);
+            enc.set_buffer(3, Some(&ds.conv_out), coff + (2 * key_dim * 4) as u64);
+            enc.set_buffer(4, Some(&ds.g), goff);
+            enc.set_buffer(5, Some(&ds.beta), goff);
+            enc.set_buffer(6, Some(&ds.dout), zoff);
+            let dp = DeltaStepParams {
+                d_state: s32,
+                n_v_heads: hv as u32,
+                group: (hv / hk) as u32,
+            };
+            enc.set_bytes(7, size_of::<DeltaStepParams>() as u64, &dp as *const _ as *const _);
+            dispatch_grid(enc, s_dim * hv);
+            bar!(&ds.dout, &st.delta);
+        }
+
+        // 5. the gated output norm. Head h of token t sits at (t·H_v + h)·S, so
+        //    the rows are already contiguous across the chunk and this needs no
+        //    stride — one threadgroup per (token, head).
+        enc.set_compute_pipeline_state(&e.pipes.gated_output_norm);
+        enc.set_buffer(0, Some(&ds.dout), 0);
+        enc.set_buffer(1, Some(&la.ssm_norm), 0);
+        enc.set_buffer(2, Some(&ds.z), 0);
+        enc.set_bytes(3, 4, &s32 as *const u32 as *const _);
+        enc.set_bytes(4, 4, &eps as *const f32 as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new((n * hv) as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        bar!(&ds.dout);
+    }
+
     fn run_from_quant(
         &mut self,
         src: Source<'_>,
@@ -5564,6 +5726,8 @@ mod deltanet_kernel_oracle {
         }
         let n32 = n as u32;
         enc.set_bytes(6, 4, &n32 as *const u32 as *const _);
+        let one = 1u32; // this helper drives one token's worth of heads
+        enc.set_bytes(7, 4, &one as *const u32 as *const _);
         enc.dispatch_thread_groups(
             MTLSize::new(((n + 63) / 64) as u64, 1, 1), MTLSize::new(64, 1, 1));
         enc.end_encoding();
@@ -6078,6 +6242,8 @@ mod deltanet_kernel_oracle {
         let d32 = dim as u32;
         enc.set_bytes(1, 4, &d32 as *const u32 as *const _);
         enc.set_bytes(2, 4, &eps as *const f32 as *const _);
+        let stride0 = 0u32; // single token: the y index is 0, so the stride is unused
+        enc.set_bytes(3, 4, &stride0 as *const u32 as *const _);
         // One threadgroup per row, NORM_TG threads wide — the kernel strides.
         enc.dispatch_thread_groups(MTLSize::new(rows.len() as u64, 1, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();

@@ -3646,14 +3646,24 @@ kernel void attn_out_gate(
 /// identical trade in its own kernel_l2_norm_impl (threadgroup float). So the
 /// oracle proves the exact half on data where the two accumulations provably
 /// agree, and bounds only the accumulation difference.
+///
+/// BATCHED FORM: the grid is (rows_per_token, n_tokens) and `tok_stride` is the
+/// float distance from one token's row block to the next. At n_tokens = 1 the y
+/// index is 0 and the address reduces to `x + row * dim` — the decode call is
+/// the same arithmetic it always was, which is what lets one kernel serve both.
 kernel void l2norm_rows(
     device float *x [[buffer(0)]],
     constant uint &dim [[buffer(1)]],
     constant float &eps [[buffer(2)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]])
+    constant uint &tok_stride [[buffer(3)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    // uint2, not uint: Metal requires the threadgroup-position and
+    // thread-position attributes to agree in rank, and rejects the mismatch at
+    // compile time rather than at dispatch.
+    uint2 tid2 [[thread_position_in_threadgroup]])
 {
-    device float *r = x + (ulong)row * dim;
+    uint tid = tid2.x;
+    device float *r = x + (ulong)tg.y * tok_stride + (ulong)tg.x * dim;
     threadgroup float partial[NORM_TG / 32];
     float acc = 0.0f;
     for (uint i = tid; i < dim; i += NORM_TG) {
@@ -3839,23 +3849,105 @@ kernel void gated_output_norm(
 /// optimisation, it is the reference's exact form — and it is what lets the
 /// oracle assert a BIT-EXACT half, since above the threshold no transcendental
 /// runs at all.
+///
+/// BATCHED FORM: `n_tokens` slices of H_v, one thread each. a and dt_bias are
+/// per-head weights shared by every token, so the head index is gid % H_v. At
+/// n_tokens = 1 that is gid and every load below is the one it always was.
 kernel void delta_gates(
-    device const float *alpha [[buffer(0)]],   // [H_v] projection output
-    device const float *beta_in [[buffer(1)]], // [H_v] projection output
+    device const float *alpha [[buffer(0)]],   // [n][H_v] projection output
+    device const float *beta_in [[buffer(1)]], // [n][H_v] projection output
     device const float *a [[buffer(2)]],       // [H_v] ssm_a
     device const float *dt_bias [[buffer(3)]], // [H_v] ssm_dt.bias
-    device float *g [[buffer(4)]],             // [H_v]
-    device float *beta [[buffer(5)]],          // [H_v]
+    device float *g [[buffer(4)]],             // [n][H_v]
+    device float *beta [[buffer(5)]],          // [n][H_v]
     constant uint &n_v_heads [[buffer(6)]],
+    constant uint &n_tokens [[buffer(7)]],
     uint gid [[thread_position_in_grid]])
 {
-    if (gid >= n_v_heads) {
+    if (gid >= n_v_heads * n_tokens) {
         return;
     }
-    float x = alpha[gid] + dt_bias[gid];
+    uint h = gid % n_v_heads;
+    float x = alpha[gid] + dt_bias[h];
     float sp = x > 20.0f ? x : log(1.0f + exp(x));
-    g[gid] = a[gid] * sp;
+    g[gid] = a[h] * sp;
     beta[gid] = 1.0f / (1.0f + exp(-beta_in[gid]));
+}
+
+struct SsmConvBatchParams {
+    uint channels;  // C
+    uint d_conv;    // k
+    uint n_tokens;  // n
+};
+
+/// The depthwise conv over a WHOLE prefill chunk — one thread per (token,
+/// channel), no sequential dependency at all.
+///
+/// The decode form rolls a window because it sees one token; over a chunk the
+/// window for token t is simply the inputs at t-(k-1) .. t-1, which are already
+/// in `x` for t >= k-1 and come from the incoming state only for the first few
+/// tokens. So `w(u)` below reads the state for u < 0 and `x` otherwise, and the
+/// taps are accumulated j = 0 .. k-1 IN THE REFERENCE'S ORDER — the stored
+/// window first, this token's own input against the last filter tap last. That
+/// ordering is why this is bit-identical to `ssm_conv_decode` applied n times,
+/// not merely equal in real arithmetic.
+///
+/// `state` is READ-ONLY here. Rolling it is `ssm_conv_roll`'s job precisely
+/// because every early token reads the window this would write: one dispatch
+/// cannot both read and write it without a cross-threadgroup race, and a race
+/// here would be silent — early tokens would convolve against a window from the
+/// wrong end of the chunk and still produce fluent text.
+kernel void ssm_conv_prefill(
+    device const float *state [[buffer(0)]],  // [C][k-1] incoming window, oldest first
+    device const float *x [[buffer(1)]],      // [n][C]
+    device const float *w [[buffer(2)]],      // [C][k]
+    device float *out [[buffer(3)]],          // [n][C]
+    constant SsmConvBatchParams &p [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+#pragma clang fp contract(off)
+    uint C = p.channels, k = p.d_conv, n = p.n_tokens;
+    if (gid >= n * C) {
+        return;
+    }
+    uint t = gid / C;
+    uint c = gid - t * C;
+    device const float *st = state + (ulong)c * (k - 1);
+    device const float *kern = w + (ulong)c * k;
+    float acc = 0.0f;
+    for (uint j = 0; j + 1 < k; j++) {
+        int u = (int)t - (int)(k - 1) + (int)j;
+        float wv = (u < 0) ? st[(uint)((int)(k - 1) + u)] : x[(ulong)u * C + c];
+        acc += wv * kern[j];
+    }
+    acc += x[(ulong)t * C + c] * kern[k - 1];
+    out[(ulong)t * C + c] = acc * (1.0f / (1.0f + exp(-acc)));
+}
+
+/// The conv window as it stands after a whole chunk: the last (k-1) inputs.
+/// Staged through registers because when n < k-1 the new window still contains
+/// entries of the old one, and writing in place would clobber a value a later
+/// slot still needs. d_conv is bounded at 8 here; the Rust side refuses a
+/// checkpoint above that rather than silently truncating.
+kernel void ssm_conv_roll(
+    device float *state [[buffer(0)]],        // [C][k-1]
+    device const float *x [[buffer(1)]],      // [n][C]
+    constant SsmConvBatchParams &p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint C = p.channels, k = p.d_conv, n = p.n_tokens;
+    if (gid >= C) {
+        return;
+    }
+    device float *st = state + (ulong)gid * (k - 1);
+    float tmp[8];
+    for (uint m = 0; m + 1 < k; m++) {
+        int u = (int)n - (int)(k - 1) + (int)m;
+        tmp[m] = (u < 0) ? st[(uint)((int)(k - 1) + u)] : x[(ulong)u * C + gid];
+    }
+    for (uint m = 0; m + 1 < k; m++) {
+        st[m] = tmp[m];
+    }
 }
 
 struct QGSplitParams {
