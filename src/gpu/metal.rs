@@ -2870,15 +2870,7 @@ impl MetalSession<'_> {
         // -only helpers below cost nothing on checkpoints that lack the joint
         // Q+gate projection.
         let qg_n = u32::from(self.qg.is_some());
-        // Dispatches the deltanet chain actually issues, which is what the
-        // attribution table's `disp` column reports. Decode still runs the
-        // per-token chain (6 kernels for its one token); a prefill chunk runs
-        // SEVEN for the whole chunk — gates 1, conv 2 (the roll cannot share a
-        // dispatch with the read), l2norm 2, delta 1, gated norm 1 — regardless
-        // of how many tokens are in it. Leaving the old `6 * n` here would have
-        // the instrument keep reporting 237,384 dispatches for a prompt that now
-        // issues 630, which is precisely the number this lane exists to move.
-        let dn_disp: u32 = if n == 1 { 6 } else { 7 };
+        let dn_disp = 6 * n as u32; // the deltanet chain's kernels per token
         macro_rules! bar {
             ($($b:expr),+) => { if conc { pe.cur().memory_barrier_with_resources(&[$($b),+]) } };
         }
