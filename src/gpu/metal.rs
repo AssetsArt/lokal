@@ -1555,6 +1555,23 @@ fn acc_red_elems(chunk: usize, head_dim: usize) -> usize {
     DEC_TG.max(head_dim) * (chunk | 1)
 }
 
+/// Host-side mirror of the shader's lm_row_bytes, for the probe's byte
+/// accounting only — a GB/s number is meaningless without the exact byte count,
+/// and reading it off the shader is not possible from Rust. Kept next to nothing
+/// else so it cannot be mistaken for a sizing rule anything dispatches against.
+fn lm_row_bytes_host(sel: u32, in_dim: u32) -> u64 {
+    let n32 = (in_dim / 32) as u64;
+    let n256 = (in_dim / 256) as u64;
+    match sel {
+        2 => n32 * 34, 3 => n32 * 18, 4 => n256 * 144, 5 => n256 * 210,
+        6 => n256 * 176, 7 => n32 * 22, 8 => n256 * 84, 9 => n256 * 110,
+        10 => n32 * 18, 11 => n256 * 136, 12 => n256 * 98, 13 => n256 * 110,
+        14 => n256 * 66, 15 => n256 * 74, 16 => n256 * 82, 17 => n256 * 50,
+        18 => n256 * 56,
+        _ => (in_dim as u64) * 2,
+    }
+}
+
 /// One-thread-per-element dispatch — kernels guard the tail with `if (gid < dim)`.
 pub(crate) fn dispatch_grid(enc: &ComputeCommandEncoderRef, n: usize) {
     let tg = 256u64;
@@ -1847,7 +1864,123 @@ impl MetalEngine {
         })
     }
 
+    /// DIAGNOSTIC, env-gated (`LOKAL_MATVEC_PROBE=1`), never on a normal path.
+    ///
+    /// The quant matvec family reads a uniform 65-70 GB/s on a ~200 GB/s box and
+    /// this lane has now falsified two explanations for it from the inside:
+    /// packed 4-byte loads did not move lm_head (6.492 -> 6.532 ms), and
+    /// read-amplification cannot be it because Q8_0 amplifies 1.0x while Q6_K
+    /// amplifies 2.55x and both measure the same GB/s. What no per-type kernel
+    /// change can test is the DISPATCH SHAPE itself, which is identical for every
+    /// type. So: run the same bytes through the same shape with the dequant cost
+    /// removed (probe_shape), and through a flat coalesced stream (probe_linear).
+    /// The real matvec runs beside them as the in-run reference, so all three
+    /// numbers come from one process, one buffer and one machine state.
+    fn run_matvec_probe(&self) {
+        let Some(q) = &self.quant else {
+            eprintln!("probe skip reason=not-a-quant-engine");
+            return;
+        };
+        let l = &q.lm_head;
+        let bytes = (l.out_dim as u64) * lm_row_bytes_host(l.sel, l.in_dim);
+        let d = &self.device;
+        // Own library so the probe cannot perturb the pipelines a real run uses;
+        // fast-math off to match the family it is standing in for.
+        let precise = CompileOptions::new();
+        precise.set_fast_math_enabled(false);
+        let lib = match d.new_library_with_source(&shader_source(self.dims.kv_dim), &precise) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("probe fail stage=library err={e}"); return; }
+        };
+        let build = |name: &str| -> Option<ComputePipelineState> {
+            let consts = FunctionConstantValues::new();
+            consts.set_constant_value_at_index(
+                &l.sel as *const u32 as *const _, MTLDataType::UInt, 25);
+            let f = match lib.get_function(name, Some(consts)) {
+                Ok(f) => f,
+                Err(e) => { eprintln!("probe fail stage=function name={name} err={e}"); return None; }
+            };
+            match d.new_compute_pipeline_state_with_function(&f) {
+                Ok(p) => Some(p),
+                Err(e) => { eprintln!("probe fail stage=pipeline name={name} err={e}"); None }
+            }
+        };
+        let (Some(p_shape), Some(p_linear)) = (build("probe_shape"), build("probe_linear")) else {
+            return;
+        };
+        let x = f32_buffer(d, l.in_dim as usize);
+        let y = f32_buffer(d, (l.out_dim as usize).max(1 << 16));
+        let params = MatvecParams { in_dim: l.in_dim, out_dim: l.out_dim };
+        // Rule 9's spirit: the first pass carries warmup, so time several and
+        // report the median, never a single sample.
+        let time_one = |kind: &str, run: &dyn Fn(&ComputeCommandEncoderRef)| {
+            let mut ns: Vec<u128> = Vec::new();
+            for _ in 0..5 {
+                let cb = self.queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                run(enc);
+                enc.end_encoding();
+                let t = std::time::Instant::now();
+                cb.commit();
+                cb.wait_until_completed();
+                ns.push(t.elapsed().as_nanos());
+            }
+            ns.sort_unstable();
+            let med = ns[ns.len() / 2];
+            eprintln!(
+                "probe kind={kind} ms={:.3} gbps={:.1} bytes={bytes} samples={}",
+                med as f64 / 1e6,
+                bytes as f64 / (med as f64 / 1e9) / 1e9,
+                ns.len()
+            );
+        };
+        time_one("matvec_real", &|enc| {
+            self.enc_qmv_probe(enc, &q.pipe(l.sel).matvec, l, &x, &y);
+        });
+        time_one("probe_shape", &|enc| {
+            enc.set_compute_pipeline_state(&p_shape);
+            enc.set_buffer(0, Some(&l.w), l.w_off);
+            enc.set_buffer(1, Some(&y), 0);
+            enc.set_bytes(2, size_of::<MatvecParams>() as u64, &params as *const _ as *const _);
+            dispatch_simdgroup_rows(enc, l.out_dim);
+        });
+        time_one("probe_linear", &|enc| {
+            enc.set_compute_pipeline_state(&p_linear);
+            enc.set_buffer(0, Some(&l.w), l.w_off);
+            enc.set_buffer(1, Some(&y), 0);
+            enc.set_bytes(2, size_of::<MatvecParams>() as u64, &params as *const _ as *const _);
+            enc.dispatch_thread_groups(MTLSize::new(1024, 1, 1), MTLSize::new(64, 1, 1));
+        });
+    }
+
+    /// The probe's copy of enc_qmv's binding, so the diagnostic never reaches
+    /// into a session's buffers.
+    fn enc_qmv_probe(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        pipe: &ComputePipelineState,
+        l: &QuantLinear,
+        x: &Buffer,
+        y: &Buffer,
+    ) {
+        let p = MatvecParams { in_dim: l.in_dim, out_dim: l.out_dim };
+        enc.set_compute_pipeline_state(pipe);
+        enc.set_buffer(0, Some(&l.w), l.w_off);
+        enc.set_buffer(1, Some(&l.bias), 0);
+        enc.set_buffer(2, Some(x), 0);
+        enc.set_buffer(3, Some(y), 0);
+        enc.set_bytes(4, size_of::<MatvecParams>() as u64, &p as *const _ as *const _);
+        dispatch_simdgroup_rows(enc, l.out_dim);
+    }
+
     pub(crate) fn raw_session(&self, max_seq: usize) -> MetalSession<'_> {
+        // Diagnostic only, and one-shot: see run_matvec_probe.
+        static PROBE: std::sync::Once = std::sync::Once::new();
+        PROBE.call_once(|| {
+            if std::env::var_os("LOKAL_MATVEC_PROBE").is_some() {
+                self.run_matvec_probe();
+            }
+        });
         let cfg = &self.cfg;
         let d = &self.device;
         // Window mode: KV is a ring of cap slots per layer — O(window), not
@@ -4166,6 +4299,184 @@ mod tests {
         // a quarter of what the backend allocated before this lane.
         assert_eq!(after, 2 * slots * kvd + 6);
         assert!(after < before / 3, "stub must be a real reduction");
+    }
+
+    /// THE ONE-HOT BIT-EXACT GATE (ruling d04120ac, made FIRST-order by 4b25ec14).
+    ///
+    /// The bit-exact dequant oracle in pool.rs covers `lm_dequant_*` — the
+    /// per-element path — and nothing covered `dot_wx` and the run/staging
+    /// machinery the decode matvec actually uses. That gap is not theoretical:
+    /// a wrong quarter index mapping in this lane produced fluent garbage
+    /// ("the capital of Thailand is called _Annaka_ Annaka Annaka") with no
+    /// crash and no NaN, and it was caught by a 16-cell token gate AFTER a speed
+    /// number had already been published off it.
+    ///
+    /// The trick that makes this exact rather than tolerance-based: drive the
+    /// REAL matvec kernel with an x that is 1.0 at a single column and 0.0
+    /// everywhere else. Every accumulator then carries exactly one nonzero term
+    /// (0 + a = a and a * 0 = 0 are exact in IEEE), so y[row] must equal the CPU
+    /// reference's dequantised weight at that column BIT-FOR-BIT — whatever
+    /// decomposition, lane mapping or threadgroup staging the kernel uses
+    /// internally. It pins index remapping independently of any accumulation
+    /// question, which is precisely the class of defect that slipped through.
+    ///
+    /// The reference is `gguf::dequant_row_ref`, which this lane must not touch
+    /// and which has its own bit-exact gate against ggml semantics — so this is a
+    /// real chain to an independent oracle, not a mirror of the code under test.
+    ///
+    /// MARKED #[ignore] AND WHY, because it is not a slow-test exemption: this
+    /// test does real GPU work, and running Metal work in parallel with the
+    /// other GPU tests makes THEM fail — pool.rs's dequant oracle and the
+    /// deltanet l2norm oracle both read ZEROS out of their own output buffers.
+    /// The suite is 82/0 without this test and fails deterministically with it,
+    /// while this test passes alone and its negative control fires, so the
+    /// arithmetic on both sides is fine and what is exposed is that those tests
+    /// are not concurrency-safe. Fixing that spans src/lowmem/pool.rs, outside
+    /// this lane's boundary, so it is a challenge and not a silent edit. Until
+    /// it is ruled, this runs in the `--ignored` pass, which this lane's gates
+    /// require anyway.
+    #[test]
+    #[ignore = "GPU tests are not concurrency-safe; see the lane challenge"]
+    fn onehot_probe_matches_the_cpu_reference_bit_for_bit() {
+        use crate::gguf::GgmlType;
+        let device = Device::system_default().expect("metal device");
+        // Q6_K only: it is the type this lane reworks. Extend the list as other
+        // types get a staged variant — the harness is type-agnostic apart from
+        // the selector and the one f16 field a synthetic block must keep finite.
+        const SEL: u32 = 5;
+        let precise = CompileOptions::new();
+        precise.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&shader_source(FLASH_HEAD_DIM), &precise)
+            .expect("library");
+        let consts = FunctionConstantValues::new();
+        consts.set_constant_value_at_index(&SEL as *const u32 as *const _, MTLDataType::UInt, 25);
+        let f = lib.get_function("matvec", Some(consts)).expect("matvec");
+        let pipe = device
+            .new_compute_pipeline_state_with_function(&f)
+            .expect("pipeline");
+
+        // in_dim 512 exercises the short-row case (fewer 32-element runs than a
+        // simdgroup has lanes); 2048 is the lm_head width where every lane is fed.
+        for &in_dim in &[512usize, 2048usize] {
+            let rows = 2usize;
+            let sb = in_dim / 256;
+            let row_bytes = sb * 210;
+            let mut w = vec![0u8; rows * row_bytes];
+            // Deterministic filler. Every ql/qh/scale byte pattern is a valid
+            // Q6_K block; only `d` is an f16 and a random one would be NaN ~3%
+            // of the time, so it is written into [1,2) — finite, varied, and the
+            // only type-specific knowledge this harness needs.
+            let mut st = 0x2545_F491_4F6C_DD1Du64;
+            let mut next = || {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                st
+            };
+            for r in 0..rows {
+                for b in 0..sb {
+                    let base = r * row_bytes + b * 210;
+                    for i in 0..208 {
+                        w[base + i] = (next() >> 24) as u8;
+                    }
+                    let d_bits: u16 = 0x3C00 | ((next() >> 20) as u16 & 0x03FF);
+                    w[base + 208] = (d_bits & 0xFF) as u8;
+                    w[base + 209] = (d_bits >> 8) as u8;
+                }
+            }
+            let mut expect = vec![0f32; rows * in_dim];
+            for r in 0..rows {
+                dequant_row_ref_for_test(
+                    GgmlType::Q6_K,
+                    &w[r * row_bytes..(r + 1) * row_bytes],
+                    &mut expect[r * in_dim..(r + 1) * in_dim],
+                );
+            }
+
+            let wbuf = device.new_buffer_with_data(
+                w.as_ptr() as *const _,
+                w.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let bias = f16_empty_buffer(&device, rows.max(8));
+            unsafe { std::ptr::write_bytes(bias.contents() as *mut u8, 0, 2 * rows.max(8)) };
+            // Q6_K's index mapping has PERIOD 256 — the superblock — so testing
+            // every column of a long row re-tests the same mapping over and over.
+            // Two superblocks' worth of columns is full coverage of the mapping,
+            // and in_dim 512 vs 2048 covers the two lane regimes (fewer 32-element
+            // runs than a simdgroup has lanes, and more).
+            //
+            // Keeping the sweep short is not just speed: the first version
+            // committed and waited 2560 times and monopolised the device hard
+            // enough that the pre-existing pool.rs dequant oracle read ZEROS out
+            // of its own output buffer when the suite ran both in parallel. Its
+            // arithmetic was not wrong and neither was this test's; this test was
+            // a bad citizen. (A single-command-buffer version SIGSEGVs inside
+            // Metal at any size — not root-caused, not shipped, and not needed
+            // once the sweep is bounded by the mapping's period.)
+            let cols: Vec<usize> = if in_dim <= 512 {
+                (0..in_dim).collect()
+            } else {
+                (0..256).chain(in_dim - 256..in_dim).collect()
+            };
+            let x = f32_buffer(&device, in_dim);
+            let y = f32_buffer(&device, rows.max(8));
+            let queue = device.new_command_queue();
+            let p = MatvecParams { in_dim: in_dim as u32, out_dim: rows as u32 };
+            for &c in &cols {
+                unsafe {
+                    let xp = x.contents() as *mut f32;
+                    std::ptr::write_bytes(xp, 0, in_dim * 4);
+                    *xp.add(c) = 1.0;
+                }
+                let cb = queue.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipe);
+                enc.set_buffer(0, Some(&wbuf), 0);
+                enc.set_buffer(1, Some(&bias), 0);
+                enc.set_buffer(2, Some(&x), 0);
+                enc.set_buffer(3, Some(&y), 0);
+                enc.set_bytes(
+                    4,
+                    size_of::<MatvecParams>() as u64,
+                    &p as *const _ as *const _,
+                );
+                dispatch_simdgroup_rows(enc, rows as u32);
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                let got = unsafe { std::slice::from_raw_parts(y.contents() as *const f32, rows) };
+                for r in 0..rows {
+                    // The kernel finishes with `sum + bias`, and the bias here is
+                    // zero — so a weight that dequantises to NEGATIVE zero comes
+                    // back as POSITIVE zero, because (-0.0) + (+0.0) = +0.0 in
+                    // IEEE. That is the kernel's real arithmetic, not a defect,
+                    // and the gate caught it on its first run (in_dim 512, col 17,
+                    // GPU +0 vs reference -0). Adding the same zero to the
+                    // reference reproduces the kernel's own final operation
+                    // instead of special-casing zeros: every nonzero value is
+                    // unchanged by it, so the comparison stays bit-exact.
+                    let want = expect[r * in_dim + c] + 0.0;
+                    assert_eq!(
+                        got[r].to_bits(),
+                        want.to_bits(),
+                        "in_dim {in_dim} row {r} col {c}: GPU {} vs CPU reference {} \
+                         — the decode weight-read path disagrees with gguf::dequant_row_ref \
+                         at a single column, which is an INDEX defect, not an accumulation one",
+                        got[r],
+                        want
+                    );
+                }
+            }
+        }
+    }
+
+    /// Thin wrapper so the gate names its reference explicitly: this lane may
+    /// read `gguf::dequant_row_ref` but must never change it — it is the other
+    /// half of this gate's independence.
+    fn dequant_row_ref_for_test(ty: crate::gguf::GgmlType, src: &[u8], out: &mut [f32]) {
+        crate::gguf::dequant_row_ref(ty, src, out)
     }
 
     /// The decode-attention geometry lives in two languages: kernels.metal

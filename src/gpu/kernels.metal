@@ -1433,6 +1433,67 @@ struct MatvecParams {
     uint out_dim;
 };
 
+// ---------- dispatch-shape probes (lane quant-matvec-rework, DIAGNOSTIC) ----------
+// Not production kernels: nothing in a normal run dispatches these, they are
+// reached only through LOKAL_MATVEC_PROBE. They are what this lane actually
+// produced, so they stay in the tree.
+//
+// The question they answer: the quant matvec family reads a uniform 56-65 GB/s on
+// a ~200 GB/s box, and no per-type kernel change can tell you whether that is the
+// DEQUANT's fault or the dispatch shape's, because the shape is identical for
+// every type. probe_shape runs the REAL shape — one simdgroup per output row,
+// lane-strided walk — over the real weight bytes, reading each byte exactly once
+// and doing nothing but adding it. probe_linear reads the same bytes as one flat
+// stream. Measured together with the production kernel in one process, one buffer,
+// one machine state: matvec_real ~56-77 GB/s, probe_shape ~145-165, probe_linear
+// ~108-132. So the shape is NOT the ceiling — it sustains ~2.5x what the
+// production kernel achieves, and the cost is inside the run functions.
+// The accumulator is written out so nothing is dead-code-eliminated.
+kernel void probe_shape(
+    device const uchar *w [[buffer(0)]],
+    device float *y [[buffer(1)]],
+    constant MatvecParams &p [[buffer(2)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]],
+    uint sg_per_tg [[simdgroups_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint row = tgid * sg_per_tg + sgid;
+    if (row >= p.out_dim) {
+        return;
+    }
+    ulong rb = lm_row_bytes(p.in_dim);
+    device const packed_uchar4 *w4 =
+        (device const packed_uchar4 *)(w + (ulong)row * rb);
+    uint n4 = (uint)(rb >> 2);
+    float acc = 0.0f;
+    for (uint i = lane; i < n4; i += 32) {
+        uchar4 v = uchar4(w4[i]);
+        acc += (float)((uint)v[0] + (uint)v[1] + (uint)v[2] + (uint)v[3]);
+    }
+    float s = simd_sum(acc);
+    if (lane == 0) {
+        y[row] = s;
+    }
+}
+
+kernel void probe_linear(
+    device const uchar *w [[buffer(0)]],
+    device float *y [[buffer(1)]],
+    constant MatvecParams &p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]],
+    uint gsz [[threads_per_grid]])
+{
+    ulong total4 = ((ulong)p.out_dim * lm_row_bytes(p.in_dim)) >> 2;
+    device const packed_uchar4 *w4 = (device const packed_uchar4 *)w;
+    float acc = 0.0f;
+    for (ulong i = gid; i < total4; i += gsz) {
+        uchar4 v = uchar4(w4[i]);
+        acc += (float)((uint)v[0] + (uint)v[1] + (uint)v[2] + (uint)v[3]);
+    }
+    y[gid] = acc;
+}
+
 kernel void matvec(
     device const half *w [[buffer(0)]],
     device const half *bias [[buffer(1)]], // models without biases get an all-zero buffer (free add, no branch)
