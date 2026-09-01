@@ -142,10 +142,10 @@ struct DeltaScratch {
     /// [chunk x n_v_heads] each — the two tiny per-head projections.
     alpha: Buffer,
     beta_p: Buffer,
-    /// [n_v_heads] each — one token's activated gates.
+    /// [chunk x n_v_heads] each — the activated gates, one slice per token.
     g: Buffer,
     beta: Buffer,
-    /// [conv_channels] — one token's post-silu conv output, split into q|k|v.
+    /// [chunk x conv_channels] — post-silu conv output, split into q|k|v.
     conv_out: Buffer,
     /// [chunk x d_inner] — the block's output, before the out projection.
     dout: Buffer,
@@ -159,9 +159,11 @@ impl DeltaScratch {
             z: gpu::f32_buffer(d, chunk * inner),
             alpha: gpu::f32_buffer(d, chunk * hv),
             beta_p: gpu::f32_buffer(d, chunk * hv),
-            g: gpu::f32_buffer(d, hv),
-            beta: gpu::f32_buffer(d, hv),
-            conv_out: gpu::f32_buffer(d, c),
+            // Chunk-wide, mirroring metal's DeltaScratch — byte-identical under
+            // the per-token loop, and the precondition for batching it.
+            g: gpu::f32_buffer(d, chunk * hv),
+            beta: gpu::f32_buffer(d, chunk * hv),
+            conv_out: gpu::f32_buffer(d, chunk * c),
             dout: gpu::f32_buffer(d, chunk * inner),
         }
     }
@@ -532,6 +534,13 @@ impl<'a> LowMemSession<'a> {
         let (s_dim, hv, hk) = (d.d_state, d.n_v_heads, d.n_k_heads);
         let (key_dim, inner, c_all) = (s_dim * hk, d.d_inner(), d.conv_channels());
 
+        // Decode keeps the per-token chain byte-for-byte — see the metal twin's
+        // note: it is one token, and it is the path that just earned 11x here.
+        if n > 1 {
+            self.enc_delta_block_chunk(enc, la, l, n);
+            return;
+        }
+
         for t in 0..n {
             let (goff, coff, zoff) = ((t * hv * 4) as u64, (t * c_all * 4) as u64, (t * inner * 4) as u64);
 
@@ -541,9 +550,10 @@ impl<'a> LowMemSession<'a> {
             enc.set_buffer(1, Some(&ds.beta_p), goff);
             enc.set_buffer(2, Some(&la.a), 0);
             enc.set_buffer(3, Some(&la.dt_bias), 0);
-            enc.set_buffer(4, Some(&ds.g), 0);
-            enc.set_buffer(5, Some(&ds.beta), 0);
+            enc.set_buffer(4, Some(&ds.g), goff);
+            enc.set_buffer(5, Some(&ds.beta), goff);
             set_bytes(enc, 6, &(hv as u32));
+            set_bytes(enc, 7, &1u32); // n_tokens — see the metal twin's note
             gpu::dispatch_grid(enc, hv);
 
             // 2. depthwise conv + silu, rolling the conv state in place.
@@ -556,16 +566,17 @@ impl<'a> LowMemSession<'a> {
             enc.set_buffer(0, Some(&st.conv), 0);
             enc.set_buffer(1, Some(&ds.qkv), coff);
             enc.set_buffer(2, Some(&la.conv1d), 0);
-            enc.set_buffer(3, Some(&ds.conv_out), 0);
+            enc.set_buffer(3, Some(&ds.conv_out), coff);
             set_bytes(enc, 4, &SsmConvParams { channels: c_all as u32, d_conv: d.d_conv as u32 });
             gpu::dispatch_grid(enc, c_all);
 
             // 3. l2-normalise q and k per K head, in place on their slices.
             for off in [0u64, (key_dim * 4) as u64] {
                 enc.set_compute_pipeline_state(&e.pipes.l2norm_rows);
-                enc.set_buffer(0, Some(&ds.conv_out), off);
+                enc.set_buffer(0, Some(&ds.conv_out), coff + off);
                 set_bytes(enc, 1, &(s_dim as u32));
                 set_bytes(enc, 2, &eps);
+                set_bytes(enc, 3, &0u32); // tok_stride — one token, y index 0
                 enc.dispatch_thread_groups(MTLSize::new(hk as u64, 1, 1), MTLSize::new(256, 1, 1));
             }
 
@@ -578,11 +589,11 @@ impl<'a> LowMemSession<'a> {
             }
             enc.set_compute_pipeline_state(&e.pipes.delta_decode_step);
             enc.set_buffer(0, Some(&st.delta), 0);
-            enc.set_buffer(1, Some(&ds.conv_out), 0);
-            enc.set_buffer(2, Some(&ds.conv_out), (key_dim * 4) as u64);
-            enc.set_buffer(3, Some(&ds.conv_out), (2 * key_dim * 4) as u64);
-            enc.set_buffer(4, Some(&ds.g), 0);
-            enc.set_buffer(5, Some(&ds.beta), 0);
+            enc.set_buffer(1, Some(&ds.conv_out), coff);
+            enc.set_buffer(2, Some(&ds.conv_out), coff + (key_dim * 4) as u64);
+            enc.set_buffer(3, Some(&ds.conv_out), coff + (2 * key_dim * 4) as u64);
+            enc.set_buffer(4, Some(&ds.g), goff);
+            enc.set_buffer(5, Some(&ds.beta), goff);
             enc.set_buffer(6, Some(&ds.dout), zoff);
             set_bytes(
                 enc,
@@ -666,6 +677,155 @@ impl<'a> LowMemSession<'a> {
     /// The same block in decode form: matvec-family projections against the
     /// bound pages, one token, and the output projection ACCUMULATED straight
     /// into x — exactly how the attention path spends its o_proj.
+    /// The chunk-wide twin of `enc_delta_block` — memo §3/§4. lowmem's decode
+    /// encoder is SERIAL, so unlike the metal side there are no explicit
+    /// barriers here: consecutive dispatches on a serial encoder are already
+    /// ordered, including the write-after-read on the conv window between
+    /// `ssm_conv_prefill` and `ssm_conv_roll`.
+    fn enc_delta_block_chunk(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        la: &super::LinearAttn,
+        l: usize,
+        n: usize,
+    ) {
+        let e = self.e;
+        let d = e.delta_dims().expect("deltanet dims on a qwen35 checkpoint");
+        let ds = self.ds.as_ref().expect("deltanet scratch on a qwen35 session");
+        let st = self.deltanet.as_ref().expect("qwen35 states").layers[l]
+            .as_ref()
+            .expect("every linear layer owns recurrent state");
+        let eps = e.cfg.rms_norm_eps;
+        let (s_dim, hv, hk) = (d.d_state, d.n_v_heads, d.n_k_heads);
+        let (key_dim, inner, c_all) = (s_dim * hk, d.d_inner(), d.conv_channels());
+        #[repr(C)]
+        struct SsmConvBatchParams {
+            channels: u32,
+            d_conv: u32,
+            n_tokens: u32,
+        }
+        #[repr(C)]
+        struct DeltaStepParams {
+            d_state: u32,
+            n_v_heads: u32,
+            group: u32,
+        }
+        let cp = SsmConvBatchParams {
+            channels: c_all as u32,
+            d_conv: d.d_conv as u32,
+            n_tokens: n as u32,
+        };
+
+        // 1. gates for every token.
+        enc.set_compute_pipeline_state(&e.pipes.delta_gates);
+        enc.set_buffer(0, Some(&ds.alpha), 0);
+        enc.set_buffer(1, Some(&ds.beta_p), 0);
+        enc.set_buffer(2, Some(&la.a), 0);
+        enc.set_buffer(3, Some(&la.dt_bias), 0);
+        enc.set_buffer(4, Some(&ds.g), 0);
+        enc.set_buffer(5, Some(&ds.beta), 0);
+        set_bytes(enc, 6, &(hv as u32));
+        set_bytes(enc, 7, &(n as u32));
+        gpu::dispatch_grid(enc, n * hv);
+
+        // 2. conv for every (token, channel), then the window rolled once.
+        enc.set_compute_pipeline_state(&e.pipes.ssm_conv_prefill);
+        enc.set_buffer(0, Some(&st.conv), 0);
+        enc.set_buffer(1, Some(&ds.qkv), 0);
+        enc.set_buffer(2, Some(&la.conv1d), 0);
+        enc.set_buffer(3, Some(&ds.conv_out), 0);
+        set_bytes(enc, 4, &cp);
+        gpu::dispatch_grid(enc, n * c_all);
+        enc.set_compute_pipeline_state(&e.pipes.ssm_conv_roll);
+        enc.set_buffer(0, Some(&st.conv), 0);
+        enc.set_buffer(1, Some(&ds.qkv), 0);
+        set_bytes(enc, 2, &cp);
+        gpu::dispatch_grid(enc, c_all);
+
+        // 3. l2-normalise q and k for every token.
+        for off in [0u64, (key_dim * 4) as u64] {
+            enc.set_compute_pipeline_state(&e.pipes.l2norm_rows);
+            enc.set_buffer(0, Some(&ds.conv_out), off);
+            set_bytes(enc, 1, &(s_dim as u32));
+            set_bytes(enc, 2, &eps);
+            set_bytes(enc, 3, &(c_all as u32));
+            enc.dispatch_thread_groups(
+                MTLSize::new(hk as u64, n as u64, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+
+        // 4. the delta rule — one dispatch for the whole chunk, or the
+        //    per-token fallback when the tile will not fit this device.
+        match gpu::delta_tile(e.device.max_threadgroup_memory_length() as usize, s_dim) {
+            Some(tile) => {
+                enc.set_compute_pipeline_state(&e.pipes.delta_prefill_step);
+                enc.set_buffer(0, Some(&st.delta), 0);
+                enc.set_buffer(1, Some(&ds.conv_out), 0);
+                enc.set_buffer(2, Some(&ds.conv_out), (key_dim * 4) as u64);
+                enc.set_buffer(3, Some(&ds.conv_out), (2 * key_dim * 4) as u64);
+                enc.set_buffer(4, Some(&ds.g), 0);
+                enc.set_buffer(5, Some(&ds.beta), 0);
+                enc.set_buffer(6, Some(&ds.dout), 0);
+                set_bytes(
+                    enc,
+                    7,
+                    &gpu::DeltaChunkParams {
+                        d_state: s_dim as u32,
+                        n_v_heads: hv as u32,
+                        group: (hv / hk) as u32,
+                        n_tokens: n as u32,
+                        tok_stride: c_all as u32,
+                        out_stride: inner as u32,
+                        gate_stride: hv as u32,
+                        tile: tile as u32,
+                    },
+                );
+                enc.set_threadgroup_memory_length(0, (tile * s_dim * 4) as u64);
+                enc.dispatch_thread_groups(
+                    MTLSize::new((hv * (s_dim / tile)) as u64, 1, 1),
+                    MTLSize::new(tile as u64, 1, 1),
+                );
+            }
+            None => {
+                for t in 0..n {
+                    let (goff, coff, zoff) =
+                        ((t * hv * 4) as u64, (t * c_all * 4) as u64, (t * inner * 4) as u64);
+                    enc.set_compute_pipeline_state(&e.pipes.delta_decode_step);
+                    enc.set_buffer(0, Some(&st.delta), 0);
+                    enc.set_buffer(1, Some(&ds.conv_out), coff);
+                    enc.set_buffer(2, Some(&ds.conv_out), coff + (key_dim * 4) as u64);
+                    enc.set_buffer(3, Some(&ds.conv_out), coff + (2 * key_dim * 4) as u64);
+                    enc.set_buffer(4, Some(&ds.g), goff);
+                    enc.set_buffer(5, Some(&ds.beta), goff);
+                    enc.set_buffer(6, Some(&ds.dout), zoff);
+                    set_bytes(
+                        enc,
+                        7,
+                        &DeltaStepParams {
+                            d_state: s_dim as u32,
+                            n_v_heads: hv as u32,
+                            group: (hv / hk) as u32,
+                        },
+                    );
+                    gpu::dispatch_grid(enc, s_dim * hv);
+                }
+            }
+        }
+
+        // 5. the gated output norm — rows are contiguous across (token, head).
+        enc.set_compute_pipeline_state(&e.pipes.gated_output_norm);
+        enc.set_buffer(0, Some(&ds.dout), 0);
+        enc.set_buffer(1, Some(&la.ssm_norm), 0);
+        enc.set_buffer(2, Some(&ds.z), 0);
+        set_bytes(enc, 3, &(s_dim as u32));
+        set_bytes(enc, 4, &eps);
+        enc.dispatch_thread_groups(
+            MTLSize::new((n * hv) as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+    }
+
     fn enc_delta_decode(
         &self,
         enc: &ComputeCommandEncoderRef,

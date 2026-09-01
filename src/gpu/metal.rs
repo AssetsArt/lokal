@@ -190,6 +190,13 @@ struct Pipelines {
     // qwen35's gated-deltanet block — shared kernel source with lowmem, so the
     // two engines dispatch the SAME code and byte-identity is achievable.
     ssm_conv_decode: ComputePipelineState,
+    /// The chunk-wide conv pair: one dispatch for every (token, channel), then
+    /// one that rolls the window forward by the whole chunk.
+    ssm_conv_prefill: ComputePipelineState,
+    ssm_conv_roll: ComputePipelineState,
+    /// The whole-chunk delta rule: one dispatch per layer, state in a
+    /// threadgroup tile across the token loop.
+    delta_prefill_step: ComputePipelineState,
     delta_decode_step: ComputePipelineState,
     delta_gates: ComputePipelineState,
     l2norm_rows: ComputePipelineState,
@@ -465,9 +472,13 @@ impl DeltaScratch {
             z: f32_buffer(d, chunk * inner),
             alpha: f32_buffer(d, chunk * hv),
             beta_p: f32_buffer(d, chunk * hv),
-            g: f32_buffer(d, hv),
-            beta: f32_buffer(d, hv),
-            conv_out: f32_buffer(d, c),
+            // CHUNK-WIDE, not one token. The per-token loop below still writes
+            // one slice at a time and reads the same slice back, so this is
+            // byte-identical today — it is what lets the batched kernels that
+            // follow address every token of a chunk at once.
+            g: f32_buffer(d, chunk * hv),
+            beta: f32_buffer(d, chunk * hv),
+            conv_out: f32_buffer(d, chunk * c),
             dout: f32_buffer(d, chunk * inner),
         }
     }
@@ -867,6 +878,9 @@ impl MetalEngine {
             silu_mul: pipe("silu_mul")?,
             add_inplace: pipe("add_inplace")?,
             ssm_conv_decode: pipe("ssm_conv_decode")?,
+            ssm_conv_prefill: pipe("ssm_conv_prefill")?,
+            ssm_conv_roll: pipe("ssm_conv_roll")?,
+            delta_prefill_step: pipe("delta_prefill_step")?,
             delta_decode_step: pipe("delta_decode_step")?,
             delta_gates: pipe("delta_gates")?,
             l2norm_rows: pipe("l2norm_rows")?,
@@ -1578,6 +1592,38 @@ fn lm_row_bytes_host(sel: u32, in_dim: u32) -> u64 {
 }
 
 /// One-thread-per-element dispatch — kernels guard the tail with `if (gid < dim)`.
+/// Mirrors `DeltaChunkParams` in kernels.metal. Metal binds by LAYOUT, so this
+/// is one of the mirrors the structural guard checks.
+#[repr(C)]
+pub(crate) struct DeltaChunkParams {
+    pub d_state: u32,
+    pub n_v_heads: u32,
+    pub group: u32,
+    pub n_tokens: u32,
+    pub tok_stride: u32,
+    pub out_stride: u32,
+    pub gate_stride: u32,
+    pub tile: u32,
+}
+
+/// State columns per threadgroup for `delta_prefill_step`, or None when this
+/// device cannot hold even the smallest useful tile.
+///
+/// The tile is `tile x d_state` f32 of THREADGROUP memory, so it is bounded by
+/// the device's own maxTotalThreadgroupMemory — 32 KB on the M-series measured,
+/// but read at runtime rather than assumed, because mis-sizing threadgroup
+/// memory is an overrun with no symptom (memo §7 risk 5). It must also divide
+/// d_state, so the column blocks tile it exactly. Returning None makes the
+/// caller run the per-token dispatches instead: slower, correct, and honest —
+/// never a silently truncated tile.
+pub(crate) fn delta_tile(max_tg_bytes: usize, d_state: usize) -> Option<usize> {
+    // Half the device limit, so one threadgroup never monopolises the block.
+    let budget = max_tg_bytes / 2;
+    [64usize, 32, 16, 8]
+        .into_iter()
+        .find(|&t| d_state % t == 0 && t * d_state * 4 <= budget)
+}
+
 pub(crate) fn dispatch_grid(enc: &ComputeCommandEncoderRef, n: usize) {
     let tg = 256u64;
     enc.dispatch_thread_groups(MTLSize::new((n as u64).div_ceil(tg), 1, 1), MTLSize::new(tg, 1, 1));
@@ -2701,6 +2747,17 @@ impl MetalSession<'_> {
             ($($b:expr),+) => { if conc { enc.memory_barrier_with_resources(&[$($b),+]) } };
         }
 
+        // DECODE keeps the per-token chain byte-for-byte. It is one token, so
+        // there is nothing to batch, and it is the path that just earned an 11x
+        // on lowmem and a 15x here — re-routing it in the lane that rewrites
+        // prefill would put both at risk for no gain. The batched path's n = 1
+        // case is proven EQUAL to this one as a test (memo §6 T2's constructed
+        // bit-exact half), not assumed by shipping through it.
+        if n > 1 {
+            self.enc_delta_block_chunk(enc, la, l, n, conc);
+            return;
+        }
+
         for t in 0..n {
             let (goff, coff, zoff) =
                 ((t * hv * 4) as u64, (t * c_all * 4) as u64, (t * inner * 4) as u64);
@@ -2710,10 +2767,17 @@ impl MetalSession<'_> {
             enc.set_buffer(1, Some(&ds.beta_p), goff);
             enc.set_buffer(2, Some(&la.a), 0);
             enc.set_buffer(3, Some(&la.dt_bias), 0);
-            enc.set_buffer(4, Some(&ds.g), 0);
-            enc.set_buffer(5, Some(&ds.beta), 0);
+            enc.set_buffer(4, Some(&ds.g), goff);
+            enc.set_buffer(5, Some(&ds.beta), goff);
             let hv32 = hv as u32;
             enc.set_bytes(6, 4, &hv32 as *const u32 as *const _);
+            // n_tokens. NOT optional: Metal binds by index at runtime, so a
+            // buffer this kernel declares and the caller never sets is read from
+            // whatever was there — no compile error, no crash, just a guard
+            // computed from garbage. That is what this lane shipped for one
+            // build, and the cell table is what caught it.
+            let one_tok = 1u32;
+            enc.set_bytes(7, 4, &one_tok as *const u32 as *const _);
             dispatch_grid(enc, hv);
             bar!(&ds.g, &ds.beta);
 
@@ -2726,7 +2790,7 @@ impl MetalSession<'_> {
             enc.set_buffer(0, Some(&st.conv), 0);
             enc.set_buffer(1, Some(&ds.qkv), coff);
             enc.set_buffer(2, Some(&la.conv1d), 0);
-            enc.set_buffer(3, Some(&ds.conv_out), 0);
+            enc.set_buffer(3, Some(&ds.conv_out), coff);
             let cp = SsmConvParams { channels: c_all as u32, d_conv: d.d_conv as u32 };
             enc.set_bytes(4, size_of::<SsmConvParams>() as u64, &cp as *const _ as *const _);
             dispatch_grid(enc, c_all);
@@ -2735,9 +2799,11 @@ impl MetalSession<'_> {
             let s32 = s_dim as u32;
             for off in [0u64, (key_dim * 4) as u64] {
                 enc.set_compute_pipeline_state(&e.pipes.l2norm_rows);
-                enc.set_buffer(0, Some(&ds.conv_out), off);
+                enc.set_buffer(0, Some(&ds.conv_out), coff + off);
                 enc.set_bytes(1, 4, &s32 as *const u32 as *const _);
                 enc.set_bytes(2, 4, &eps as *const f32 as *const _);
+                let no_stride = 0u32; // one token: the grid's y index is 0
+                enc.set_bytes(3, 4, &no_stride as *const u32 as *const _);
                 enc.dispatch_thread_groups(MTLSize::new(hk as u64, 1, 1), MTLSize::new(256, 1, 1));
             }
             bar!(&ds.conv_out);
@@ -2750,11 +2816,11 @@ impl MetalSession<'_> {
             }
             enc.set_compute_pipeline_state(&e.pipes.delta_decode_step);
             enc.set_buffer(0, Some(&st.delta), 0);
-            enc.set_buffer(1, Some(&ds.conv_out), 0);
-            enc.set_buffer(2, Some(&ds.conv_out), (key_dim * 4) as u64);
-            enc.set_buffer(3, Some(&ds.conv_out), (2 * key_dim * 4) as u64);
-            enc.set_buffer(4, Some(&ds.g), 0);
-            enc.set_buffer(5, Some(&ds.beta), 0);
+            enc.set_buffer(1, Some(&ds.conv_out), coff);
+            enc.set_buffer(2, Some(&ds.conv_out), coff + (key_dim * 4) as u64);
+            enc.set_buffer(3, Some(&ds.conv_out), coff + (2 * key_dim * 4) as u64);
+            enc.set_buffer(4, Some(&ds.g), goff);
+            enc.set_buffer(5, Some(&ds.beta), goff);
             enc.set_buffer(6, Some(&ds.dout), zoff);
             let dp = DeltaStepParams {
                 d_state: s32,
@@ -2781,6 +2847,179 @@ impl MetalSession<'_> {
     /// Rust binary has no ambient autorelease pool — without one the diagnosis
     /// mode would grow the process for the length of the run. The untimed path
     /// keeps the exact call it has always had.
+    /// The same six stages over a WHOLE prefill chunk. Four of them have no
+    /// cross-token dependency at all and collapse to one dispatch each; the
+    /// delta rule keeps its per-token loop here and loses it in the next commit.
+    ///
+    /// Ordering, which is the whole difficulty on the CONCURRENT prefill
+    /// encoder: `ssm_conv_roll` WRITES the window `ssm_conv_prefill` READ, so
+    /// the barrier between them names `st.conv` — a write-after-read hazard,
+    /// the kind that leaves no trace when it fires because every early token
+    /// simply convolves against a window from the wrong end of the chunk and
+    /// still produces fluent text.
+    fn enc_delta_block_chunk(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        la: &QuantLinearAttn,
+        l: usize,
+        n: usize,
+        conc: bool,
+    ) {
+        let e = self.engine;
+        let d = e.deltanet_dims().expect("deltanet dims on a deltanet checkpoint");
+        let ds = self.ds_ref();
+        let st = self.deltanet.as_ref().expect("deltanet states").layers[l]
+            .as_ref()
+            .expect("every linear layer owns recurrent state");
+        let eps = e.cfg.rms_norm_eps;
+        let (s_dim, hv, hk) = (d.d_state, d.n_v_heads, d.n_k_heads);
+        let (key_dim, inner, c_all) = (s_dim * hk, d.d_inner(), d.conv_channels());
+        let s32 = s_dim as u32;
+        macro_rules! bar {
+            ($($b:expr),+) => { if conc { enc.memory_barrier_with_resources(&[$($b),+]) } };
+        }
+        #[repr(C)]
+        struct SsmConvBatchParams {
+            channels: u32,
+            d_conv: u32,
+            n_tokens: u32,
+        }
+        #[repr(C)]
+        struct DeltaStepParams {
+            d_state: u32,
+            n_v_heads: u32,
+            group: u32,
+        }
+        let cp = SsmConvBatchParams {
+            channels: c_all as u32,
+            d_conv: d.d_conv as u32,
+            n_tokens: n as u32,
+        };
+        // 1. the two per-head scalars, every token at once.
+        enc.set_compute_pipeline_state(&e.pipes.delta_gates);
+        enc.set_buffer(0, Some(&ds.alpha), 0);
+        enc.set_buffer(1, Some(&ds.beta_p), 0);
+        enc.set_buffer(2, Some(&la.a), 0);
+        enc.set_buffer(3, Some(&la.dt_bias), 0);
+        enc.set_buffer(4, Some(&ds.g), 0);
+        enc.set_buffer(5, Some(&ds.beta), 0);
+        let hv32 = hv as u32;
+        let n32 = n as u32;
+        enc.set_bytes(6, 4, &hv32 as *const u32 as *const _);
+        enc.set_bytes(7, 4, &n32 as *const u32 as *const _);
+        dispatch_grid(enc, n * hv);
+        bar!(&ds.g, &ds.beta);
+
+        // 2. the conv for every (token, channel), then the window rolled once
+        //    for the whole chunk.
+        enc.set_compute_pipeline_state(&e.pipes.ssm_conv_prefill);
+        enc.set_buffer(0, Some(&st.conv), 0);
+        enc.set_buffer(1, Some(&ds.qkv), 0);
+        enc.set_buffer(2, Some(&la.conv1d), 0);
+        enc.set_buffer(3, Some(&ds.conv_out), 0);
+        enc.set_bytes(4, size_of::<SsmConvBatchParams>() as u64, &cp as *const _ as *const _);
+        dispatch_grid(enc, n * c_all);
+        // WAR on st.conv, plus the read-after-write on conv_out.
+        bar!(&ds.conv_out, &st.conv);
+        enc.set_compute_pipeline_state(&e.pipes.ssm_conv_roll);
+        enc.set_buffer(0, Some(&st.conv), 0);
+        enc.set_buffer(1, Some(&ds.qkv), 0);
+        enc.set_bytes(2, size_of::<SsmConvBatchParams>() as u64, &cp as *const _ as *const _);
+        dispatch_grid(enc, c_all);
+        bar!(&st.conv);
+
+        // 3. l2-normalise q and k for every token — the grid's y axis is the
+        //    token and `tok_stride` walks it.
+        let cstride = c_all as u32;
+        for off in [0u64, (key_dim * 4) as u64] {
+            enc.set_compute_pipeline_state(&e.pipes.l2norm_rows);
+            enc.set_buffer(0, Some(&ds.conv_out), off);
+            enc.set_bytes(1, 4, &s32 as *const u32 as *const _);
+            enc.set_bytes(2, 4, &eps as *const f32 as *const _);
+            enc.set_bytes(3, 4, &cstride as *const u32 as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(hk as u64, n as u64, 1),
+                MTLSize::new(256, 1, 1),
+            );
+        }
+        bar!(&ds.conv_out);
+
+        // 4. the delta rule — ONE dispatch for the whole chunk, the state
+        //    living in a threadgroup tile across the token loop. If the tile
+        //    will not fit this device, fall back to the per-token dispatches
+        //    rather than mis-size it (memo §7 risk 5).
+        match delta_tile(e.device.max_threadgroup_memory_length() as usize, s_dim) {
+            Some(tile) => {
+                let cparams = DeltaChunkParams {
+                    d_state: s32,
+                    n_v_heads: hv as u32,
+                    group: (hv / hk) as u32,
+                    n_tokens: n as u32,
+                    tok_stride: c_all as u32,
+                    out_stride: inner as u32,
+                    gate_stride: hv as u32,
+                    tile: tile as u32,
+                };
+                enc.set_compute_pipeline_state(&e.pipes.delta_prefill_step);
+                enc.set_buffer(0, Some(&st.delta), 0);
+                enc.set_buffer(1, Some(&ds.conv_out), 0);
+                enc.set_buffer(2, Some(&ds.conv_out), (key_dim * 4) as u64);
+                enc.set_buffer(3, Some(&ds.conv_out), (2 * key_dim * 4) as u64);
+                enc.set_buffer(4, Some(&ds.g), 0);
+                enc.set_buffer(5, Some(&ds.beta), 0);
+                enc.set_buffer(6, Some(&ds.dout), 0);
+                enc.set_bytes(
+                    7,
+                    size_of::<DeltaChunkParams>() as u64,
+                    &cparams as *const _ as *const _,
+                );
+                enc.set_threadgroup_memory_length(0, (tile * s_dim * 4) as u64);
+                enc.dispatch_thread_groups(
+                    MTLSize::new((hv * (s_dim / tile)) as u64, 1, 1),
+                    MTLSize::new(tile as u64, 1, 1),
+                );
+                bar!(&ds.dout, &st.delta);
+            }
+            None => {
+                for t in 0..n {
+                    let (goff, coff, zoff) =
+                        ((t * hv * 4) as u64, (t * c_all * 4) as u64, (t * inner * 4) as u64);
+                    enc.set_compute_pipeline_state(&e.pipes.delta_decode_step);
+                    enc.set_buffer(0, Some(&st.delta), 0);
+                    enc.set_buffer(1, Some(&ds.conv_out), coff);
+                    enc.set_buffer(2, Some(&ds.conv_out), coff + (key_dim * 4) as u64);
+                    enc.set_buffer(3, Some(&ds.conv_out), coff + (2 * key_dim * 4) as u64);
+                    enc.set_buffer(4, Some(&ds.g), goff);
+                    enc.set_buffer(5, Some(&ds.beta), goff);
+                    enc.set_buffer(6, Some(&ds.dout), zoff);
+                    let dp = DeltaStepParams {
+                        d_state: s32,
+                        n_v_heads: hv as u32,
+                        group: (hv / hk) as u32,
+                    };
+                    enc.set_bytes(7, size_of::<DeltaStepParams>() as u64, &dp as *const _ as *const _);
+                    dispatch_grid(enc, s_dim * hv);
+                    bar!(&ds.dout, &st.delta);
+                }
+            }
+        }
+
+        // 5. the gated output norm. Head h of token t sits at (t·H_v + h)·S, so
+        //    the rows are already contiguous across the chunk and this needs no
+        //    stride — one threadgroup per (token, head).
+        enc.set_compute_pipeline_state(&e.pipes.gated_output_norm);
+        enc.set_buffer(0, Some(&ds.dout), 0);
+        enc.set_buffer(1, Some(&la.ssm_norm), 0);
+        enc.set_buffer(2, Some(&ds.z), 0);
+        enc.set_bytes(3, 4, &s32 as *const u32 as *const _);
+        enc.set_bytes(4, 4, &eps as *const f32 as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new((n * hv) as u64, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+        bar!(&ds.dout);
+    }
+
     fn run_from_quant(
         &mut self,
         src: Source<'_>,
@@ -5026,6 +5265,192 @@ mod deltanet_kernel_oracle {
     /// inside the second loop, and the summation order of both dots. Only the
     /// decay itself is left to the bounded test below, so nothing can hide
     /// inside a tolerance.
+    /// Drive `delta_prefill_step` over a whole chunk. q/k/v are packed into rows
+    /// of a common `tok_stride`, exactly as production views them out of one
+    /// conv_out buffer, so the test exercises the addressing the engine uses and
+    /// not a friendlier one.
+    fn gpu_delta_chunk(
+        d: rf::DeltaDims,
+        state0: &[f32],
+        q: &[Vec<f32>],
+        k: &[Vec<f32>],
+        v: &[Vec<f32>],
+        g: &[Vec<f32>],
+        beta: &[Vec<f32>],
+    ) -> (Vec<Vec<f32>>, Vec<f32>) {
+        let device = Device::system_default().expect("Metal device required");
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(&gpu::shader_source(128), &opts)
+            .expect("kernels.metal compiles");
+        let f = lib.get_function("delta_prefill_step", None).expect("delta_prefill_step");
+        let pipe = device.new_compute_pipeline_state_with_function(&f).expect("pipeline");
+        let queue = device.new_command_queue();
+        let shared = MTLResourceOptions::StorageModeShared;
+
+        let (s_dim, hv) = (d.d_state, d.n_v_heads);
+        let n = q.len();
+        let ts = s_dim * hv; // one stride for q, k and v — production uses C
+        let mut qf = vec![0f32; n * ts];
+        let mut kf = vec![0f32; n * ts];
+        let mut vf = vec![0f32; n * ts];
+        let mut gf = vec![0f32; n * hv];
+        let mut bf = vec![0f32; n * hv];
+        for t in 0..n {
+            qf[t * ts..t * ts + q[t].len()].copy_from_slice(&q[t]);
+            kf[t * ts..t * ts + k[t].len()].copy_from_slice(&k[t]);
+            vf[t * ts..t * ts + v[t].len()].copy_from_slice(&v[t]);
+            gf[t * hv..(t + 1) * hv].copy_from_slice(&g[t]);
+            bf[t * hv..(t + 1) * hv].copy_from_slice(&beta[t]);
+        }
+        let up = |x: &[f32]| {
+            device.new_buffer_with_data(
+                x.as_ptr() as *const _,
+                std::mem::size_of_val(x) as u64,
+                shared,
+            )
+        };
+        let uploaded = permute_delta_state(d, state0);
+        let st = up(&uploaded);
+        let (qb, kb, vb, gb, bb) = (up(&qf), up(&kf), up(&vf), up(&gf), up(&bf));
+        let out = device.new_buffer((n * hv * s_dim * 4) as u64, shared);
+
+        let tile = gpu::delta_tile(device.max_threadgroup_memory_length() as usize, s_dim)
+            .expect("this device holds no usable delta tile");
+        let p = gpu::DeltaChunkParams {
+            d_state: s_dim as u32,
+            n_v_heads: hv as u32,
+            group: (hv / d.n_k_heads) as u32,
+            n_tokens: n as u32,
+            tok_stride: ts as u32,
+            out_stride: (hv * s_dim) as u32,
+            gate_stride: hv as u32,
+            tile: tile as u32,
+        };
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipe);
+        for (i, b) in [&st, &qb, &kb, &vb, &gb, &bb, &out].iter().enumerate() {
+            enc.set_buffer(i as u64, Some(b), 0);
+        }
+        enc.set_bytes(
+            7,
+            std::mem::size_of::<gpu::DeltaChunkParams>() as u64,
+            &p as *const _ as *const _,
+        );
+        enc.set_threadgroup_memory_length(0, (tile * s_dim * 4) as u64);
+        enc.dispatch_thread_groups(
+            MTLSize::new((hv * (s_dim / tile)) as u64, 1, 1),
+            MTLSize::new(tile as u64, 1, 1),
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let flat =
+            unsafe { std::slice::from_raw_parts(out.contents() as *const f32, n * hv * s_dim) };
+        let outs = (0..n)
+            .map(|t| flat[t * hv * s_dim..(t + 1) * hv * s_dim].to_vec())
+            .collect();
+        let raw = unsafe {
+            std::slice::from_raw_parts(st.contents() as *const f32, state0.len())
+        }
+        .to_vec();
+        (outs, permute_delta_state(d, &raw))
+    }
+
+    /// THE T2 GATE (memo §6): the chunk kernel is the decode kernel's recurrence
+    /// with the state parked in threadgroup memory between tokens, so it owes
+    /// BIT-IDENTITY, not a tolerance — nothing about the arithmetic or its order
+    /// changed, only where the state lives.
+    ///
+    /// Both halves are here. n = 1 is the CONSTRUCTED bit-exact half the memo
+    /// named: with one token the chunk kernel does exactly what the decode
+    /// kernel does, and it is free to check. n = 9 is the real gate, and it is
+    /// the one that can fail — the state has to survive eight in-place updates
+    /// in a threadgroup tile and come back to device memory permuted correctly.
+    ///
+    /// The comparison runs against BOTH the decode kernel and the CPU reference,
+    /// per rule 13: one reference verifies the port, two verify comprehension.
+    #[test]
+    fn delta_prefill_chunk_is_bit_identical_to_the_decode_recurrence() {
+        let d = dims();
+        for (steps, decay) in [(1usize, false), (9, false), (1, true), (9, true)] {
+            let mut seed = 0x1234_5678u32;
+            let (state0, q, k, v, g, beta) = delta_inputs(d, steps, &mut seed, decay);
+            let (dec_outs, dec_state) = gpu_delta(d, &state0, &q, &k, &v, &g, &beta);
+            let (chk_outs, chk_state) = gpu_delta_chunk(d, &state0, &q, &k, &v, &g, &beta);
+
+            let mut ref_state = state0.clone();
+            for t in 0..steps {
+                let want = rf::delta_decode_step(
+                    &d, &mut ref_state, &q[t], &k[t], &v[t], &g[t], &beta[t],
+                );
+                // vs the CPU reference: BIT-EXACT ONLY WITH THE DECAY OFF. With
+                // g = 0 every exp is exactly 1.0 and the kernel is pure
+                // multiply-add, which is the constructed half. With live decay
+                // the f32 exp against the reference's own is a legitimate
+                // last-bit difference the decode kernel does not close either —
+                // `delta_decode_bounded_once_the_decay_is_live` is where that
+                // half is measured, and asserting bit-equality here would be the
+                // hand-picked-ulp mistake this repo has made twice.
+                if !decay {
+                    for (i, (a, b)) in want.iter().zip(&chk_outs[t]).enumerate() {
+                        assert_eq!(
+                            a.to_bits(), b.to_bits(),
+                            "steps={steps} t={t} slot {i}: cpu reference {a} vs chunk kernel {b}"
+                        );
+                    }
+                }
+                // vs the DECODE KERNEL: bit-identical in every case, decay or
+                // not. Same hardware, same exp, same operations in the same
+                // order — the ONLY difference is where the state sits between
+                // tokens, and that must cost nothing.
+                for (i, (a, b)) in dec_outs[t].iter().zip(&chk_outs[t]).enumerate() {
+                    assert_eq!(
+                        a.to_bits(), b.to_bits(),
+                        "steps={steps} decay={decay} t={t} slot {i}: decode kernel {a} vs chunk kernel {b}"
+                    );
+                }
+            }
+            // The state is the half a per-token output comparison cannot see: a
+            // kernel that writes the right outputs from a subtly wrong tile
+            // passes t=0 and fails t=3, and at steps=1 it cannot fail at all —
+            // which is exactly why steps=9 is here.
+            if !decay {
+                for (i, (a, b)) in ref_state.iter().zip(&chk_state).enumerate() {
+                    assert_eq!(
+                        a.to_bits(), b.to_bits(),
+                        "steps={steps} final state slot {i}: cpu reference {a} vs chunk kernel {b}"
+                    );
+                }
+            }
+            for (i, (a, b)) in dec_state.iter().zip(&chk_state).enumerate() {
+                assert_eq!(
+                    a.to_bits(), b.to_bits(),
+                    "steps={steps} decay={decay} final state slot {i}: decode kernel {a} vs chunk kernel {b}"
+                );
+            }
+        }
+    }
+
+    /// The tile chooser refuses rather than mis-sizes (memo §7 risk 5).
+    #[test]
+    fn delta_tile_refuses_a_device_that_cannot_hold_one() {
+        // M-series measured: 32768 B, d_state 128 -> 64 columns would need 32 KB,
+        // more than the half-limit budget, so 32 is the answer.
+        assert_eq!(gpu::delta_tile(32768, 128), Some(32));
+        // A device with a quarter of that still fits 8 columns.
+        assert_eq!(gpu::delta_tile(8192, 128), Some(8));
+        // Too small for any tile: None, so the caller runs per-token dispatches
+        // instead of truncating the tile into a threadgroup-memory overrun.
+        assert_eq!(gpu::delta_tile(1024, 128), None);
+        // A d_state no candidate divides is refused too, rather than tiled
+        // partially and read past the end.
+        assert_eq!(gpu::delta_tile(32768, 100), None);
+    }
+
     #[test]
     fn delta_decode_matches_reference_bit_for_bit() {
         let d = dims();
@@ -5560,6 +5985,8 @@ mod deltanet_kernel_oracle {
         }
         let n32 = n as u32;
         enc.set_bytes(6, 4, &n32 as *const u32 as *const _);
+        let one = 1u32; // this helper drives one token's worth of heads
+        enc.set_bytes(7, 4, &one as *const u32 as *const _);
         enc.dispatch_thread_groups(
             MTLSize::new(((n + 63) / 64) as u64, 1, 1), MTLSize::new(64, 1, 1));
         enc.end_encoding();
@@ -5695,6 +6122,8 @@ mod deltanet_kernel_oracle {
             }
             let hv32 = hv as u32;
             enc.set_bytes(6, 4, &hv32 as *const u32 as *const _);
+            let one_tok = 1u32;
+            enc.set_bytes(7, 4, &one_tok as *const u32 as *const _);
             enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(64, 1, 1));
 
             // 2. depthwise conv + silu, rolling the conv state
@@ -5717,6 +6146,8 @@ mod deltanet_kernel_oracle {
                 enc.set_buffer(0, Some(&b_conv_out), off);
                 enc.set_bytes(1, 4, &s32 as *const u32 as *const _);
                 enc.set_bytes(2, 4, &eps as *const f32 as *const _);
+                let no_stride = 0u32;
+                enc.set_bytes(3, 4, &no_stride as *const u32 as *const _);
                 enc.dispatch_thread_groups(MTLSize::new(hk as u64, 1, 1), MTLSize::new(256, 1, 1));
             }
 
@@ -6074,6 +6505,8 @@ mod deltanet_kernel_oracle {
         let d32 = dim as u32;
         enc.set_bytes(1, 4, &d32 as *const u32 as *const _);
         enc.set_bytes(2, 4, &eps as *const f32 as *const _);
+        let stride0 = 0u32; // single token: the y index is 0, so the stride is unused
+        enc.set_bytes(3, 4, &stride0 as *const u32 as *const _);
         // One threadgroup per row, NORM_TG threads wide — the kernel strides.
         enc.dispatch_thread_groups(MTLSize::new(rows.len() as u64, 1, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();

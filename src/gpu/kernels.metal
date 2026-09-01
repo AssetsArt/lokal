@@ -3646,14 +3646,24 @@ kernel void attn_out_gate(
 /// identical trade in its own kernel_l2_norm_impl (threadgroup float). So the
 /// oracle proves the exact half on data where the two accumulations provably
 /// agree, and bounds only the accumulation difference.
+///
+/// BATCHED FORM: the grid is (rows_per_token, n_tokens) and `tok_stride` is the
+/// float distance from one token's row block to the next. At n_tokens = 1 the y
+/// index is 0 and the address reduces to `x + row * dim` — the decode call is
+/// the same arithmetic it always was, which is what lets one kernel serve both.
 kernel void l2norm_rows(
     device float *x [[buffer(0)]],
     constant uint &dim [[buffer(1)]],
     constant float &eps [[buffer(2)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]])
+    constant uint &tok_stride [[buffer(3)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    // uint2, not uint: Metal requires the threadgroup-position and
+    // thread-position attributes to agree in rank, and rejects the mismatch at
+    // compile time rather than at dispatch.
+    uint2 tid2 [[thread_position_in_threadgroup]])
 {
-    device float *r = x + (ulong)row * dim;
+    uint tid = tid2.x;
+    device float *r = x + (ulong)tg.y * tok_stride + (ulong)tg.x * dim;
     threadgroup float partial[NORM_TG / 32];
     float acc = 0.0f;
     for (uint i = tid; i < dim; i += NORM_TG) {
@@ -3773,6 +3783,102 @@ kernel void delta_decode_step(
     out[h * s_dim + j] = o;
 }
 
+struct DeltaChunkParams {
+    uint d_state;     // S
+    uint n_v_heads;   // H_v
+    uint group;       // H_v / H_k
+    uint n_tokens;    // n
+    uint tok_stride;  // floats between tokens in the conv-output view (= C)
+    uint out_stride;  // floats between tokens in `out` (= H_v · S)
+    uint gate_stride; // floats between tokens in g / beta (= H_v)
+    uint tile;        // state columns per threadgroup
+};
+
+/// The delta rule over a WHOLE prefill chunk in one dispatch — memo §3, P2.
+///
+/// The arithmetic is `delta_decode_step`'s, unchanged, executed n times in
+/// sequence. What changes is WHERE THE STATE LIVES BETWEEN TOKENS: the decode
+/// kernel reads and writes its column in device memory twice per token, so a
+/// 512-token chunk moves the whole state 2048 times. Here each thread's column
+/// is staged into threadgroup memory once, updated in place for every token,
+/// and written back once — the same recurrence at 1/(2n) of the traffic.
+///
+/// WHY IT IS STILL BIT-EXACT, which is the whole point of not adopting the
+/// upstream fused kernel: thread (h, j) still walks the contraction index i
+/// serially, in the reference's order, and no value is ever summed by a
+/// different thread than before. The standing constraint (workspace memory
+/// ef397862) forbids splitting the CONTRACTION; this splits nothing — it moves
+/// which memory the same thread reads. Upstream's kernel additionally
+/// simd_sums the contraction because it holds the state in REGISTERS and a
+/// 128-float column does not fit; a threadgroup tile does, so we do not pay
+/// that price.
+///
+/// NO BARRIER IN THE TOKEN LOOP, deliberately: column j is read and written
+/// only by the thread that owns it (the reference's j loop has no cross-j
+/// dependency), so the tile is per-thread scratch that happens to live in
+/// threadgroup memory. A barrier here would cost and prove nothing.
+///
+/// The tile is sized by the CALLER against the device's real
+/// maxTotalThreadgroupMemory; this kernel trusts `p.tile` and the caller
+/// refuses rather than mis-sizes.
+kernel void delta_prefill_step(
+    device float *state [[buffer(0)]],       // [S·S·H_v], transposed: (i,j) at i·S + j
+    device const float *q [[buffer(1)]],     // token 0's q; token t at +t·tok_stride
+    device const float *k [[buffer(2)]],
+    device const float *v [[buffer(3)]],
+    device const float *g [[buffer(4)]],     // [n][H_v]
+    device const float *beta [[buffer(5)]],  // [n][H_v]
+    device float *out [[buffer(6)]],         // [n][H_v·S]
+    constant DeltaChunkParams &p [[buffer(7)]],
+    threadgroup float *tg [[threadgroup(0)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint2 tid2 [[thread_position_in_threadgroup]])
+{
+#pragma clang fp contract(off)
+    uint S = p.d_state;
+    uint tile = p.tile;
+    uint jl = tid2.x;
+    uint blocks = S / tile;
+    uint h = tgid.x / blocks;
+    uint j = (tgid.x % blocks) * tile + jl;
+    if (h >= p.n_v_heads) {
+        return;
+    }
+    uint kh_base = (h / p.group) * S;
+    device float *st = state + (ulong)h * S * S;
+
+    for (uint i = 0; i < S; i++) {
+        tg[i * tile + jl] = st[(ulong)i * S + j];
+    }
+
+    float scale = 1.0f / sqrt((float)S);
+    for (uint t = 0; t < p.n_tokens; t++) {
+        device const float *kh = k + (ulong)t * p.tok_stride + kh_base;
+        device const float *qh = q + (ulong)t * p.tok_stride + kh_base;
+        float ge = exp(g[(ulong)t * p.gate_stride + h]);
+        float b = beta[(ulong)t * p.gate_stride + h];
+
+        float sk = 0.0f;
+        for (uint i = 0; i < S; i++) {
+            float s = tg[i * tile + jl] * ge;
+            tg[i * tile + jl] = s;
+            sk += s * kh[i];
+        }
+        float d = (v[(ulong)t * p.tok_stride + h * S + j] - sk) * b;
+        float o = 0.0f;
+        for (uint i = 0; i < S; i++) {
+            float s = tg[i * tile + jl] + kh[i] * d;
+            tg[i * tile + jl] = s;
+            o += s * (qh[i] * scale);
+        }
+        out[(ulong)t * p.out_stride + h * S + j] = o;
+    }
+
+    for (uint i = 0; i < S; i++) {
+        st[(ulong)i * S + j] = tg[i * tile + jl];
+    }
+}
+
 /// The linear block's output stage: per-head RMSNorm(o; ssm_norm) · silu(z),
 /// in place on `o` — one threadgroup per V head (build_norm_gated).
 ///
@@ -3839,23 +3945,105 @@ kernel void gated_output_norm(
 /// optimisation, it is the reference's exact form — and it is what lets the
 /// oracle assert a BIT-EXACT half, since above the threshold no transcendental
 /// runs at all.
+///
+/// BATCHED FORM: `n_tokens` slices of H_v, one thread each. a and dt_bias are
+/// per-head weights shared by every token, so the head index is gid % H_v. At
+/// n_tokens = 1 that is gid and every load below is the one it always was.
 kernel void delta_gates(
-    device const float *alpha [[buffer(0)]],   // [H_v] projection output
-    device const float *beta_in [[buffer(1)]], // [H_v] projection output
+    device const float *alpha [[buffer(0)]],   // [n][H_v] projection output
+    device const float *beta_in [[buffer(1)]], // [n][H_v] projection output
     device const float *a [[buffer(2)]],       // [H_v] ssm_a
     device const float *dt_bias [[buffer(3)]], // [H_v] ssm_dt.bias
-    device float *g [[buffer(4)]],             // [H_v]
-    device float *beta [[buffer(5)]],          // [H_v]
+    device float *g [[buffer(4)]],             // [n][H_v]
+    device float *beta [[buffer(5)]],          // [n][H_v]
     constant uint &n_v_heads [[buffer(6)]],
+    constant uint &n_tokens [[buffer(7)]],
     uint gid [[thread_position_in_grid]])
 {
-    if (gid >= n_v_heads) {
+    if (gid >= n_v_heads * n_tokens) {
         return;
     }
-    float x = alpha[gid] + dt_bias[gid];
+    uint h = gid % n_v_heads;
+    float x = alpha[gid] + dt_bias[h];
     float sp = x > 20.0f ? x : log(1.0f + exp(x));
-    g[gid] = a[gid] * sp;
+    g[gid] = a[h] * sp;
     beta[gid] = 1.0f / (1.0f + exp(-beta_in[gid]));
+}
+
+struct SsmConvBatchParams {
+    uint channels;  // C
+    uint d_conv;    // k
+    uint n_tokens;  // n
+};
+
+/// The depthwise conv over a WHOLE prefill chunk — one thread per (token,
+/// channel), no sequential dependency at all.
+///
+/// The decode form rolls a window because it sees one token; over a chunk the
+/// window for token t is simply the inputs at t-(k-1) .. t-1, which are already
+/// in `x` for t >= k-1 and come from the incoming state only for the first few
+/// tokens. So `w(u)` below reads the state for u < 0 and `x` otherwise, and the
+/// taps are accumulated j = 0 .. k-1 IN THE REFERENCE'S ORDER — the stored
+/// window first, this token's own input against the last filter tap last. That
+/// ordering is why this is bit-identical to `ssm_conv_decode` applied n times,
+/// not merely equal in real arithmetic.
+///
+/// `state` is READ-ONLY here. Rolling it is `ssm_conv_roll`'s job precisely
+/// because every early token reads the window this would write: one dispatch
+/// cannot both read and write it without a cross-threadgroup race, and a race
+/// here would be silent — early tokens would convolve against a window from the
+/// wrong end of the chunk and still produce fluent text.
+kernel void ssm_conv_prefill(
+    device const float *state [[buffer(0)]],  // [C][k-1] incoming window, oldest first
+    device const float *x [[buffer(1)]],      // [n][C]
+    device const float *w [[buffer(2)]],      // [C][k]
+    device float *out [[buffer(3)]],          // [n][C]
+    constant SsmConvBatchParams &p [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+#pragma clang fp contract(off)
+    uint C = p.channels, k = p.d_conv, n = p.n_tokens;
+    if (gid >= n * C) {
+        return;
+    }
+    uint t = gid / C;
+    uint c = gid - t * C;
+    device const float *st = state + (ulong)c * (k - 1);
+    device const float *kern = w + (ulong)c * k;
+    float acc = 0.0f;
+    for (uint j = 0; j + 1 < k; j++) {
+        int u = (int)t - (int)(k - 1) + (int)j;
+        float wv = (u < 0) ? st[(uint)((int)(k - 1) + u)] : x[(ulong)u * C + c];
+        acc += wv * kern[j];
+    }
+    acc += x[(ulong)t * C + c] * kern[k - 1];
+    out[(ulong)t * C + c] = acc * (1.0f / (1.0f + exp(-acc)));
+}
+
+/// The conv window as it stands after a whole chunk: the last (k-1) inputs.
+/// Staged through registers because when n < k-1 the new window still contains
+/// entries of the old one, and writing in place would clobber a value a later
+/// slot still needs. d_conv is bounded at 8 here; the Rust side refuses a
+/// checkpoint above that rather than silently truncating.
+kernel void ssm_conv_roll(
+    device float *state [[buffer(0)]],        // [C][k-1]
+    device const float *x [[buffer(1)]],      // [n][C]
+    constant SsmConvBatchParams &p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint C = p.channels, k = p.d_conv, n = p.n_tokens;
+    if (gid >= C) {
+        return;
+    }
+    device float *st = state + (ulong)gid * (k - 1);
+    float tmp[8];
+    for (uint m = 0; m + 1 < k; m++) {
+        int u = (int)n - (int)(k - 1) + (int)m;
+        tmp[m] = (u < 0) ? st[(uint)((int)(k - 1) + u)] : x[(ulong)u * C + gid];
+    }
+    for (uint m = 0; m + 1 < k; m++) {
+        st[m] = tmp[m];
+    }
 }
 
 struct QGSplitParams {
