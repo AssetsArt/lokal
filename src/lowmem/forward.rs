@@ -142,10 +142,10 @@ struct DeltaScratch {
     /// [chunk x n_v_heads] each — the two tiny per-head projections.
     alpha: Buffer,
     beta_p: Buffer,
-    /// [n_v_heads] each — one token's activated gates.
+    /// [chunk x n_v_heads] each — the activated gates, one slice per token.
     g: Buffer,
     beta: Buffer,
-    /// [conv_channels] — one token's post-silu conv output, split into q|k|v.
+    /// [chunk x conv_channels] — post-silu conv output, split into q|k|v.
     conv_out: Buffer,
     /// [chunk x d_inner] — the block's output, before the out projection.
     dout: Buffer,
@@ -159,9 +159,11 @@ impl DeltaScratch {
             z: gpu::f32_buffer(d, chunk * inner),
             alpha: gpu::f32_buffer(d, chunk * hv),
             beta_p: gpu::f32_buffer(d, chunk * hv),
-            g: gpu::f32_buffer(d, hv),
-            beta: gpu::f32_buffer(d, hv),
-            conv_out: gpu::f32_buffer(d, c),
+            // Chunk-wide, mirroring metal's DeltaScratch — byte-identical under
+            // the per-token loop, and the precondition for batching it.
+            g: gpu::f32_buffer(d, chunk * hv),
+            beta: gpu::f32_buffer(d, chunk * hv),
+            conv_out: gpu::f32_buffer(d, chunk * c),
             dout: gpu::f32_buffer(d, chunk * inner),
         }
     }
@@ -541,8 +543,8 @@ impl<'a> LowMemSession<'a> {
             enc.set_buffer(1, Some(&ds.beta_p), goff);
             enc.set_buffer(2, Some(&la.a), 0);
             enc.set_buffer(3, Some(&la.dt_bias), 0);
-            enc.set_buffer(4, Some(&ds.g), 0);
-            enc.set_buffer(5, Some(&ds.beta), 0);
+            enc.set_buffer(4, Some(&ds.g), goff);
+            enc.set_buffer(5, Some(&ds.beta), goff);
             set_bytes(enc, 6, &(hv as u32));
             gpu::dispatch_grid(enc, hv);
 
@@ -556,14 +558,14 @@ impl<'a> LowMemSession<'a> {
             enc.set_buffer(0, Some(&st.conv), 0);
             enc.set_buffer(1, Some(&ds.qkv), coff);
             enc.set_buffer(2, Some(&la.conv1d), 0);
-            enc.set_buffer(3, Some(&ds.conv_out), 0);
+            enc.set_buffer(3, Some(&ds.conv_out), coff);
             set_bytes(enc, 4, &SsmConvParams { channels: c_all as u32, d_conv: d.d_conv as u32 });
             gpu::dispatch_grid(enc, c_all);
 
             // 3. l2-normalise q and k per K head, in place on their slices.
             for off in [0u64, (key_dim * 4) as u64] {
                 enc.set_compute_pipeline_state(&e.pipes.l2norm_rows);
-                enc.set_buffer(0, Some(&ds.conv_out), off);
+                enc.set_buffer(0, Some(&ds.conv_out), coff + off);
                 set_bytes(enc, 1, &(s_dim as u32));
                 set_bytes(enc, 2, &eps);
                 enc.dispatch_thread_groups(MTLSize::new(hk as u64, 1, 1), MTLSize::new(256, 1, 1));
@@ -578,11 +580,11 @@ impl<'a> LowMemSession<'a> {
             }
             enc.set_compute_pipeline_state(&e.pipes.delta_decode_step);
             enc.set_buffer(0, Some(&st.delta), 0);
-            enc.set_buffer(1, Some(&ds.conv_out), 0);
-            enc.set_buffer(2, Some(&ds.conv_out), (key_dim * 4) as u64);
-            enc.set_buffer(3, Some(&ds.conv_out), (2 * key_dim * 4) as u64);
-            enc.set_buffer(4, Some(&ds.g), 0);
-            enc.set_buffer(5, Some(&ds.beta), 0);
+            enc.set_buffer(1, Some(&ds.conv_out), coff);
+            enc.set_buffer(2, Some(&ds.conv_out), coff + (key_dim * 4) as u64);
+            enc.set_buffer(3, Some(&ds.conv_out), coff + (2 * key_dim * 4) as u64);
+            enc.set_buffer(4, Some(&ds.g), goff);
+            enc.set_buffer(5, Some(&ds.beta), goff);
             enc.set_buffer(6, Some(&ds.dout), zoff);
             set_bytes(
                 enc,

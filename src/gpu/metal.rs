@@ -465,9 +465,13 @@ impl DeltaScratch {
             z: f32_buffer(d, chunk * inner),
             alpha: f32_buffer(d, chunk * hv),
             beta_p: f32_buffer(d, chunk * hv),
-            g: f32_buffer(d, hv),
-            beta: f32_buffer(d, hv),
-            conv_out: f32_buffer(d, c),
+            // CHUNK-WIDE, not one token. The per-token loop below still writes
+            // one slice at a time and reads the same slice back, so this is
+            // byte-identical today — it is what lets the batched kernels that
+            // follow address every token of a chunk at once.
+            g: f32_buffer(d, chunk * hv),
+            beta: f32_buffer(d, chunk * hv),
+            conv_out: f32_buffer(d, chunk * c),
             dout: f32_buffer(d, chunk * inner),
         }
     }
@@ -2710,8 +2714,8 @@ impl MetalSession<'_> {
             enc.set_buffer(1, Some(&ds.beta_p), goff);
             enc.set_buffer(2, Some(&la.a), 0);
             enc.set_buffer(3, Some(&la.dt_bias), 0);
-            enc.set_buffer(4, Some(&ds.g), 0);
-            enc.set_buffer(5, Some(&ds.beta), 0);
+            enc.set_buffer(4, Some(&ds.g), goff);
+            enc.set_buffer(5, Some(&ds.beta), goff);
             let hv32 = hv as u32;
             enc.set_bytes(6, 4, &hv32 as *const u32 as *const _);
             dispatch_grid(enc, hv);
@@ -2726,7 +2730,7 @@ impl MetalSession<'_> {
             enc.set_buffer(0, Some(&st.conv), 0);
             enc.set_buffer(1, Some(&ds.qkv), coff);
             enc.set_buffer(2, Some(&la.conv1d), 0);
-            enc.set_buffer(3, Some(&ds.conv_out), 0);
+            enc.set_buffer(3, Some(&ds.conv_out), coff);
             let cp = SsmConvParams { channels: c_all as u32, d_conv: d.d_conv as u32 };
             enc.set_bytes(4, size_of::<SsmConvParams>() as u64, &cp as *const _ as *const _);
             dispatch_grid(enc, c_all);
@@ -2735,7 +2739,7 @@ impl MetalSession<'_> {
             let s32 = s_dim as u32;
             for off in [0u64, (key_dim * 4) as u64] {
                 enc.set_compute_pipeline_state(&e.pipes.l2norm_rows);
-                enc.set_buffer(0, Some(&ds.conv_out), off);
+                enc.set_buffer(0, Some(&ds.conv_out), coff + off);
                 enc.set_bytes(1, 4, &s32 as *const u32 as *const _);
                 enc.set_bytes(2, 4, &eps as *const f32 as *const _);
                 enc.dispatch_thread_groups(MTLSize::new(hk as u64, 1, 1), MTLSize::new(256, 1, 1));
@@ -2750,11 +2754,11 @@ impl MetalSession<'_> {
             }
             enc.set_compute_pipeline_state(&e.pipes.delta_decode_step);
             enc.set_buffer(0, Some(&st.delta), 0);
-            enc.set_buffer(1, Some(&ds.conv_out), 0);
-            enc.set_buffer(2, Some(&ds.conv_out), (key_dim * 4) as u64);
-            enc.set_buffer(3, Some(&ds.conv_out), (2 * key_dim * 4) as u64);
-            enc.set_buffer(4, Some(&ds.g), 0);
-            enc.set_buffer(5, Some(&ds.beta), 0);
+            enc.set_buffer(1, Some(&ds.conv_out), coff);
+            enc.set_buffer(2, Some(&ds.conv_out), coff + (key_dim * 4) as u64);
+            enc.set_buffer(3, Some(&ds.conv_out), coff + (2 * key_dim * 4) as u64);
+            enc.set_buffer(4, Some(&ds.g), goff);
+            enc.set_buffer(5, Some(&ds.beta), goff);
             enc.set_buffer(6, Some(&ds.dout), zoff);
             let dp = DeltaStepParams {
                 d_state: s32,
