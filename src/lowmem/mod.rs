@@ -220,6 +220,8 @@ pub(crate) struct Pipes {
     /// the same source as everything else and cost only pipeline objects) so
     /// the encoder never has to unwrap an Option mid-dispatch.
     pub ssm_conv_decode: ComputePipelineState,
+    pub ssm_conv_prefill: ComputePipelineState,
+    pub ssm_conv_roll: ComputePipelineState,
     pub delta_decode_step: ComputePipelineState,
     pub delta_gates: ComputePipelineState,
     pub l2norm_rows: ComputePipelineState,
@@ -941,6 +943,8 @@ impl LowMemEngine {
             silu_mul: pipe("silu_mul")?,
             add_inplace: pipe("add_inplace")?,
             ssm_conv_decode: pipe("ssm_conv_decode")?,
+            ssm_conv_prefill: pipe("ssm_conv_prefill")?,
+            ssm_conv_roll: pipe("ssm_conv_roll")?,
             delta_decode_step: pipe("delta_decode_step")?,
             delta_gates: pipe("delta_gates")?,
             l2norm_rows: pipe("l2norm_rows")?,
