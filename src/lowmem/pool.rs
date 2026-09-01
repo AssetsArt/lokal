@@ -1197,6 +1197,9 @@ mod quant_oracle {
     #[test]
     fn gpu_dequant_matches_reference_bit_for_bit() {
         let device = Device::system_default().expect("Metal device required for the oracle");
+        // Serialise device work: see gguf::testutil::gpu_lock — a dispatch can
+        // report Completed and write NOTHING when two tests drive the GPU at once.
+        let _gpu = crate::gguf::testutil::gpu_lock();
         // PRECISE library: fast-math would license fma fusion and reordering,
         // and the gate is bit equality with strict-IEEE Rust — the shipped
         // quant pipelines are built from this same fast-math-off source.
@@ -1285,10 +1288,36 @@ mod quant_oracle {
             enc.end_encoding();
             cb.commit();
             cb.wait_until_completed();
+            // A fresh Metal buffer is zero-filled, so an unexecuted dispatch and a
+            // kernel that wrote zeros are indistinguishable by value alone. These
+            // two assertions make the difference visible: the first catches a
+            // command buffer that failed, the second catches one that reported
+            // Completed and still wrote nothing — which is the case this lane
+            // actually found. Without them the symptom is a numeric mismatch at
+            // an arbitrary column, which is what sent the first investigation
+            // looking for an arithmetic bug that was never there.
+            assert_eq!(
+                cb.status(),
+                metal::MTLCommandBufferStatus::Completed,
+                "{ty:?}: command buffer did not complete — the zeros this test would \
+                 otherwise compare are a FAILED DISPATCH, not kernel output"
+            );
 
             let got = unsafe {
                 std::slice::from_raw_parts(out_buf.contents() as *const f32, want.len())
             };
+            // Status Completed plus an ENTIRELY zero buffer means the work did not
+            // land despite the wait; partial zeros would mean something else
+            // entirely. Keeping the distinction in the assertion text is what
+            // makes the next occurrence diagnosable in one run instead of ten.
+            let zeros = got.iter().filter(|v| v.to_bits() == 0).count();
+            assert!(
+                zeros < got.len(),
+                "{ty:?}: command buffer reported Completed but the ENTIRE output \
+                 buffer ({} elements) is zero — the wait returned before the work \
+                 landed",
+                got.len()
+            );
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
                 assert!(
                     g.to_bits() == w.to_bits(),

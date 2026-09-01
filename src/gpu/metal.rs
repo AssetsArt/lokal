@@ -4564,6 +4564,9 @@ mod tests {
     #[test]
     fn deltanet_states_lifecycle() {
         let device = Device::system_default().expect("metal device");
+        // Serialise device work: see gguf::testutil::gpu_lock — a dispatch can
+        // report Completed and write NOTHING when two tests drive the GPU at once.
+        let _gpu = crate::gguf::testutil::gpu_lock();
         // Interval-4 trunk of 8: layers 3 and 7 are attention.
         let layout = DeltaNetLayout {
             is_recurrent: (0..8).map(|i| (i + 1) % 4 != 0).collect(),
@@ -4626,6 +4629,9 @@ mod tests {
             assert_eq!(*k == Recurrent, layout.is_recurrent[l], "layer {l}");
         }
         let device = Device::system_default().expect("metal device");
+        // Serialise device work: see gguf::testutil::gpu_lock — a dispatch can
+        // report Completed and write NOTHING when two tests drive the GPU at once.
+        let _gpu = crate::gguf::testutil::gpu_lock();
         let st = DeltaNetStates::new(&device, &layout);
         for (l, k) in sched.iter().enumerate() {
             assert_eq!(st.layers[l].is_some(), *k == Recurrent, "slot kind, layer {l}");
@@ -4706,10 +4712,12 @@ mod tests {
     /// it is ruled, this runs in the `--ignored` pass, which this lane's gates
     /// require anyway.
     #[test]
-    #[ignore = "GPU tests are not concurrency-safe; see the lane challenge"]
     fn onehot_probe_matches_the_cpu_reference_bit_for_bit() {
         use crate::gguf::GgmlType;
         let device = Device::system_default().expect("metal device");
+        // Serialise device work: see gguf::testutil::gpu_lock — a dispatch can
+        // report Completed and write NOTHING when two tests drive the GPU at once.
+        let _gpu = crate::gguf::testutil::gpu_lock();
         // One entry per type whose read path this arc rewrites. The harness is
         // type-agnostic apart from two things: the LM_W_QTYPE selector, and which
         // bytes of a synthetic block must be constrained so the block is VALID.
@@ -4990,6 +4998,9 @@ mod deltanet_kernel_oracle {
     /// single-shot comparison would miss a broken roll entirely.
     fn gpu_conv(d: rf::DeltaDims, state0: &[f32], xs: &[Vec<f32>], w: &[f32]) -> (Vec<Vec<f32>>, Vec<f32>) {
         let device = Device::system_default().expect("Metal device required");
+        // Serialise device work: see gguf::testutil::gpu_lock — a dispatch can
+        // report Completed and write NOTHING when two tests drive the GPU at once.
+        let _gpu = crate::gguf::testutil::gpu_lock();
         let opts = CompileOptions::new();
         opts.set_fast_math_enabled(false);
         let lib = device
@@ -5161,6 +5172,9 @@ mod deltanet_kernel_oracle {
         reference_layout: bool,
     ) -> (Vec<Vec<f32>>, Vec<f32>) {
         let device = Device::system_default().expect("Metal device required");
+        // Serialise device work: see gguf::testutil::gpu_lock — a dispatch can
+        // report Completed and write NOTHING when two tests drive the GPU at once.
+        let _gpu = crate::gguf::testutil::gpu_lock();
         let opts = CompileOptions::new();
         opts.set_fast_math_enabled(false);
         let lib = device
@@ -5279,6 +5293,9 @@ mod deltanet_kernel_oracle {
         beta: &[Vec<f32>],
     ) -> (Vec<Vec<f32>>, Vec<f32>) {
         let device = Device::system_default().expect("Metal device required");
+        // Serialise device work: see gguf::testutil::gpu_lock — a dispatch can
+        // report Completed and write NOTHING when two tests drive the GPU at once.
+        let _gpu = crate::gguf::testutil::gpu_lock();
         let opts = CompileOptions::new();
         opts.set_fast_math_enabled(false);
         let lib = device
@@ -5559,6 +5576,9 @@ mod deltanet_kernel_oracle {
     /// Run attn_out_gate over a flat vector.
     fn gpu_attn_gate(attn: &[f32], gate: &[f32]) -> Vec<f32> {
         let device = Device::system_default().expect("Metal device required");
+        // Serialise device work: see gguf::testutil::gpu_lock — a dispatch can
+        // report Completed and write NOTHING when two tests drive the GPU at once.
+        let _gpu = crate::gguf::testutil::gpu_lock();
         let opts = CompileOptions::new();
         opts.set_fast_math_enabled(false);
         let lib = device
@@ -5683,6 +5703,9 @@ mod deltanet_kernel_oracle {
     /// Run gated_output_norm (one threadgroup per V head).
     fn gpu_gated_norm(d: rf::DeltaDims, o: &[f32], w: &[f32], z: &[f32], eps: f32) -> Vec<f32> {
         let device = Device::system_default().expect("Metal device required");
+        // Serialise device work: see gguf::testutil::gpu_lock — a dispatch can
+        // report Completed and write NOTHING when two tests drive the GPU at once.
+        let _gpu = crate::gguf::testutil::gpu_lock();
         let opts = CompileOptions::new();
         opts.set_fast_math_enabled(false);
         let lib = device
@@ -5962,6 +5985,9 @@ mod deltanet_kernel_oracle {
 
     fn gpu_delta_gates(alpha: &[f32], beta_in: &[f32], a: &[f32], dt: &[f32]) -> (Vec<f32>, Vec<f32>) {
         let device = Device::system_default().expect("Metal device required");
+        // Serialise device work: see gguf::testutil::gpu_lock — a dispatch can
+        // report Completed and write NOTHING when two tests drive the GPU at once.
+        let _gpu = crate::gguf::testutil::gpu_lock();
         let opts = CompileOptions::new();
         opts.set_fast_math_enabled(false);
         let lib = device
@@ -6077,6 +6103,9 @@ mod deltanet_kernel_oracle {
         eps: f32,
     ) -> (Vec<Vec<f32>>, Vec<f32>, Vec<f32>) {
         let device = Device::system_default().expect("Metal device required");
+        // Serialise device work: see gguf::testutil::gpu_lock — a dispatch can
+        // report Completed and write NOTHING when two tests drive the GPU at once.
+        let _gpu = crate::gguf::testutil::gpu_lock();
         let opts = CompileOptions::new();
         opts.set_fast_math_enabled(false);
         let lib = device
@@ -6401,6 +6430,9 @@ mod deltanet_kernel_oracle {
         let x: Vec<f32> = (0..n_rows * n_heads * head_dim).map(|_| lcg(&mut seed)).collect();
 
         let device = Device::system_default().expect("Metal device required");
+        // Serialise device work: see gguf::testutil::gpu_lock — a dispatch can
+        // report Completed and write NOTHING when two tests drive the GPU at once.
+        let _gpu = crate::gguf::testutil::gpu_lock();
         let opts = CompileOptions::new();
         opts.set_fast_math_enabled(false);
         let lib = device
@@ -6482,6 +6514,9 @@ mod deltanet_kernel_oracle {
     /// Run l2norm_rows over `rows` (one threadgroup per row) and read them back.
     fn gpu_l2norm(rows: &[Vec<f32>], eps: f32) -> Vec<Vec<f32>> {
         let device = Device::system_default().expect("Metal device required");
+        // Serialise device work: see gguf::testutil::gpu_lock — a dispatch can
+        // report Completed and write NOTHING when two tests drive the GPU at once.
+        let _gpu = crate::gguf::testutil::gpu_lock();
         let opts = CompileOptions::new();
         opts.set_fast_math_enabled(false);
         let lib = device
