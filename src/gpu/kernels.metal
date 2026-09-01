@@ -1252,6 +1252,69 @@ inline float lm_dot_run_q6_K(device const uchar *row, uint e0, device const floa
     return s0 * a0 + s1 * a1;
 }
 
+/// IQ1_S over one 32-element run. A 32-element run is EXACTLY one ib group, so
+/// everything the per-element path recomputed 32 times — the superblock base,
+/// the f16 d, the qh u16, the group scale dl and the delta sign — is loop
+/// invariant and hoists out. Inside, each 64-bit grid entry covers 8 outputs, so
+/// the constant-memory load that the per-element path issued EIGHT TIMES per
+/// entry is issued once. That is the longest dependency chain in the family
+/// (a dependent constant-mem load per element), which is why the loads-in-flight
+/// diagnosis from quant-matvec-rework predicts this type benefits where Q6_K did
+/// not.
+///
+/// ORDER-PRESERVING BY CONSTRUCTION: t = l*8 + j walks 0..31 in exactly the
+/// order the per-element loop did, and each term is still
+/// (dl * (g + delta)) * x[t] with the same associativity — so this is
+/// bit-identical to what it replaces, and the one-hot gate plus the token gates
+/// prove that rather than assume it.
+inline float lm_dot_run_iq1_s(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 8) * 50;
+    float d = lm_f16_at(b);
+    uint ib = (e0 & 255) >> 5;
+    uint qh = (uint)b[34 + 2 * ib] | ((uint)b[35 + 2 * ib] << 8);
+    float dl = d * (float)(2 * ((qh >> 12) & 7) + 1);
+    float delta = (qh & 0x8000) ? -LM_IQ1_DELTA : LM_IQ1_DELTA;
+    float a = 0.0f;
+    for (uint l = 0; l < 4; l++) {
+        uint gi = (uint)b[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8);
+        ulong g = lm_iq1s_grid[gi];
+        for (uint j = 0; j < 8; j++) {
+            a += dl * ((float)(char)((g >> (8 * j)) & 0xFF) + delta) * x[e0 + l * 8 + j];
+        }
+    }
+    return a;
+}
+
+/// IQ1_M over one 32-element run. Same shape as IQ1_S: ib is constant across a
+/// run, so the four scale u16s, the assembled f16 and the group selector hoist
+/// out; dl and the qh byte vary only with l (four values), not per element; and
+/// one grid entry still serves 8 outputs. Order-preserving on the same argument.
+inline float lm_dot_run_iq1_m(device const uchar *row, uint e0, device const float *x) {
+    device const uchar *b = row + (e0 >> 8) * 56;
+    uint s0 = (uint)b[48] | ((uint)b[49] << 8);
+    uint s1 = (uint)b[50] | ((uint)b[51] << 8);
+    uint s2 = (uint)b[52] | ((uint)b[53] << 8);
+    uint s3 = (uint)b[54] | ((uint)b[55] << 8);
+    ushort bits = (ushort)((s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000));
+    float d = (float)as_type<half>(bits);
+    uint ib = (e0 & 255) >> 5;
+    uint scw = (ib / 2 == 0) ? s0 : ((ib / 2 == 1) ? s1 : ((ib / 2 == 2) ? s2 : s3));
+    float a = 0.0f;
+    for (uint l = 0; l < 4; l++) {
+        uint shift = 6 * (ib % 2) + ((l < 2) ? 0 : 3);
+        float dl = d * (float)(2 * ((scw >> shift) & 7) + 1);
+        uint qh = b[32 + 2 * ib + (l >> 1)];
+        uint gi = (uint)b[4 * ib + l] | ((qh << ((l % 2 == 0) ? 8 : 4)) & 0x700);
+        uint mask = (l % 2 == 0) ? 0x08 : 0x80;
+        float delta = (qh & mask) ? -LM_IQ1_DELTA : LM_IQ1_DELTA;
+        ulong g = lm_iq1s_grid[gi];
+        for (uint j = 0; j < 8; j++) {
+            a += dl * ((float)(char)((g >> (8 * j)) & 0xFF) + delta) * x[e0 + l * 8 + j];
+        }
+    }
+    return a;
+}
+
 /// Dot product of one 32-element aligned run of a quantized row with x.
 inline float lm_dot_run(device const uchar *row, uint e0, device const float *x) {
     switch (LM_W_QTYPE) {
@@ -1270,24 +1333,8 @@ inline float lm_dot_run(device const uchar *row, uint e0, device const float *x)
         case 14: return lm_dot_run_iq2_xxs(row, e0, x);
         case 15: return lm_dot_run_iq2_xs(row, e0, x);
         case 16: return lm_dot_run_iq2_s(row, e0, x);
-        // The IQ1 pair has no bespoke run variant: its per-element path already
-        // decodes one grid entry per 8 outputs, and these types appear on the
-        // smallest tensors of the smallest files, where the win would not pay
-        // for a fourth hand-derived index mapping.
-        case 17: {
-            float a = 0.0f;
-            for (uint t = 0; t < 32; t++) {
-                a += lm_dequant_iq1_s(row, e0 + t) * x[e0 + t];
-            }
-            return a;
-        }
-        case 18: {
-            float a = 0.0f;
-            for (uint t = 0; t < 32; t++) {
-                a += lm_dequant_iq1_m(row, e0 + t) * x[e0 + t];
-            }
-            return a;
-        }
+        case 17: return lm_dot_run_iq1_s(row, e0, x);
+        case 18: return lm_dot_run_iq1_m(row, e0, x);
         default: return 0.0f;
     }
 }

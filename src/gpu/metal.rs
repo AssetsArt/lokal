@@ -1876,7 +1876,133 @@ impl MetalEngine {
     /// removed (probe_shape), and through a flat coalesced stream (probe_linear).
     /// The real matvec runs beside them as the in-run reference, so all three
     /// numbers come from one process, one buffer and one machine state.
+    /// SYNTHETIC microbenchmark for a weight type no file on this box carries.
+    /// `LOKAL_MATVEC_PROBE=synth:<sel>:<in_dim>:<out_dim>` builds a tensor of
+    /// VALID blocks for that selector and times the real matvec over it.
+    ///
+    /// It exists because unsloth/Qwen3.5-{0.8B,2B}-GGUF have no IQ1 tag at all
+    /// (checked: IQ2_M, IQ2_XXS, IQ3_XXS, IQ4_XS and up, no IQ1_*), so the type
+    /// that is 86.7% of the 27B IQ1_M step cannot be timed here on real weights.
+    /// Every number it prints is labelled SYNTHETIC and supports NO claim about
+    /// the 27B — it compares two binaries on identical bytes, nothing more.
+    /// Block validity follows the same rules the one-hot gate uses.
+    fn run_synth_probe(&self, spec: &str) {
+        let parts: Vec<&str> = spec.split(':').collect();
+        let (Ok(sel), Ok(in_dim), Ok(out_dim)) = (
+            parts.first().unwrap_or(&"").parse::<u32>(),
+            parts.get(1).unwrap_or(&"").parse::<usize>(),
+            parts.get(2).unwrap_or(&"").parse::<usize>(),
+        ) else {
+            eprintln!("probe fail stage=spec want=synth:<sel>:<in_dim>:<out_dim> got={spec}");
+            return;
+        };
+        let blk = match sel {
+            5 => 210usize,
+            17 => 50,
+            18 => 56,
+            _ => {
+                eprintln!("probe fail stage=selector sel={sel} has no synthetic block rule");
+                return;
+            }
+        };
+        let sb = in_dim / 256;
+        let row_bytes = sb * blk;
+        let mut w = vec![0u8; out_dim * row_bytes];
+        let mut st = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        for r in 0..out_dim {
+            for b in 0..sb {
+                let base = r * row_bytes + b * blk;
+                for i in 0..blk {
+                    w[base + i] = (next() >> 24) as u8;
+                }
+                let d_bits: u16 = 0x3C00 | ((next() >> 20) as u16 & 0x03FF);
+                match sel {
+                    5 => {
+                        w[base + 208] = (d_bits & 0xFF) as u8;
+                        w[base + 209] = (d_bits >> 8) as u8;
+                    }
+                    17 => {
+                        w[base] = (d_bits & 0xFF) as u8;
+                        w[base + 1] = (d_bits >> 8) as u8;
+                    }
+                    _ => w[base + 55] = (w[base + 55] & 0x0F) | 0x30,
+                }
+            }
+        }
+        let d = &self.device;
+        let precise = CompileOptions::new();
+        precise.set_fast_math_enabled(false);
+        let Ok(lib) = d.new_library_with_source(&shader_source(self.dims.kv_dim), &precise) else {
+            eprintln!("probe fail stage=library");
+            return;
+        };
+        let consts = FunctionConstantValues::new();
+        consts.set_constant_value_at_index(&sel as *const u32 as *const _, MTLDataType::UInt, 25);
+        let Ok(f) = lib.get_function("matvec", Some(consts)) else {
+            eprintln!("probe fail stage=function");
+            return;
+        };
+        let Ok(pipe) = d.new_compute_pipeline_state_with_function(&f) else {
+            eprintln!("probe fail stage=pipeline");
+            return;
+        };
+        let wbuf = d.new_buffer_with_data(
+            w.as_ptr() as *const _,
+            w.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let x = f32_buffer(d, in_dim);
+        unsafe {
+            let xp = x.contents() as *mut f32;
+            for i in 0..in_dim {
+                *xp.add(i) = 1.0;
+            }
+        }
+        let bias = f16_empty_buffer(d, out_dim.max(8));
+        unsafe { std::ptr::write_bytes(bias.contents() as *mut u8, 0, 2 * out_dim.max(8)) };
+        let y = f32_buffer(d, out_dim.max(8));
+        let p = MatvecParams { in_dim: in_dim as u32, out_dim: out_dim as u32 };
+        let mut ns: Vec<u128> = Vec::new();
+        for _ in 0..7 {
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipe);
+            enc.set_buffer(0, Some(&wbuf), 0);
+            enc.set_buffer(1, Some(&bias), 0);
+            enc.set_buffer(2, Some(&x), 0);
+            enc.set_buffer(3, Some(&y), 0);
+            enc.set_bytes(4, size_of::<MatvecParams>() as u64, &p as *const _ as *const _);
+            dispatch_simdgroup_rows(enc, out_dim as u32);
+            enc.end_encoding();
+            let t = std::time::Instant::now();
+            cb.commit();
+            cb.wait_until_completed();
+            ns.push(t.elapsed().as_nanos());
+        }
+        ns.sort_unstable();
+        let med = ns[ns.len() / 2];
+        eprintln!(
+            "probe kind=SYNTHETIC sel={sel} in_dim={in_dim} out_dim={out_dim} ms={:.3} \
+             gbps={:.1} bytes={} samples={} note=no-real-file-for-this-type",
+            med as f64 / 1e6,
+            w.len() as f64 / (med as f64 / 1e9) / 1e9,
+            w.len(),
+            ns.len()
+        );
+    }
+
     fn run_matvec_probe(&self) {
+        if let Ok(spec) = std::env::var("LOKAL_MATVEC_PROBE") {
+            if let Some(rest) = spec.strip_prefix("synth:") {
+                return self.run_synth_probe(rest);
+            }
+        }
         let Some(q) = &self.quant else {
             eprintln!("probe skip reason=not-a-quant-engine");
             return;
@@ -4340,10 +4466,19 @@ mod tests {
     fn onehot_probe_matches_the_cpu_reference_bit_for_bit() {
         use crate::gguf::GgmlType;
         let device = Device::system_default().expect("metal device");
-        // Q6_K only: it is the type this lane reworks. Extend the list as other
-        // types get a staged variant — the harness is type-agnostic apart from
-        // the selector and the one f16 field a synthetic block must keep finite.
-        const SEL: u32 = 5;
+        // One entry per type whose read path this arc rewrites. The harness is
+        // type-agnostic apart from two things: the LM_W_QTYPE selector, and which
+        // bytes of a synthetic block must be constrained so the block is VALID.
+        // Everything else — grid indices, scale nibbles, quant bits — is random,
+        // and for both IQ1 types that is provably safe: their grid index is 11
+        // bits wide (byte | 3 bits) and lm_iq1s_grid has exactly 2048 entries, so
+        // no random byte pattern can read out of bounds.
+        let types: &[(u32, crate::gguf::GgmlType, usize)] = &[
+            (5, crate::gguf::GgmlType::Q6_K, 210),
+            (17, crate::gguf::GgmlType::IQ1_S, 50),
+            (18, crate::gguf::GgmlType::IQ1_M, 56),
+        ];
+        for &(SEL, TY, BLK) in types {
         let precise = CompileOptions::new();
         precise.set_fast_math_enabled(false);
         let lib = device
@@ -4361,7 +4496,7 @@ mod tests {
         for &in_dim in &[512usize, 2048usize] {
             let rows = 2usize;
             let sb = in_dim / 256;
-            let row_bytes = sb * 210;
+            let row_bytes = sb * BLK;
             let mut w = vec![0u8; rows * row_bytes];
             // Deterministic filler. Every ql/qh/scale byte pattern is a valid
             // Q6_K block; only `d` is an f16 and a random one would be NaN ~3%
@@ -4376,19 +4511,36 @@ mod tests {
             };
             for r in 0..rows {
                 for b in 0..sb {
-                    let base = r * row_bytes + b * 210;
-                    for i in 0..208 {
+                    let base = r * row_bytes + b * BLK;
+                    for i in 0..BLK {
                         w[base + i] = (next() >> 24) as u8;
                     }
+                    // Keep the block's f16 scale FINITE. A random f16 is NaN or
+                    // Inf about 3% of the time and NaN != NaN would turn this
+                    // gate into a coin flip. [1,2) is finite and still varied.
                     let d_bits: u16 = 0x3C00 | ((next() >> 20) as u16 & 0x03FF);
-                    w[base + 208] = (d_bits & 0xFF) as u8;
-                    w[base + 209] = (d_bits >> 8) as u8;
+                    let put = |w: &mut Vec<u8>, off: usize, bits: u16| {
+                        w[base + off] = (bits & 0xFF) as u8;
+                        w[base + off + 1] = (bits >> 8) as u8;
+                    };
+                    match SEL {
+                        5 => put(&mut w, 208, d_bits),   // Q6_K: d at the end
+                        17 => put(&mut w, 0, d_bits),    // IQ1_S: d first
+                        // IQ1_M has NO d field: its f16 is assembled from the TOP
+                        // NIBBLE of each of the four scale u16s, and the top
+                        // nibble of the LAST one supplies sign + the high
+                        // exponent bits. Forcing it to 3 gives exponent 011xx —
+                        // finite for every value the other three nibbles take,
+                        // so the rest stays random.
+                        18 => w[base + 55] = (w[base + 55] & 0x0F) | 0x30,
+                        _ => unreachable!("no block-validity rule for selector {SEL}"),
+                    }
                 }
             }
             let mut expect = vec![0f32; rows * in_dim];
             for r in 0..rows {
                 dequant_row_ref_for_test(
-                    GgmlType::Q6_K,
+                    TY,
                     &w[r * row_bytes..(r + 1) * row_bytes],
                     &mut expect[r * in_dim..(r + 1) * in_dim],
                 );
@@ -4401,7 +4553,8 @@ mod tests {
             );
             let bias = f16_empty_buffer(&device, rows.max(8));
             unsafe { std::ptr::write_bytes(bias.contents() as *mut u8, 0, 2 * rows.max(8)) };
-            // Q6_K's index mapping has PERIOD 256 — the superblock — so testing
+            // Every one of these types maps indices with PERIOD 256 — the
+            // superblock — so testing
             // every column of a long row re-tests the same mapping over and over.
             // Two superblocks' worth of columns is full coverage of the mapping,
             // and in_dim 512 vs 2048 covers the two lane regimes (fewer 32-element
@@ -4469,6 +4622,7 @@ mod tests {
                     );
                 }
             }
+        }
         }
     }
 
