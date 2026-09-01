@@ -1975,6 +1975,7 @@ impl MetalEngine {
             state: self.state_schedule(),
             kv_base,
             max_seq,
+            timing: GpuTiming::from_env(self),
             engine: self,
         }
     }
@@ -2040,6 +2041,9 @@ pub(crate) struct MetalSession<'a> {
     state: Vec<LayerStateKind>,
     kv_base: u64, // byte offset of this session's slot when the cache is pooled
     max_seq: usize,
+    /// GPU phase attribution — `None` unless LOKAL_GPU_TIMING is set, which is
+    /// every run that is not this lane's diagnosis. See the timing section.
+    timing: Option<Box<GpuTiming>>,
 }
 
 impl MetalSession<'_> {
@@ -2509,6 +2513,10 @@ impl MetalSession<'_> {
         }
     }
 
+    /// A timed step creates hundreds of autoreleased encoder objects, and a
+    /// Rust binary has no ambient autorelease pool — without one the diagnosis
+    /// mode would grow the process for the length of the run. The untimed path
+    /// keeps the exact call it has always had.
     fn run_from_quant(
         &mut self,
         src: Source<'_>,
@@ -2517,6 +2525,28 @@ impl MetalSession<'_> {
         layer0: usize,
         logits_rows: usize,
     ) -> crate::Result<Vec<f32>> {
+        if self.timing.is_some() {
+            objc2::rc::autoreleasepool(|_| {
+                self.run_from_quant_inner(src, n, pos0, layer0, logits_rows)
+            })
+        } else {
+            self.run_from_quant_inner(src, n, pos0, layer0, logits_rows)
+        }
+    }
+
+    fn run_from_quant_inner(
+        &mut self,
+        src: Source<'_>,
+        n: usize,
+        pos0: usize,
+        layer0: usize,
+        logits_rows: usize,
+    ) -> crate::Result<Vec<f32>> {
+        let t_step = std::time::Instant::now();
+        // Out of the session for the step so the phase encoder can hold it
+        // mutably while `self` keeps handing out buffers; put back on the way
+        // out (every early return below is an Err, which ends the run anyway).
+        let mut timing = self.timing.take();
         let e = self.engine;
         let q = e.quant.as_ref().expect("quant path entered without state");
         let cfg = &e.cfg;
@@ -2567,93 +2597,101 @@ impl MetalSession<'_> {
         // generalized; the Full-attn fused branch below (joint Q+gate split, per-head
         // qk-norm, partial rope) was already written for qwen35 and simply never ran.
         let fused_decode = n == 1 && hd <= DEC_MAX_HD && hd.is_multiple_of(4);
-        let enc = if fused_decode {
-            cb.new_compute_command_encoder()
-        } else {
-            cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent)
-        };
         let conc = !fused_decode;
+        let cpu_pre_ns = t_step.elapsed().as_nanos();
+        // One encoder when timing is off — the construction this path has
+        // always used, byte for byte. One encoder PER PHASE RUN when it is on.
+        let mut pe = PhaseEnc::new(cb, conc, timing.as_deref_mut());
+        // A mark with zero dispatches never cuts an encoder, so the two qwen35
+        // -only helpers below cost nothing on checkpoints that lack the joint
+        // Q+gate projection.
+        let qg_n = u32::from(self.qg.is_some());
+        let dn_disp = 6 * n as u32; // the deltanet chain's kernels per token
         macro_rules! bar {
-            ($($b:expr),+) => { if conc { enc.memory_barrier_with_resources(&[$($b),+]) } };
+            ($($b:expr),+) => { if conc { pe.cur().memory_barrier_with_resources(&[$($b),+]) } };
         }
 
         let v_base = self.kvs.length() / 2;
         let rot = e.dims.rot_dim; // == hd except on qwen35 (partial rope)
         for (l, blk) in q.blocks.iter().enumerate().skip(layer0) {
             if fused_decode {
-                e.enc_rmsnorm(enc, &self.x, &blk.input_layernorm, &self.xn, 1);
+                e.enc_rmsnorm(pe.at(Phase::Norm, 1), &self.x, &blk.input_layernorm, &self.xn, 1);
                 match &blk.attn {
                     QuantAttn::Linear(la) => {
                         // Gated-deltanet block: four projections, the six-kernel
                         // chain one token at a time, then the out projection
                         // accumulated straight into x (what o_proj does below).
-                        self.enc_qmv(enc, &q.pipe(la.qkv.sel).matvec, &la.qkv, &self.xn, &self.ds_ref().qkv, 0);
-                        self.enc_qmv(enc, &q.pipe(la.z_gate.sel).matvec, &la.z_gate, &self.xn, &self.ds_ref().z, 0);
-                        self.enc_qmv(enc, &q.pipe(la.alpha.sel).matvec, &la.alpha, &self.xn, &self.ds_ref().alpha, 0);
-                        self.enc_qmv(enc, &q.pipe(la.beta.sel).matvec, &la.beta, &self.xn, &self.ds_ref().beta_p, 0);
-                        self.enc_delta_block(enc, la, l, 1, conc);
-                        self.enc_qmv(enc, &q.pipe(la.out.sel).matvec_acc, &la.out, &self.ds_ref().dout, &self.x, 0);
+                        self.enc_qmv(pe.at(Phase::Mm(MmRole::Dn, la.qkv.sel), 1), &q.pipe(la.qkv.sel).matvec, &la.qkv, &self.xn, &self.ds_ref().qkv, 0);
+                        self.enc_qmv(pe.at(Phase::Mm(MmRole::Dn, la.z_gate.sel), 1), &q.pipe(la.z_gate.sel).matvec, &la.z_gate, &self.xn, &self.ds_ref().z, 0);
+                        self.enc_qmv(pe.at(Phase::Mm(MmRole::Dn, la.alpha.sel), 1), &q.pipe(la.alpha.sel).matvec, &la.alpha, &self.xn, &self.ds_ref().alpha, 0);
+                        self.enc_qmv(pe.at(Phase::Mm(MmRole::Dn, la.beta.sel), 1), &q.pipe(la.beta.sel).matvec, &la.beta, &self.xn, &self.ds_ref().beta_p, 0);
+                        self.enc_delta_block(pe.at(Phase::Delta, dn_disp), la, l, 1, conc);
+                        self.enc_qmv(pe.at(Phase::Mm(MmRole::Dn, la.out.sel), 1), &q.pipe(la.out.sel).matvec_acc, &la.out, &self.ds_ref().dout, &self.x, 0);
                     }
                     QuantAttn::Full(fa) => {
-                self.enc_qmv(enc, &q.pipe(fa.q_proj.sel).matvec, &fa.q_proj, &self.xn, &self.q, 0);
-                let qbuf = self.enc_split_qg(enc, 1, conc);
-                self.enc_qmv(enc, &q.pipe(fa.k_proj.sel).matvec_h, &fa.k_proj, &self.xn, &self.k_cache[l], kv_byte_off);
-                self.enc_qmv(enc, &q.pipe(fa.v_proj.sel).matvec_h, &fa.v_proj, &self.xn, &self.v_cache[l], kv_byte_off);
+                self.enc_qmv(pe.at(Phase::Mm(MmRole::Attn, fa.q_proj.sel), 1), &q.pipe(fa.q_proj.sel).matvec, &fa.q_proj, &self.xn, &self.q, 0);
+                let qbuf = self.enc_split_qg(pe.at(Phase::Attn, qg_n), 1, conc);
+                self.enc_qmv(pe.at(Phase::Mm(MmRole::Attn, fa.k_proj.sel), 1), &q.pipe(fa.k_proj.sel).matvec_h, &fa.k_proj, &self.xn, &self.k_cache[l], kv_byte_off);
+                self.enc_qmv(pe.at(Phase::Mm(MmRole::Attn, fa.v_proj.sel), 1), &q.pipe(fa.v_proj.sel).matvec_h, &fa.v_proj, &self.xn, &self.v_cache[l], kv_byte_off);
                 if let (Some(qn), Some(kn)) = (&fa.q_norm, &fa.k_norm) {
-                    e.enc_rmsnorm_dim(enc, qbuf, qn, cfg.num_attention_heads, hd);
-                    e.enc_rmsnorm_h_inplace(enc, &self.k_cache[l], kv_byte_off, kn, cfg.num_key_value_heads, hd);
+                    e.enc_rmsnorm_dim(pe.at(Phase::Norm, 1), qbuf, qn, cfg.num_attention_heads, hd);
+                    e.enc_rmsnorm_h_inplace(pe.at(Phase::Norm, 1), &self.k_cache[l], kv_byte_off, kn, cfg.num_key_value_heads, hd);
                 }
-                e.enc_rope_qk(enc, qbuf, &self.k_cache[l], kv_byte_off, pos0);
-                e.enc_attention_decode(enc, qbuf, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.partials, &self.att, pos0);
-                self.enc_apply_qgate(enc, 1, conc);
-                self.enc_qmv(enc, &q.pipe(fa.o_proj.sel).matvec_acc, &fa.o_proj, &self.att, &self.x, 0);
+                e.enc_rope_qk(pe.at(Phase::Rope, 1), qbuf, &self.k_cache[l], kv_byte_off, pos0);
+                // two kernels: the flash-decoding partials, then the merge.
+                e.enc_attention_decode(pe.at(Phase::Attn, 2), qbuf, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.partials, &self.att, pos0);
+                self.enc_apply_qgate(pe.at(Phase::Attn, qg_n), 1, conc);
+                self.enc_qmv(pe.at(Phase::Mm(MmRole::Attn, fa.o_proj.sel), 1), &q.pipe(fa.o_proj.sel).matvec_acc, &fa.o_proj, &self.att, &self.x, 0);
                     }
                 }
-                e.enc_rmsnorm(enc, &self.x, &blk.post_attention_layernorm, &self.xn, 1);
+                e.enc_rmsnorm(pe.at(Phase::Norm, 1), &self.x, &blk.post_attention_layernorm, &self.xn, 1);
                 // gate/up dispatch separately: a mixed-quant file may hold the
                 // two halves in different encodings, and matvec_swiglu assumes
                 // one selector for both.
-                self.enc_qmv(enc, &q.pipe(blk.gate_proj.sel).matvec, &blk.gate_proj, &self.xn, &self.gate, 0);
-                self.enc_qmv(enc, &q.pipe(blk.up_proj.sel).matvec, &blk.up_proj, &self.xn, &self.up, 0);
-                let p = ElemParams { dim: cfg.intermediate_size as u32 };
-                enc.set_compute_pipeline_state(&e.pipes.silu_mul);
-                enc.set_buffer(0, Some(&self.gate), 0);
-                enc.set_buffer(1, Some(&self.up), 0);
-                enc.set_bytes(2, size_of::<ElemParams>() as u64, &p as *const _ as *const _);
-                dispatch_grid(enc, cfg.intermediate_size);
-                self.enc_qmv(enc, &q.pipe(blk.down_proj.sel).matvec_acc, &blk.down_proj, &self.gate, &self.x, 0);
+                self.enc_qmv(pe.at(Phase::Mm(MmRole::Mlp, blk.gate_proj.sel), 1), &q.pipe(blk.gate_proj.sel).matvec, &blk.gate_proj, &self.xn, &self.gate, 0);
+                self.enc_qmv(pe.at(Phase::Mm(MmRole::Mlp, blk.up_proj.sel), 1), &q.pipe(blk.up_proj.sel).matvec, &blk.up_proj, &self.xn, &self.up, 0);
+                {
+                    let enc = pe.at(Phase::Elem, 1);
+                    let p = ElemParams { dim: cfg.intermediate_size as u32 };
+                    enc.set_compute_pipeline_state(&e.pipes.silu_mul);
+                    enc.set_buffer(0, Some(&self.gate), 0);
+                    enc.set_buffer(1, Some(&self.up), 0);
+                    enc.set_bytes(2, size_of::<ElemParams>() as u64, &p as *const _ as *const _);
+                    dispatch_grid(enc, cfg.intermediate_size);
+                }
+                self.enc_qmv(pe.at(Phase::Mm(MmRole::Mlp, blk.down_proj.sel), 1), &q.pipe(blk.down_proj.sel).matvec_acc, &blk.down_proj, &self.gate, &self.x, 0);
                 continue;
             }
 
             // Prefill: rmsnorm (f32), quant GEMMs, staged K/V into the cache.
-            e.enc_rmsnorm(enc, &self.x, &blk.input_layernorm, &self.xn, n);
+            e.enc_rmsnorm(pe.at(Phase::Norm, 1), &self.x, &blk.input_layernorm, &self.xn, n);
             bar!(&self.xn);
             let attn_out_done = match &blk.attn {
                 QuantAttn::Linear(la) => {
                     // Gated-deltanet block, prefill form: the four projections,
                     // then the decode-form chain token by token (plan v1), then
                     // the out projection and the residual add.
-                    self.enc_qmm(enc, &q.pipe(la.qkv.sel).matmul_pg, &la.qkv, &self.xn, 0, &self.ds_ref().qkv, 0, n);
-                    self.enc_qmm(enc, &q.pipe(la.z_gate.sel).matmul_pg, &la.z_gate, &self.xn, 0, &self.ds_ref().z, 0, n);
-                    self.enc_qmm(enc, &q.pipe(la.alpha.sel).matmul_pg, &la.alpha, &self.xn, 0, &self.ds_ref().alpha, 0, n);
-                    self.enc_qmm(enc, &q.pipe(la.beta.sel).matmul_pg, &la.beta, &self.xn, 0, &self.ds_ref().beta_p, 0, n);
+                    self.enc_qmm(pe.at(Phase::Mm(MmRole::Dn, la.qkv.sel), 1), &q.pipe(la.qkv.sel).matmul_pg, &la.qkv, &self.xn, 0, &self.ds_ref().qkv, 0, n);
+                    self.enc_qmm(pe.at(Phase::Mm(MmRole::Dn, la.z_gate.sel), 1), &q.pipe(la.z_gate.sel).matmul_pg, &la.z_gate, &self.xn, 0, &self.ds_ref().z, 0, n);
+                    self.enc_qmm(pe.at(Phase::Mm(MmRole::Dn, la.alpha.sel), 1), &q.pipe(la.alpha.sel).matmul_pg, &la.alpha, &self.xn, 0, &self.ds_ref().alpha, 0, n);
+                    self.enc_qmm(pe.at(Phase::Mm(MmRole::Dn, la.beta.sel), 1), &q.pipe(la.beta.sel).matmul_pg, &la.beta, &self.xn, 0, &self.ds_ref().beta_p, 0, n);
                     bar!(&self.ds_ref().qkv, &self.ds_ref().z, &self.ds_ref().alpha, &self.ds_ref().beta_p);
-                    self.enc_delta_block(enc, la, l, n, conc);
+                    self.enc_delta_block(pe.at(Phase::Delta, dn_disp), la, l, n, conc);
                     bar!(&self.ds_ref().dout);
-                    self.enc_qmm(enc, &q.pipe(la.out.sel).matmul_pg, &la.out, &self.ds_ref().dout, 0, &self.xb, 0, n);
+                    self.enc_qmm(pe.at(Phase::Mm(MmRole::Dn, la.out.sel), 1), &q.pipe(la.out.sel).matmul_pg, &la.out, &self.ds_ref().dout, 0, &self.xb, 0, n);
                     bar!(&self.xb);
-                    e.enc_elementwise(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
+                    e.enc_elementwise(pe.at(Phase::Elem, 1), &e.pipes.add_inplace, &self.x, &self.xb, n * h);
                     bar!(&self.x);
                 }
                 QuantAttn::Full(fa) => {
-                self.enc_qmm(enc, &q.pipe(fa.q_proj.sel).matmul_pg, &fa.q_proj, &self.xn, 0, &self.q, 0, n);
-                self.enc_qmm(enc, &q.pipe(fa.k_proj.sel).matmul_pg, &fa.k_proj, &self.xn, 0, &self.kvs, 0, n);
-                self.enc_qmm(enc, &q.pipe(fa.v_proj.sel).matmul_pg, &fa.v_proj, &self.xn, 0, &self.kvs, v_base, n);
+                self.enc_qmm(pe.at(Phase::Mm(MmRole::Attn, fa.q_proj.sel), 1), &q.pipe(fa.q_proj.sel).matmul_pg, &fa.q_proj, &self.xn, 0, &self.q, 0, n);
+                self.enc_qmm(pe.at(Phase::Mm(MmRole::Attn, fa.k_proj.sel), 1), &q.pipe(fa.k_proj.sel).matmul_pg, &fa.k_proj, &self.xn, 0, &self.kvs, 0, n);
+                self.enc_qmm(pe.at(Phase::Mm(MmRole::Attn, fa.v_proj.sel), 1), &q.pipe(fa.v_proj.sel).matmul_pg, &fa.v_proj, &self.xn, 0, &self.kvs, v_base, n);
                 bar!(&self.q, &self.kvs);
                 // qwen35 projects Q and the output gate together, interleaved per
                 // head; split once so qk-norm, RoPE and attention keep seeing an
                 // ordinary compact Q. A no-op on every other checkpoint.
-                let qbuf = self.enc_split_qg(enc, n, conc);
+                let qbuf = self.enc_split_qg(pe.at(Phase::Attn, qg_n), n, conc);
                 if let (Some(qn), Some(kn)) = (&fa.q_norm, &fa.k_norm) {
                     // qwen3: per-head norm before RoPE — q in place (f32), k while
                     // still in the f32 staging half (why this precedes the spans).
@@ -2667,11 +2705,12 @@ impl MetalSession<'_> {
                     // chasing. On every other arch qbuf IS self.q, so `qbuf` is
                     // correct in both cases and `self.q` is correct in only one.
                     // The decode half below has always used qbuf; keep them same.
-                    e.enc_rmsnorm_dim(enc, qbuf, qn, n * cfg.num_attention_heads, hd);
-                    e.enc_rmsnorm_dim(enc, &self.kvs, kn, n * cfg.num_key_value_heads, hd);
+                    e.enc_rmsnorm_dim(pe.at(Phase::Norm, 1), qbuf, qn, n * cfg.num_attention_heads, hd);
+                    e.enc_rmsnorm_dim(pe.at(Phase::Norm, 1), &self.kvs, kn, n * cfg.num_key_value_heads, hd);
                     bar!(qbuf, &self.kvs);
                 }
                 {
+                    let enc = pe.at(Phase::Rope, 1);
                     let rp = RopeParams {
                         head_dim: hd as u32,
                         n_heads: cfg.num_attention_heads as u32,
@@ -2692,9 +2731,10 @@ impl MetalSession<'_> {
                 for &(row, slot, len) in &spans {
                     let src_off = (row * kvd * 4) as u64;
                     let dst_off = self.kv_base + (slot * kvd * 2) as u64;
-                    e.enc_f32_to_f16(enc, &self.kvs, src_off, &self.k_cache[l], dst_off, len * kvd);
-                    e.enc_f32_to_f16(enc, &self.kvs, v_base + src_off, &self.v_cache[l], dst_off, len * kvd);
+                    e.enc_f32_to_f16(pe.at(Phase::KvStage, 1), &self.kvs, src_off, &self.k_cache[l], dst_off, len * kvd);
+                    e.enc_f32_to_f16(pe.at(Phase::KvStage, 1), &self.kvs, v_base + src_off, &self.v_cache[l], dst_off, len * kvd);
                     bar!(&self.k_cache[l]);
+                    let enc = pe.at(Phase::Rope, 1);
                     let rp = RopeParams {
                         head_dim: hd as u32,
                         n_heads: cfg.num_key_value_heads as u32,
@@ -2714,24 +2754,25 @@ impl MetalSession<'_> {
                         Some(w) => w.cfg.cap,
                         None => self.max_seq,
                     };
-                    e.enc_attention(enc, qbuf, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.scores, &self.att, pos0, n, kv_extent, &self.xh);
+                    e.enc_attention(pe.at(Phase::Attn, 1), qbuf, &self.k_cache[l], &self.v_cache[l], self.kv_base, &self.scores, &self.att, pos0, n, kv_extent, &self.xh);
                     bar!(&self.att, &self.scores);
                 }
-                self.enc_apply_qgate(enc, n, conc);
-                self.enc_qmm(enc, &q.pipe(fa.o_proj.sel).matmul_pg, &fa.o_proj, &self.att, 0, &self.xb, 0, n);
+                self.enc_apply_qgate(pe.at(Phase::Attn, qg_n), n, conc);
+                self.enc_qmm(pe.at(Phase::Mm(MmRole::Attn, fa.o_proj.sel), 1), &q.pipe(fa.o_proj.sel).matmul_pg, &fa.o_proj, &self.att, 0, &self.xb, 0, n);
                 bar!(&self.xb);
-                e.enc_elementwise(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
+                e.enc_elementwise(pe.at(Phase::Elem, 1), &e.pipes.add_inplace, &self.x, &self.xb, n * h);
                 bar!(&self.x);
                 }
             };
             let _ = attn_out_done;
 
-            e.enc_rmsnorm(enc, &self.x, &blk.post_attention_layernorm, &self.xn, n);
+            e.enc_rmsnorm(pe.at(Phase::Norm, 1), &self.x, &blk.post_attention_layernorm, &self.xn, n);
             bar!(&self.xn);
-            self.enc_qmm(enc, &q.pipe(blk.gate_proj.sel).matmul_pg, &blk.gate_proj, &self.xn, 0, &self.gate, 0, n);
-            self.enc_qmm(enc, &q.pipe(blk.up_proj.sel).matmul_pg, &blk.up_proj, &self.xn, 0, &self.up, 0, n);
+            self.enc_qmm(pe.at(Phase::Mm(MmRole::Mlp, blk.gate_proj.sel), 1), &q.pipe(blk.gate_proj.sel).matmul_pg, &blk.gate_proj, &self.xn, 0, &self.gate, 0, n);
+            self.enc_qmm(pe.at(Phase::Mm(MmRole::Mlp, blk.up_proj.sel), 1), &q.pipe(blk.up_proj.sel).matmul_pg, &blk.up_proj, &self.xn, 0, &self.up, 0, n);
             bar!(&self.gate, &self.up);
             {
+                let enc = pe.at(Phase::Elem, 1);
                 let p = ElemParams { dim: (n * cfg.intermediate_size) as u32 };
                 enc.set_compute_pipeline_state(&e.pipes.silu_mul);
                 enc.set_buffer(0, Some(&self.gate), 0);
@@ -2740,34 +2781,54 @@ impl MetalSession<'_> {
                 dispatch_grid(enc, n * cfg.intermediate_size);
             }
             bar!(&self.gate);
-            self.enc_qmm(enc, &q.pipe(blk.down_proj.sel).matmul_pg, &blk.down_proj, &self.gate, 0, &self.xb, 0, n);
+            self.enc_qmm(pe.at(Phase::Mm(MmRole::Mlp, blk.down_proj.sel), 1), &q.pipe(blk.down_proj.sel).matmul_pg, &blk.down_proj, &self.gate, 0, &self.xb, 0, n);
             bar!(&self.xb);
-            e.enc_elementwise(enc, &e.pipes.add_inplace, &self.x, &self.xb, n * h);
+            e.enc_elementwise(pe.at(Phase::Elem, 1), &e.pipes.add_inplace, &self.x, &self.xb, n * h);
             bar!(&self.x);
         }
 
         if logits_rows > 0 {
-            e.enc_rmsnorm(enc, &self.x, &q.final_norm, &self.xn, n);
+            e.enc_rmsnorm(pe.at(Phase::Norm, 1), &self.x, &q.final_norm, &self.xn, n);
             bar!(&self.xn);
             let first = n - logits_rows;
             if logits_rows == 1 && !conc {
-                self.enc_qmv(enc, &q.pipe(q.lm_head.sel).matvec, &q.lm_head, &self.xn, &self.logits, 0);
+                self.enc_qmv(pe.at(Phase::Mm(MmRole::Head, q.lm_head.sel), 1), &q.pipe(q.lm_head.sel).matvec, &q.lm_head, &self.xn, &self.logits, 0);
             } else {
-                self.enc_qmm(enc, &q.pipe(q.lm_head.sel).matmul_pg, &q.lm_head, &self.xn, (first * h * 4) as u64, &self.logits, 0, logits_rows);
+                self.enc_qmm(pe.at(Phase::Mm(MmRole::Head, q.lm_head.sel), 1), &q.pipe(q.lm_head.sel).matmul_pg, &q.lm_head, &self.xn, (first * h * 4) as u64, &self.logits, 0, logits_rows);
             }
         }
 
-        enc.end_encoding();
+        pe.end();
+        let t_commit = std::time::Instant::now();
         cb.commit();
         cb.wait_until_completed();
+        let gpu_wait_ns = t_commit.elapsed().as_nanos();
+        let cpu_enc_ns = t_commit.duration_since(t_step).as_nanos() - cpu_pre_ns;
 
-        if logits_rows == 0 {
-            return Ok(Vec::new());
-        }
-        let logits = unsafe {
-            std::slice::from_raw_parts(self.logits.contents() as *const f32, logits_rows * cfg.vocab_size)
+        let t_post = std::time::Instant::now();
+        let out = if logits_rows == 0 {
+            Vec::new()
+        } else {
+            let logits = unsafe {
+                std::slice::from_raw_parts(self.logits.contents() as *const f32, logits_rows * cfg.vocab_size)
+            };
+            logits.to_vec()
         };
-        Ok(logits.to_vec())
+        if let Some(t) = timing.as_deref_mut() {
+            let kind = if n == 1 { "decode" } else { "prefill" };
+            t.report(
+                kind,
+                n,
+                pos0,
+                t_step.elapsed().as_nanos(),
+                cpu_pre_ns,
+                cpu_enc_ns,
+                gpu_wait_ns,
+                t_post.elapsed().as_nanos(),
+            );
+        }
+        self.timing = timing;
+        Ok(out)
     }
 
     /// The model config, for callers (the ane backend) that only hold a session.
@@ -3153,6 +3214,574 @@ impl MetalBatcher<'_> {
     }
 }
 
+// ==================== GPU time attribution (LOKAL_GPU_TIMING) ====================
+//
+// DIAGNOSIS ONLY, and default OFF. With the variable unset this file dispatches
+// exactly what it dispatched before the mode existed — same encoder
+// construction, same kernel order, same buffers — so every identity gate holds
+// byte for byte. The whole off-path cost is one `Option::is_none` per phase
+// mark.
+//
+// MECHANISM, and why this one and not the obvious one. Apple M-series report
+// `supportsCounterSampling(AtStageBoundary) == true` and every other sampling
+// point FALSE (measured, M1 Pro / macOS 26), so per-DISPATCH counters do not
+// exist on this hardware at any price. What does exist is a timestamp pair per
+// COMPUTE ENCODER, attached through MTLComputePassDescriptor. So a timed step
+// splits its one encoder into one encoder per contiguous run of same-phase
+// dispatches — still ONE command buffer, ONE commit, ONE wait. The GPU work is
+// unchanged; only the phase boundaries become observable.
+//
+// ITS DISTORTION, measured rather than assumed (`gputime hdr` carries it):
+//   * each encoder boundary costs a fixed slice INSIDE the measured window
+//     (encoder start + drain) and a fixed GAP between windows;
+//   * on the CONCURRENT prefill encoder a boundary additionally serializes
+//     overlap that the unsplit encoder would have had.
+// `calib_inside_ns` / `calib_gap_ns` are that constant, measured in-process on
+// this device against a real pipeline, so any phase's raw ns can be corrected
+// by its own encoder count. `LOKAL_GPU_TIMING=total` runs the step as ONE
+// encoder (two samples, no splitting) — the undistorted reference the harness
+// compares timed against untimed throughput with.
+//
+// metal-rs 0.33 BUG WORKED AROUND HERE: `CounterSampleBufferRef::
+// resolve_counter_range` builds `Vec::with_capacity(n)` and then passes
+// `size_of_val(data.as_slice())` — the length of an EMPTY vec, i.e. 0 — to
+// `-getBytes:length:`, so it copies nothing and always returns zeros. The
+// resolve below goes straight to the ObjC selector through objc2 (already a
+// dependency of this crate) for that reason.
+
+/// What a run of dispatches is doing. The tag is compared to decide where one
+/// timed encoder ends and the next begins, so two adjacent dispatches with the
+/// same tag cost one encoder, not two.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Phase {
+    /// rmsnorm in all its shapes (f32, per-head, in-place-half).
+    Norm,
+    /// rope / rope_h / rope_qk_decode.
+    Rope,
+    /// attention proper, plus the q/gate split and output gate that only exist
+    /// to feed it.
+    Attn,
+    /// the gated-deltanet six-kernel chain (delta_gates, ssm_conv_decode,
+    /// l2norm_rows x2, delta_decode_step, gated_output_norm).
+    Delta,
+    /// silu_mul, add_inplace — the cheap elementwise glue.
+    Elem,
+    /// f32 -> f16 staging of fresh K/V rows into the cache.
+    KvStage,
+    /// a weight multiply: which weight, and the quant selector it dispatches.
+    Mm(MmRole, u32),
+    /// everything not currently being isolated (see the filter).
+    Other,
+}
+
+/// Which weight a `Phase::Mm` is multiplying. The quant family answers "is the
+/// i-quant grid dequant the problem"; the role answers "which matmul do we
+/// fix", and the two questions have different answers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MmRole {
+    /// q / k / v / o projections of a full-attention block.
+    Attn,
+    /// the gated-deltanet block's projections (qkv, z, alpha, beta, out).
+    Dn,
+    /// gate / up / down.
+    Mlp,
+    /// the vocab head.
+    Head,
+}
+
+impl MmRole {
+    fn name(self) -> &'static str {
+        match self {
+            MmRole::Attn => "attn",
+            MmRole::Dn => "dn",
+            MmRole::Mlp => "mlp",
+            MmRole::Head => "head",
+        }
+    }
+}
+
+/// Selector -> short type label for the table. This MIRRORS `SrcType::qtype()`
+/// (src/lowmem/mod.rs) and is deliberately the cheap kind of mirror: an
+/// unmapped selector prints `selN` — visible in the table rather than silent —
+/// and a wrong label cannot change one bit of what the GPU computes. The test
+/// `sel_names_cover_every_quant_type` keeps the known set honest.
+fn sel_name(sel: u32) -> String {
+    let s = match sel {
+        0 => "f16",
+        1 => "bf16",
+        2 => "q8_0",
+        3 => "q4_0",
+        4 => "q4_k",
+        5 => "q6_k",
+        6 => "q5_k",
+        7 => "q5_0",
+        8 => "q2_k",
+        9 => "q3_k",
+        10 => "iq4_nl",
+        11 => "iq4_xs",
+        12 => "iq3_xxs",
+        13 => "iq3_s",
+        14 => "iq2_xxs",
+        15 => "iq2_xs",
+        16 => "iq2_s",
+        17 => "iq1_s",
+        18 => "iq1_m",
+        _ => return format!("sel{sel}"),
+    };
+    s.to_string()
+}
+
+impl Phase {
+    fn name(self) -> String {
+        match self {
+            Phase::Norm => "norm".to_string(),
+            Phase::Rope => "rope".to_string(),
+            Phase::Attn => "attn".to_string(),
+            Phase::Delta => "delta".to_string(),
+            Phase::Elem => "elem".to_string(),
+            Phase::KvStage => "kvstage".to_string(),
+            Phase::Other => "other".to_string(),
+            Phase::Mm(r, sel) => format!("mm:{}:{}", r.name(), sel_name(sel)),
+        }
+    }
+}
+
+/// A `#[repr(C)]` NSRange we can hand to objc2 (metal-rs's own NSRange carries
+/// no `Encode` impl).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NsRange {
+    location: usize,
+    length: usize,
+}
+unsafe impl objc2::encode::Encode for NsRange {
+    const ENCODING: objc2::encode::Encoding = objc2::encode::Encoding::Struct(
+        "_NSRange",
+        &[usize::ENCODING, usize::ENCODING],
+    );
+}
+
+/// Sentinel Metal writes when a sample could not be taken.
+const COUNTER_ERROR: u64 = u64::MAX;
+
+/// Read `n` timestamps out of a counter sample buffer. See the metal-rs bug
+/// note at the top of this section for why this is not
+/// `resolve_counter_range`.
+fn resolve_timestamps(sb: &metal::CounterSampleBufferRef, n: usize) -> Vec<u64> {
+    use metal::foreign_types::ForeignTypeRef;
+    if n == 0 {
+        return Vec::new();
+    }
+    unsafe {
+        let obj = sb.as_ptr() as *mut objc2::runtime::AnyObject;
+        let r = NsRange { location: 0, length: n };
+        let data: *mut objc2::runtime::AnyObject =
+            objc2::msg_send![obj, resolveCounterRange: r];
+        if data.is_null() {
+            return Vec::new();
+        }
+        let bytes: *const u8 = objc2::msg_send![data, bytes];
+        let len: usize = objc2::msg_send![data, length];
+        if bytes.is_null() || len < n * 8 {
+            return Vec::new();
+        }
+        std::slice::from_raw_parts(bytes as *const u64, n).to_vec()
+    }
+}
+
+/// The per-process timing state: the sample buffer, the phase filter, and the
+/// per-step encoder ledger. `None` on the session unless LOKAL_GPU_TIMING is set.
+pub(crate) struct GpuTiming {
+    sb: metal::CounterSampleBuffer,
+    /// How many encoders one step may split into before the sample buffer runs
+    /// out. Metal caps a sample buffer at 32768 bytes = 4096 timestamps.
+    cap_enc: usize,
+    /// `None` = isolate every phase (mode `1`); `Some(v)` = only phases whose
+    /// name starts with one of these split out, the rest merge into `other`
+    /// (`total` is the empty vector: nothing splits, one encoder per step).
+    filter: Option<Vec<String>>,
+    /// One entry per timed encoder used by the step in flight.
+    tags: Vec<Phase>,
+    disp: Vec<u32>,
+    /// The step ran out of samples and stopped splitting — its phase sums are
+    /// short and the harness must say so rather than average them in.
+    overflow: bool,
+    dec_seq: u32,
+    pre_seq: u32,
+}
+
+impl GpuTiming {
+    /// Build from the environment. Returns None when timing is off, which is
+    /// the only state any non-diagnostic run is ever in.
+    fn from_env(e: &MetalEngine) -> Option<Box<GpuTiming>> {
+        let raw = std::env::var("LOKAL_GPU_TIMING").ok()?;
+        let v = raw.trim();
+        if v.is_empty() || v == "0" || v.eq_ignore_ascii_case("off") {
+            return None;
+        }
+        let filter = match v {
+            "1" | "full" | "all" => None,
+            "total" | "none" => Some(Vec::new()),
+            other => Some(other.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()),
+        };
+        let ts = e.device.counter_sets().into_iter().find(|c| c.name() == "timestamp")?;
+        if !e.device.supports_counter_sampling(metal::MTLCounterSamplingPoint::AtStageBoundary) {
+            eprintln!("gputime hdr error=\"device does not support AtStageBoundary counter sampling — timing disabled\"");
+            return None;
+        }
+        // 4096 timestamps is the device maximum (32768 B); two per encoder.
+        let n_samples: u64 = 4096;
+        let desc = metal::CounterSampleBufferDescriptor::new();
+        desc.set_counter_set(&ts);
+        desc.set_sample_count(n_samples);
+        desc.set_storage_mode(metal::MTLStorageMode::Shared);
+        let sb = match e.device.new_counter_sample_buffer_with_descriptor(&desc) {
+            Ok(sb) => sb,
+            Err(err) => {
+                eprintln!("gputime hdr error=\"counter sample buffer: {err}\"");
+                return None;
+            }
+        };
+        let t = GpuTiming {
+            sb,
+            cap_enc: (n_samples / 2) as usize,
+            filter,
+            tags: Vec::new(),
+            disp: Vec::new(),
+            overflow: false,
+            dec_seq: 0,
+            pre_seq: 0,
+        };
+        let (inside, gap) = t.calibrate(e);
+        let mode = match &t.filter {
+            None => "full".to_string(),
+            Some(v) if v.is_empty() => "total".to_string(),
+            Some(v) => format!("isolate:{}", v.join("+")),
+        };
+        eprintln!(
+            "gputime hdr device=\"{}\" mode={} cap_enc={} calib_inside_ns={:.0} calib_gap_ns={:.0} unit=ns",
+            e.device.name(),
+            mode,
+            t.cap_enc,
+            inside,
+            gap
+        );
+        Some(Box::new(t))
+    }
+
+    /// What an encoder boundary costs on THIS device, measured against a real
+    /// pipeline (add_inplace over one element — the cheapest dispatch the
+    /// engine already owns; this lane may not add a kernel). `inside` is the
+    /// fixed slice each encoder's own measured window carries, `gap` the dead
+    /// time between windows. Reported, never silently subtracted.
+    fn calibrate(&self, e: &MetalEngine) -> (f64, f64) {
+        const N: usize = 128;
+        let a = f32_buffer(&e.device, 4);
+        let b = f32_buffer(&e.device, 4);
+        let p = ElemParams { dim: 1 };
+        let mut inside = Vec::new();
+        let mut gap = Vec::new();
+        for _ in 0..3 {
+            // A: one encoder, N dispatches (samples 0,1).
+            let cb = e.queue.new_command_buffer();
+            let pd = metal::ComputePassDescriptor::new();
+            let att = pd.sample_buffer_attachments().object_at(0).unwrap();
+            att.set_sample_buffer(&self.sb);
+            att.set_start_of_encoder_sample_index(0);
+            att.set_end_of_encoder_sample_index(1);
+            let enc = cb.compute_command_encoder_with_descriptor(pd);
+            for _ in 0..N {
+                enc.set_compute_pipeline_state(&e.pipes.add_inplace);
+                enc.set_buffer(0, Some(&a), 0);
+                enc.set_buffer(1, Some(&b), 0);
+                enc.set_bytes(2, size_of::<ElemParams>() as u64, &p as *const _ as *const _);
+                dispatch_grid(enc, 1);
+            }
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            // B: N encoders, one dispatch each (samples 2 .. 2+2N).
+            let cb = e.queue.new_command_buffer();
+            for i in 0..N {
+                let pd = metal::ComputePassDescriptor::new();
+                let att = pd.sample_buffer_attachments().object_at(0).unwrap();
+                att.set_sample_buffer(&self.sb);
+                att.set_start_of_encoder_sample_index((2 + 2 * i) as u64);
+                att.set_end_of_encoder_sample_index((2 + 2 * i + 1) as u64);
+                let enc = cb.compute_command_encoder_with_descriptor(pd);
+                enc.set_compute_pipeline_state(&e.pipes.add_inplace);
+                enc.set_buffer(0, Some(&a), 0);
+                enc.set_buffer(1, Some(&b), 0);
+                enc.set_bytes(2, size_of::<ElemParams>() as u64, &p as *const _ as *const _);
+                dispatch_grid(enc, 1);
+                enc.end_encoding();
+            }
+            cb.commit();
+            cb.wait_until_completed();
+            let ts = resolve_timestamps(&self.sb, 2 + 2 * N);
+            if ts.len() < 2 + 2 * N || ts.iter().any(|&t| t == COUNTER_ERROR) {
+                return (f64::NAN, f64::NAN);
+            }
+            let one = ts[1].saturating_sub(ts[0]) as f64;
+            let sum: f64 = (0..N)
+                .map(|i| ts[2 + 2 * i + 1].saturating_sub(ts[2 + 2 * i]) as f64)
+                .sum();
+            let span = ts[2 + 2 * N - 1].saturating_sub(ts[2]) as f64;
+            inside.push((sum - one) / N as f64);
+            gap.push((span - sum) / (N - 1) as f64);
+        }
+        let med = |mut v: Vec<f64>| {
+            v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            v[v.len() / 2]
+        };
+        (med(inside), med(gap))
+    }
+
+    /// The tag an encoder is opened under: the phase itself when it is being
+    /// isolated, `Other` when it is not. `full` isolates everything, `total`
+    /// isolates nothing — one code path covers both.
+    fn key_of(&self, p: Phase) -> Phase {
+        match &self.filter {
+            None => p,
+            Some(names) => {
+                let n = p.name();
+                if names.iter().any(|f| n.starts_with(f.as_str())) {
+                    p
+                } else {
+                    Phase::Other
+                }
+            }
+        }
+    }
+
+    fn begin_step(&mut self) {
+        self.tags.clear();
+        self.disp.clear();
+        self.overflow = false;
+    }
+
+    /// Attach the next free sample pair to `pd`, or None when the buffer is full.
+    fn attach(&mut self, pd: &metal::ComputePassDescriptorRef, tag: Phase) -> bool {
+        let i = self.tags.len();
+        if i >= self.cap_enc {
+            self.overflow = true;
+            return false;
+        }
+        let att = pd.sample_buffer_attachments().object_at(0).unwrap();
+        att.set_sample_buffer(&self.sb);
+        att.set_start_of_encoder_sample_index((2 * i) as u64);
+        att.set_end_of_encoder_sample_index((2 * i + 1) as u64);
+        self.tags.push(tag);
+        self.disp.push(0);
+        true
+    }
+
+    fn add_dispatches(&mut self, n: u32) {
+        if let Some(d) = self.disp.last_mut() {
+            *d += n;
+        }
+    }
+
+    /// Resolve the step's samples and print it: one `step` line, then one
+    /// `phase` line per phase that ran. Structured key=value on stderr so the
+    /// harness never has to grep free text (protocol:gate-scripts rule 3).
+    #[allow(clippy::too_many_arguments)]
+    fn report(
+        &mut self,
+        kind: &str,
+        n: usize,
+        pos0: usize,
+        wall_ns: u128,
+        cpu_pre_ns: u128,
+        cpu_enc_ns: u128,
+        gpu_wait_ns: u128,
+        cpu_post_ns: u128,
+    ) {
+        let n_enc = self.tags.len();
+        let ts = resolve_timestamps(&self.sb, 2 * n_enc);
+        let seq = if kind == "decode" {
+            let s = self.dec_seq;
+            self.dec_seq += 1;
+            s
+        } else {
+            let s = self.pre_seq;
+            self.pre_seq += 1;
+            s
+        };
+        let mut sums: Vec<(Phase, u64, u32, u32)> = Vec::new(); // phase, ns, encoders, dispatches
+        let mut bad = 0u32;
+        let mut empty = 0u32;
+        let mut total = 0u64;
+        let (mut first, mut last) = (u64::MAX, 0u64);
+        if ts.len() == 2 * n_enc {
+            for i in 0..n_enc {
+                // AN ENCODER WITH NO DISPATCHES NEVER HAS ITS COUNTERS WRITTEN.
+                // Its sample pair still holds whatever the PREVIOUS step wrote
+                // there, which reads as a perfectly plausible interval — that
+                // stale pair is what made gpu_span_ns come out at half a second
+                // for a 32 ms decode step. Skip them by construction rather
+                // than trusting that none exist.
+                if self.disp[i] == 0 {
+                    empty += 1;
+                    continue;
+                }
+                let (s, e) = (ts[2 * i], ts[2 * i + 1]);
+                if s == COUNTER_ERROR || e == COUNTER_ERROR || e < s {
+                    bad += 1;
+                    continue;
+                }
+                first = first.min(s);
+                last = last.max(e);
+                let d = e - s;
+                total += d;
+                let tag = self.tags[i];
+                match sums.iter_mut().find(|(p, _, _, _)| *p == tag) {
+                    Some(row) => {
+                        row.1 += d;
+                        row.2 += 1;
+                        row.3 += self.disp[i];
+                    }
+                    None => sums.push((tag, d, 1, self.disp[i])),
+                }
+            }
+        } else {
+            bad = n_enc as u32;
+        }
+        let span = if first == u64::MAX { 0 } else { last - first };
+        sums.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!(
+            "gputime step kind={kind} seq={seq} n={n} pos0={pos0} enc={n_enc} bad={bad} \
+empty={empty} overflow={} wall_ns={wall_ns} cpu_pre_ns={cpu_pre_ns} cpu_encode_ns={cpu_enc_ns} \
+gpu_wait_ns={gpu_wait_ns} cpu_post_ns={cpu_post_ns} gpu_sum_ns={total} gpu_span_ns={span}",
+            u8::from(self.overflow)
+        );
+        for (p, ns, enc, disp) in sums {
+            eprintln!(
+                "gputime phase kind={kind} seq={seq} name={} ns={ns} enc={enc} disp={disp}",
+                p.name()
+            );
+        }
+    }
+}
+
+/// The encoder in flight, plus where to cut the next one. When timing is off
+/// this is a thin newtype over the single encoder the engine has always used
+/// and `at()` is a null check.
+struct PhaseEnc<'a, 'b> {
+    cb: &'a metal::CommandBufferRef,
+    conc: bool,
+    /// `None` until the first marked dispatch: an encoder opened before its
+    /// phase is known would be an EMPTY encoder, and Metal does not write
+    /// counter samples for one (see `report`).
+    enc: Option<&'a ComputeCommandEncoderRef>,
+    tm: Option<&'b mut GpuTiming>,
+    key: Phase,
+    /// The sample buffer filled up; stop splitting rather than churn encoders.
+    stopped: bool,
+}
+
+impl<'a, 'b> PhaseEnc<'a, 'b> {
+    fn new(cb: &'a metal::CommandBufferRef, conc: bool, tm: Option<&'b mut GpuTiming>) -> Self {
+        match tm {
+            // OFF PATH — byte-for-byte the construction this file has always used.
+            None => PhaseEnc {
+                cb,
+                conc,
+                enc: Some(if conc {
+                    cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent)
+                } else {
+                    cb.new_compute_command_encoder()
+                }),
+                tm: None,
+                key: Phase::Other,
+                stopped: true,
+            },
+            Some(t) => {
+                t.begin_step();
+                PhaseEnc { cb, conc, enc: None, tm: Some(t), key: Phase::Other, stopped: false }
+            }
+        }
+    }
+
+    fn open(
+        cb: &'a metal::CommandBufferRef,
+        conc: bool,
+        tm: Option<&mut GpuTiming>,
+        tag: Phase,
+    ) -> &'a ComputeCommandEncoderRef {
+        let dt = if conc {
+            metal::MTLDispatchType::Concurrent
+        } else {
+            metal::MTLDispatchType::Serial
+        };
+        if let Some(t) = tm {
+            let pd = metal::ComputePassDescriptor::new();
+            pd.set_dispatch_type(dt);
+            if t.attach(pd, tag) {
+                return cb.compute_command_encoder_with_descriptor(pd);
+            }
+        }
+        if conc {
+            cb.compute_command_encoder_with_dispatch_type(dt)
+        } else {
+            cb.new_compute_command_encoder()
+        }
+    }
+
+    /// Mark the next `nd` dispatches as belonging to phase `p`, and return the
+    /// encoder to put them in — a new one when the phase changed.
+    ///
+    /// `nd == 0` NEVER cuts an encoder. Two call sites (the joint Q+gate split
+    /// and the output gate) dispatch nothing on checkpoints without a joint
+    /// projection, and cutting there would leave an empty encoder holding a
+    /// stale sample pair.
+    fn at(&mut self, p: Phase, nd: u32) -> &'a ComputeCommandEncoderRef {
+        let Some(t) = self.tm.as_deref_mut() else {
+            return self.enc.expect("the untimed path opens its encoder eagerly");
+        };
+        if nd == 0 {
+            if let Some(enc) = self.enc {
+                return enc;
+            }
+        }
+        if !self.stopped {
+            let k = t.key_of(p);
+            if k != self.key || self.enc.is_none() {
+                if let Some(enc) = self.enc {
+                    enc.end_encoding();
+                }
+                let before = t.tags.len();
+                self.enc = Some(Self::open(self.cb, self.conc, Some(&mut *t), k));
+                if t.tags.len() == before {
+                    // out of samples: this and every later encoder is untimed
+                    self.stopped = true;
+                }
+                self.key = k;
+            }
+        } else if self.enc.is_none() {
+            self.enc = Some(Self::open(self.cb, self.conc, None, self.key));
+        }
+        t.add_dispatches(nd);
+        self.enc.expect("just opened")
+    }
+
+    /// The encoder currently open, for barriers that must ride the same one.
+    fn cur(&mut self) -> &'a ComputeCommandEncoderRef {
+        if self.enc.is_none() {
+            let tm = self.tm.as_deref_mut();
+            let key = self.key;
+            self.enc = Some(Self::open(self.cb, self.conc, tm, key));
+        }
+        self.enc.expect("just opened")
+    }
+
+    fn end(self) {
+        if let Some(enc) = self.enc {
+            enc.end_encoding();
+        }
+    }
+}
+
 impl Session for MetalSession<'_> {
     fn forward(&mut self, token: u32, pos: usize) -> crate::Result<Vec<f32>> {
         self.run(&[token], pos, 1)
@@ -3178,6 +3807,44 @@ impl Session for MetalSession<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// `sel_name` (the GPU-attribution table's type labels) mirrors
+    /// `SrcType::qtype()` in src/lowmem/mod.rs. It is the CHEAP kind of mirror
+    /// — a wrong label cannot move one computed bit, only mislabel a
+    /// diagnostic row — but a selector the table has never heard of is exactly
+    /// the silent drift the guard below exists for, so every type the seam
+    /// maps to a metal pipeline must have a distinct name here.
+    #[test]
+    fn sel_names_cover_every_quant_type() {
+        use crate::gguf::GgmlType as G;
+        use crate::lowmem::SrcType;
+        let all = [
+            G::F32, G::F16, G::Q4_0, G::Q5_0, G::Q8_0, G::Q2_K, G::Q3_K, G::Q4_K,
+            G::Q5_K, G::Q6_K, G::IQ1_S, G::IQ1_M, G::IQ2_XXS, G::IQ2_XS, G::IQ2_S,
+            G::IQ3_XXS, G::IQ3_S, G::IQ4_NL, G::IQ4_XS,
+        ];
+        let mut by_sel: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+        for t in all {
+            let sel = SrcType::Quant(t).qtype();
+            if sel == u32::MAX {
+                continue; // not wired to a metal pipeline yet — refused earlier
+            }
+            let name = super::sel_name(sel);
+            assert!(
+                !name.starts_with("sel"),
+                "GGUF type {t:?} maps to selector {sel}, which has no attribution label"
+            );
+            let prev = by_sel.insert(sel, name.clone());
+            assert!(prev.is_none() || prev.as_deref() == Some(name.as_str()));
+        }
+        let mut names: Vec<&String> = by_sel.values().collect();
+        names.sort();
+        let n = names.len();
+        names.dedup();
+        assert_eq!(names.len(), n, "two selectors share one attribution label");
+        assert_eq!(super::sel_name(SrcType::F16.qtype()), "f16");
+        assert_eq!(super::sel_name(SrcType::BF16.qtype()), "bf16");
+    }
+
     /// THE MIRROR GUARD — the class this lane exists to close.
     ///
     /// kernels.metal's `*Params` structs are mirrored by hand in Rust, in more
